@@ -288,7 +288,8 @@ if ($FirstBoot) {
 $stagedTitles = @()
 $stagedTitlesFile = "$stage/rnps/staged_titles.json"
 if (Test-Path $stagedTitlesFile) {
-    $stagedTitles = @(Get-Content $stagedTitlesFile -Raw | ConvertFrom-Json)
+    # Windows PowerShell emits the JSON array as one pipeline object.
+    $stagedTitles = @((Get-Content $stagedTitlesFile -Raw | ConvertFrom-Json) | ForEach-Object { $_ })
 }
 New-Item -ItemType Directory -Path $systemData -Force | Out-Null
 New-Item -ItemType Directory -Path "$systemData/user" -Force | Out-Null
