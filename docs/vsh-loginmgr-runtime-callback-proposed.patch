@@ -1,0 +1,78 @@
+diff --git a/src/loader/runtimeGuestExecution.h b/src/loader/runtimeGuestExecution.h
+--- a/src/loader/runtimeGuestExecution.h
++++ b/src/loader/runtimeGuestExecution.h
+@@ -114,6 +114,10 @@
+ 	// No C++ frame/RAII below this boundary. Supports SysV void(void*), void(),
+ 	// uint64_t(void*) and uint64_t(); void results are explicitly normalized.
+ 	RuntimeGuestResult InvokeCallback(uint64_t target, void* argument = nullptr, bool returns_value = false) noexcept;
++	// Trusted host argument array; current-thread, nonvariadic SysV integer/pointer
++	// callback only. No floating-point, aggregate or hidden-return ABI support.
++	RuntimeGuestResult InvokeIntegerCallback(uint64_t target, const uint64_t* arguments,
++	                                       size_t count) noexcept;
+ 	// Request only at this owner's active innermost guest boundary. Does not
+ 	// stop/fail peers. The caller must return normally before transferring.
+ 	bool RequestThreadExit(uint64_t value) noexcept;
+diff --git a/src/loader/runtimeGuestExecution.cpp b/src/loader/runtimeGuestExecution.cpp
+--- a/src/loader/runtimeGuestExecution.cpp
++++ b/src/loader/runtimeGuestExecution.cpp
+@@ -38,7 +38,11 @@
+ struct CallbackArguments {
+ 	uint64_t target;
+ 	void* argument;
+ };
++struct IntegerCallbackArguments {
++	uint64_t target;
++	std::array<uint64_t, 7> values;
++};
+ struct ModuleArguments {
+ 	uint64_t target;
+ 	size_t args;
+@@ -66,6 +70,25 @@
+ 	                 "xorl %eax, %eax\n\t"
+ 	                 "ret\n\t");
+ }
++static_assert(offsetof(IntegerCallbackArguments, values) == 8 && sizeof(IntegerCallbackArguments) == 64);
++__attribute__((naked)) uint64_t KYTY_GUEST_CALL_BOUNDARY_SYSV IntegerCallbackTransition(void*) {
++	// Entry RSP is 8 mod 16. Reserve arg7 and align RSP for call; the target
++	// sees its seventh argument at RSP+8, immediately above its return address.
++	__asm__ volatile("movq %rdi, %r10\n\t"
++	                 "movq 0(%r10), %rax\n\t"
++	                 "subq $8, %rsp\n\t"
++	                 "movq 56(%r10), %r11\n\t"
++	                 "movq %r11, 0(%rsp)\n\t"
++	                 "movq 8(%r10), %rdi\n\t"
++	                 "movq 16(%r10), %rsi\n\t"
++	                 "movq 24(%r10), %rdx\n\t"
++	                 "movq 32(%r10), %rcx\n\t"
++	                 "movq 40(%r10), %r8\n\t"
++	                 "movq 48(%r10), %r9\n\t"
++	                 "call *%rax\n\t"
++	                 "addq $8, %rsp\n\t"
++	                 "ret\n\t");
++}
+ static_assert(sizeof(size_t) == 8 && offsetof(ModuleArguments, callback) == 24);
+ __attribute__((naked)) uint64_t KYTY_GUEST_CALL_BOUNDARY_SYSV ModuleTransition(void*) {
+ 	__asm__ volatile("movq %rdi, %r10\n\t"
+@@ -223,6 +246,22 @@
+ 	return {{GuestCallBoundaryStatus::InvalidArgument, GuestCallOutcomeTag::NotInvoked, 0},
+ 	        Fail(GuestFailureReason::BoundaryUnavailable, target), StopRequested()};
+ }
++RuntimeGuestResult RuntimeGuestExecution::InvokeIntegerCallback(uint64_t target,
++    const uint64_t* values, size_t count) noexcept {
++	auto lease = TryAcquire(GuestWorkKind::Callback);
++	if (!lease) { return {{GuestCallBoundaryStatus::Ok, GuestCallOutcomeTag::NotInvoked, 0}, Failure(), true}; }
++#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
++	if (target && count <= 7 && (values || count == 0)) {
++		IntegerCallbackArguments arguments {target, {}};
++		for (size_t n = 0; n < count; ++n) { arguments.values[n] = values[n]; }
++		// Ownership, argument storage and both leases remain above the naked
++		// transition; Invoke performs the existing stop/abort/thread-exit handling.
++		return Invoke(IntegerCallbackTransition, &arguments);
++	}
++#endif
++	return {{GuestCallBoundaryStatus::InvalidArgument, GuestCallOutcomeTag::NotInvoked, 0},
++	        Fail(GuestFailureReason::BoundaryUnavailable, target), StopRequested()};
++}
+ GuestThreadExitOutcome RuntimeGuestExecution::PendingThreadExit() const noexcept {
+ 	return thread_exit_request.owner.identity == owner_.identity && thread_exit_request.owner.token == owner_.token ?
+ 	    thread_exit_request.outcome : GuestThreadExitOutcome {};
