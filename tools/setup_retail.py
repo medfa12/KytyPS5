@@ -4,6 +4,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 import subprocess
 import sys
@@ -11,6 +13,40 @@ import sys
 sys.dont_write_bytecode = True
 from prepare_shellui_managed_1360 import LAUNCHER_PROFILES, validate_rnps_source
 from extract_agc_register_data import extract as extract_agc
+
+
+def rnps_plan(fw, stage, source):
+    """Validate decrypted HBC and plan filenames without modifying the input."""
+    plan = []
+    for title in validate_rnps_source(fw, stage, source):
+        files = {p.name: p for p in title.iterdir() if p.is_file() and p.name != '_delete.txt'}
+        delete_file = title / '_delete.txt'
+        deletes = set(delete_file.read_text(encoding='utf-8').splitlines()) if delete_file.exists() else set()
+        for name, path in list(files.items()):
+            if not name.endswith('.ps.hbc'):
+                continue
+            target = name[:-4] + '.bundle.hbc'
+            sibling = files.get(target)
+            if sibling is not None:
+                with sibling.open('rb') as f:
+                    encrypted = f.read(8) == b'RNPSHEDR'
+                if not encrypted and sibling.read_bytes() != path.read_bytes():
+                    raise ValueError('Conflicting decrypted RNPS payloads: ' + str(path))
+            files[target] = path
+            del files[name]
+        for name, path in list(files.items()):
+            if not name.endswith('.bundle.hbc'):
+                continue
+            with path.open('rb') as f:
+                magic = f.read(8)
+            if magic != bytes.fromhex('c61fbc03c103191f'):
+                raise ValueError('RNPS requires decrypted Hermes HBC, not an encrypted container: ' + str(path))
+            # Prefer the supplied bytecode to a possibly encrypted JS sibling.
+            sibling = name[:-4]
+            files.pop(sibling, None)
+            deletes.add(sibling)
+        plan.append((title.name, files, deletes))
+    return plan
 
 
 def main():
@@ -31,6 +67,7 @@ def main():
     install = Path(__file__).resolve().parent.parent
     fw, data = args.firmware.resolve(), args.data.resolve()
     errors = []
+    overlays = []
     agc_path = data / 'agc-register-data.json'
     agc_bytes = None
     try:
@@ -77,10 +114,17 @@ def main():
         errors.append('Provide --rnps-source with matching decrypted per-title RNPS overlays')
     else:
         try:
-            validate_rnps_source(fw, data / 'managed', args.rnps_source.resolve())
+            overlays = rnps_plan(fw, data / 'managed', args.rnps_source.resolve())
         except (ValueError, OSError) as exc:
             errors.append(str(exc))
     if profile == 'alternate':
+        for name, expected in (
+            ('libSceNpCommon.sprx', '81de809c26e4cd1a73d6268c7e89d1e41cf811397f1ac7be17f70e8e14a26a35'),
+            ('libSceSsl.sprx', 'c4cd758bb1f9aa25ffef517e89e029ef4b3f6f3b22b7e525c1e4bf591b8fb3a7'),
+            ('libSceLibcInternal.sprx', '8fa838791061e19ca81ddd4912798bfd1d074f8127ce8c5fb25bb708eab66935')):
+            provider = fw / 'system_b/common/lib' / name
+            if not provider.is_file() or hashlib.sha256(provider.read_bytes()).hexdigest() != expected:
+                errors.append('Missing or unsupported native startup provider: ' + str(provider))
         for name, path, expected in (
             ('core', args.core_record, '5d9c1daacc67e91fbe1ddfdd0eac992270edc0e55986564cf579da89a95cc57a'),
             ('ui', args.ui_record, 'b35057cfe2d2d844f287325c438b39950ed6555f686592af546eb12fb950e0aa')):
@@ -101,6 +145,14 @@ def main():
             output.write(agc_bytes)
     work = data / 'work'
     work.mkdir(exist_ok=True)
+    # A new input snapshot avoids overwriting earlier diagnostics or source files.
+    rnps_source = Path(tempfile.mkdtemp(prefix='rnps-input-', dir=data))
+    for title, files, deletes in overlays:
+        target = rnps_source / title
+        target.mkdir()
+        for name, source in files.items():
+            shutil.copyfile(source, target / name)
+        (target / '_delete.txt').write_text('\n'.join(sorted(deletes)) + '\n', encoding='utf-8')
     command = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
                str(install / 'tools/run_shellui_1360.ps1'), '-FirmwareRoot', str(fw),
                '-RuntimeRoot', str(data), '-WorkDir', str(work),
@@ -108,9 +160,11 @@ def main():
                '-EmulatorPath', str(install / 'kyty_emulator.exe'),
                '-ManagedStage', str(data / 'managed'), '-SystemDataPath', str(data / 'system'),
                '-UrlConfigReference', str(args.url_config.resolve()),
-               '-RnpsSource', str(args.rnps_source.resolve()), '-LauncherProfile', profile,
+                '-RnpsSource', str(rnps_source), '-LauncherProfile', profile,
                '-LogName', 'retail', '-VshRuntime', '-ForegroundUser', '-UserStore',
-               '-RnpsReplay', '-NoGraphicsDebugDump', '-MonoLogLevel', 'error']
+                '-RnpsReplay', '-NoGraphicsDebugDump', '-MonoLogLevel', 'error']
+    if profile == 'alternate':
+        command += ['-NativeNpAlternateStartup', '-NativeSsl']
     for option, path in (('-CoreAuthRecord', args.core_record), ('-UiAuthRecord', args.ui_record)):
         if path is not None:
             command += [option, str(path.resolve())]

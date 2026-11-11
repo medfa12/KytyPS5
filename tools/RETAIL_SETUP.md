@@ -1,5 +1,25 @@
 # Retail firmware setup (experimental)
 
+Current runtime status: mixed retail/devkit diagnostics pass the earlier
+AutoMounter startup exception with native NP and SSL enabled, but the tested
+Intel Arc system still displays a black surface at 0 FPS. Usable Home and
+retail-only startup are not verified.
+
+Supply decrypted RNPS files under `--rnps-source <directory>`, with one title
+directory per app (for example `NPXS40141/host.ps.hbc`). Setup accepts bare
+Hermes bytecode as `*.ps.hbc` or `*.ps.bundle.hbc`, normalizes the former to the
+runtime filename, and omits the corresponding JS bundle sibling in its staged
+copy. Conflicting plaintext variants and encrypted HBC containers are rejected.
+Setup creates a separate RNPS input snapshot under your data directory; source
+firmware and decrypted input files are not modified. It does not decrypt RNPS
+or compile decompiled JavaScript back into bytecode.
+
+For the hash-detected alternate retail profile, setup automatically selects
+native NP startup and native SSL/libc initialization. Their exact firmware
+providers are checked before preparation, then validated again by the runtime.
+These options remove observed startup prerequisites; they do not establish
+successful PSN authentication or working graphics.
+
 Windows requires Python 3.10+ with `dnfile` (`python -m pip install dnfile`),
 Windows PowerShell, and the installed emulator/runtime DLLs.
 
