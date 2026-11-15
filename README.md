@@ -40,6 +40,31 @@ Community game test results are available in the
 Compatibility, stability, and performance can vary between versions. You may encounter crashes
 or graphical glitches, so please include the version you tested when reporting an issue.
 
+## Retail firmware 13.60 launch guide
+
+The retail firmware shell workflow is on this fork's
+[`retail-release` branch](https://github.com/medfa12/KytyPS5/tree/retail-release).
+Use its installed package and follow the
+[step-by-step Windows launch guide](https://github.com/medfa12/KytyPS5/blob/retail-release/README.md#launching-retail-firmware-1360-windows):
+
+1. Supply your own extracted **retail firmware 13.60** and the required
+   decrypted executables/modules.
+2. **Decrypt the matching RNPS bundles separately** and retain their per-title
+   directory structure. An independent community repository exists for this
+   preparation step; it is not named or linked here.
+3. Install Python 3.10+ and `dnfile`, then use the retail package's
+   `tools/setup_retail.py --check` with your firmware, decrypted RNPS, matching
+   setup inputs, and a dedicated writable data directory.
+4. Resolve any missing prerequisites, then use the same arguments with
+   `--launch` instead of `--check`.
+
+Emulation development and the jailbreak scene are separate activities.
+Firmware extraction and RNPS decryption are external preparation steps;
+these instructions begin with user-prepared files and provide no exploit
+chains, decryption keys, or firmware downloads. PSN sign-in is outside this
+release workflow. The retail branch remains experimental; a successful input
+check is not a guarantee of Home or application compatibility.
+
 ## Screenshots
 
 <table align="center">
