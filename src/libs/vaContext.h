@@ -3,6 +3,9 @@
 
 #include <cstddef>
 #include <xmmintrin.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define VA_ARGS                                                                                    \
@@ -30,9 +33,27 @@
 	(ctx).va_list.reg_save_area     = &(ctx).reg_save_area;                                        \
 	(ctx).va_list.gp_offset         = offsetof(VaRegSave, gp);                                     \
 	(ctx).va_list.fp_offset         = offsetof(VaRegSave, fp);                                     \
-	(ctx).va_list.overflow_arg_area = &overflow_arg_area;
+	/* Overflow base = first stack arg = incoming rsp + 8 (the slot holding */                    \
+	/* the return address, +8). Probed alternatives both fail: &overflow_arg_area */              \
+	/* names a compiler spill slot (only slot 0's VALUE is right; neighbors are */                \
+	/* adjacent reg spills, not caller stack args), and frame_address()+16 points */              \
+	/* into the realigned frame (prologue-dependent garbage). The intrinsic is */                 \
+	/* computed from the incoming rsp by the compiler, so it survives */                          \
+	/* force_align_arg_pointer. Validated with a raw-asm SysV caller under */                     \
+	/* clang-cl /O2 (all 6 reg + 3 stack args exact). Requires running in the */                   \
+	/* HLE body itself (never inlined elsewhere). */                                              \
+	(ctx).va_list.overflow_arg_area = VA_OVERFLOW_BASE();                                          \
+	(void)overflow_arg_area;
 
 namespace Libs {
+
+#ifdef _MSC_VER
+// First stack argument from the return-address slot. See VA_CONTEXT note.
+#define VA_OVERFLOW_BASE() (static_cast<char*>(_AddressOfReturnAddress()) + 8)
+#else
+// Non-MSVC targets keep the historical formula (unchanged behavior there).
+#define VA_OVERFLOW_BASE() (static_cast<void*>(&overflow_arg_area))
+#endif
 
 #pragma pack(1)
 

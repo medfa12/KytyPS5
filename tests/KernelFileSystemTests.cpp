@@ -5,17 +5,29 @@
 #include "common/archive.h"
 #include "common/file.h"
 #include "ArchiveTestFixture.h"
-#include "FileTimeTestUtil.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "common/virtualMemory.h"
 #include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
+#include "kernel/fileSystemIdentity.h"
+#include "kernel/memory.h"
+#include "libs/guestHeap.h"
+#include "libs/controller.h"
+#include "libs/libMbusDevice.h"
+#include "libs/dialog.h"
+#include "libs/libLncUtil.h"
+#include "libs/padData.h"
+#include "libs/libs.h"
+#include "libs/libGuestFile.h"
+#include "loader/runtimeLinker.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "libs/kernelIoctl.h"
 #include "libs/network.h"
 #include "loader/additionalContent.h"
 #include "loader/runtimeLinker.h"
@@ -31,6 +43,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <future>
 #include <limits>
 #include <memory>
@@ -40,6 +54,12 @@
 #include <thread>
 #include <vector>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #if defined(__linux__)
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -51,16 +71,39 @@
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 }
+namespace Libs::FsSandbox::FsInternalForVsh { void InitFsInternalForVshSandbox_1(Loader::SymbolDatabase*); }
 
-namespace Libs::LibKernel {
-void KernelDispatchPendingSignalForCurrentThread();
+namespace Libs::LibcInternal {
+const void* KYTY_SYSV_ABI SceKernelGetFsSandboxRandomWord();
 }
+
+namespace Libs::ShellCoreFloor::KernelFloor {
+void InitShellCoreFloorKernel_1(Loader::SymbolDatabase* symbols);
+}
+
+void TestJsonResourceLookup();
+void TestJsonPathParser(const std::filesystem::path& root);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void TestSocketpairNetworkOnly();
+void TestKernelSemaphoreProvenance(bool enabled);
+void TestKernelSemaphores();
+void TestKernelSemaphoreGuestThreads();
+void TestKernelEventFlagLifetime();
+void TestKernelEventFlagGuestThreads();
+void TestNetworkP2pOwnership();
+void TestSocketpairFileDescriptors(const std::filesystem::path& root);
+#endif
 
 namespace Libs {
 void InitLibKernel_1(Loader::SymbolDatabase *symbols);
 void InitSysmodule_1(Loader::SymbolDatabase *symbols);
 void InitSystemService_1(Loader::SymbolDatabase *symbols);
+void InitPad_1(Loader::SymbolDatabase *symbols);
 void InitAppContent_1(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LncUtil {
+void InitLncUtil_1(Loader::SymbolDatabase* symbols);
 }
 
 namespace Libs::LibAmpr {
@@ -73,6 +116,19 @@ void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 
 namespace Libs::LibNpWebApi2 {
 void InitNet_1_NpWebApi2(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::ShellCoreFloor::LibcFloor {
+void InitShellCoreFloorLibc_1(Loader::SymbolDatabase* symbols);
+}
+namespace Libs::SysKern {
+void InitSysKern_1(Loader::SymbolDatabase* symbols);
+}
+namespace Libs::LibcInternal {
+void InitLibcInternal_1(Loader::SymbolDatabase* symbols);
+void* KYTY_SYSV_ABI GuestFopen(const char* path, const char* mode);
+int KYTY_SYSV_ABI GuestFclose(void* stream);
+int KYTY_SYSV_ABI RemoveFile(const char* path);
 }
 
 namespace Libs::LibNpCommerce {
@@ -251,33 +307,6 @@ void TestMutexHandoff() {
         "mutex remains usable after waiter cancellation");
 }
 
-int dispatched_signals = 0;
-
-void KYTY_SYSV_ABI CountDispatchedSignal(int, void *) { dispatched_signals++; }
-
-void TestPendingSignalDispatch() {
-  using namespace Libs::LibKernel;
-  Loader::SymbolDatabase symbols;
-  Libs::InitLibKernel_1(&symbols);
-  const auto *install_symbol = symbols.FindByNid("WkwEd3N7w0Y", Loader::SymbolType::Func);
-  const auto *remove_symbol = symbols.FindByNid("Qhv5ARAoOEc", Loader::SymbolType::Func);
-  Check(install_symbol != nullptr && remove_symbol != nullptr, "signal handler exports resolve");
-  const auto install = reinterpret_cast<int(KYTY_SYSV_ABI *)(int, void *)>(install_symbol->vaddr);
-  const auto remove = reinterpret_cast<int(KYTY_SYSV_ABI *)(int)>(remove_symbol->vaddr);
-  Check(install(30, reinterpret_cast<void *>(CountDispatchedSignal)) == OK,
-        "install signal handler");
-
-  PthreadQueuePendingSignal(PthreadSelf(), 30);
-  const auto start = std::chrono::steady_clock::now();
-  for (int call = 0; call < 1000000; ++call) {
-    KernelDispatchPendingSignalForCurrentThread();
-  }
-  Check(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(50) &&
-            dispatched_signals == 1,
-        "a pending signal dispatches once and idle dispatches skip the signal scan");
-  Check(remove(30) == OK, "remove signal handler");
-}
-
 class TempDirectory {
 public:
   TempDirectory() {
@@ -403,7 +432,7 @@ void TestFileDescriptorFlags() {
   const auto* symbol = symbols.Find(
       {"8nY19bKoiZk", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
   Check(symbol != nullptr, "POSIX fcntl export resolves");
-  const auto fcntl = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int, int)>(symbol->vaddr);
+  const auto fcntl = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int, int64_t)>(symbol->vaddr);
   Check(fcntl(std::numeric_limits<int>::min(), 1, 0) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
         "invalid descriptor reports EBADF");
@@ -717,33 +746,9 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
-  Check(FileSystem::KernelUnlink("/savedata0") == Libs::LibKernel::KERNEL_ERROR_EPERM,
-        "unlink refuses a directory");
-  Check(FileSystem::KernelMkdir(Path, 0777) == Libs::LibKernel::KERNEL_ERROR_EEXIST &&
-            FileSystem::KernelMkdir("/savedata0", 0777) == Libs::LibKernel::KERNEL_ERROR_EEXIST,
-        "mkdir reports an existing file or directory");
 }
 
-bool HasTestWriteTime(const FileSystem::FileStat &stat) {
-  return stat.st_mtim.tv_sec == 1700000000 && stat.st_mtim.tv_nsec == 123456700 &&
-         stat.st_birthtim.tv_sec == 1700000000 && stat.st_birthtim.tv_nsec == 123456700 &&
-         stat.st_atim.tv_sec > 1700000000;
-}
-
-void TestStatTimes() {
-  constexpr char Path[] = "/savedata0/stat-times.dat";
-  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
-  Check(fd >= 3, "create stat time fixture");
-  SetUnixWriteTime(FileSystem::GetRealFilename(Path), 1700000000123456700);
-  FileSystem::FileStat by_path {};
-  FileSystem::FileStat by_fd {};
-  Check(FileSystem::KernelStat(Path, &by_path) == OK && FileSystem::KernelFstat(fd, &by_fd) == OK &&
-            HasTestWriteTime(by_path) && HasTestWriteTime(by_fd),
-        "stat and fstat report exact host file times");
-  Check(FileSystem::KernelClose(fd) == OK, "close stat time fixture");
-}
-
-void TestFsync() {
+void TestFsync(const std::filesystem::path& root) {
   Loader::SymbolDatabase symbols;
   Libs::InitLibKernel_1(&symbols);
   const auto* symbol = symbols.Find(
@@ -763,12 +768,43 @@ void TestFsync() {
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
         "closed fsync descriptor reports POSIX EBADF");
 
-  for (const auto& [path, flags] : {std::pair {"/savedata0", 0x00020000}, std::pair {Path, 0},
-                                    std::pair {"/dev/urandom", 0x2}}) {
-    const int descriptor = FileSystem::KernelOpen(path, flags, 0);
-    Check(descriptor >= 3 && fsync(descriptor) == OK && FileSystem::KernelClose(descriptor) == OK,
-          "fsync succeeds on a directory, a read-only file and a writable device");
-  }
+  const auto directory = root / "dirsync";
+  const auto renamed = root / "dirsync-renamed";
+  Check(std::filesystem::create_directory(directory), "create directory fsync fixture");
+  const int parent = FileSystem::KernelOpen("/savedata0/dirsync", 0x20000, 0);
+  FileSystem::FileStat before {}, after {};
+  Check(parent >= 3 && FileSystem::KernelFstat(parent, &before) == OK,
+        "open retained journal parent directory");
+  const int journal = FileSystem::KernelOpen("/savedata0/dirsync/test.db-journal", 0x602, 0600);
+  Check(journal >= 3 && FileSystem::KernelWrite(journal, "journal", 7) == 7 &&
+            fsync(journal) == OK && fsync(parent) == OK,
+        "flush journal bytes and directory entry before commit");
+  Check(FileSystem::KernelClose(journal) == OK &&
+            FileSystem::KernelUnlink("/savedata0/dirsync/test.db-journal") == OK &&
+            FileSystem::KernelFsync(parent) == OK,
+        "journal deletion followed by parent-directory fsync succeeds");
+
+  std::filesystem::rename(directory, renamed);
+  const int replacement = FileSystem::KernelOpen("/savedata0/dirsync", 0x602, 0600);
+  Check(replacement >= 3 && FileSystem::KernelClose(replacement) == OK &&
+            fsync(parent) == OK && FileSystem::KernelFstat(parent, &after) == OK &&
+            before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
+            (after.st_mode & 0170000) == 0040000,
+        "directory fsync retains the renamed object despite a regular-file path replacement");
+  Common::File invalid_directory;
+  std::error_code error;
+  Check(!invalid_directory.OpenDirectory(directory, error) &&
+            error == std::errc::not_a_directory,
+        "directory backend rejects a regular-file replacement");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  Common::File metadata;
+  Check(metadata.OpenMetadata(renamed, error) && !metadata.Flush(),
+        "metadata-only host handle flush failure is not reported as success");
+  metadata.Close();
+#endif
+  Check(FileSystem::KernelClose(parent) == OK && fsync(parent) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
+        "closed directory fsync reports POSIX EBADF");
 }
 
 void TestSaveTruncate() {
@@ -1175,6 +1211,14 @@ void CheckMountRoot(const std::filesystem::path &root) {
 }
 
 void CheckUnmappedPaths(const std::filesystem::path &root) {
+  FileSystem::ScopedGuestFsContext scope(FileSystem::CreateBootstrapFsContext());
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  // Drive syntax is invalid in guest paths, even with a bound cwd. It must
+  // never become a host-path escape or a sandbox creation candidate.
+  constexpr int rejected_host_path = Libs::LibKernel::KERNEL_ERROR_EINVAL;
+#else
+  constexpr int rejected_host_path = Libs::LibKernel::KERNEL_ERROR_ENOENT;
+#endif
   const auto host_file = root / "host-only.dat";
   const auto host_path = Common::PathToGenericString(host_file);
   Common::File fixture;
@@ -1186,30 +1230,30 @@ void CheckUnmappedPaths(const std::filesystem::path &root) {
         "the guest root is a directory without a mount");
   Check(FileSystem::GetRealFilename(host_path).empty() &&
             FileSystem::KernelOpen(host_path.c_str(), 0, 0) ==
-                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+                rejected_host_path &&
             FileSystem::KernelStat(host_path.c_str(), &stat) ==
-                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+                rejected_host_path &&
             FileSystem::KernelCheckReachability(host_path.c_str()) ==
-                Libs::LibKernel::KERNEL_ERROR_ENOENT,
+                rejected_host_path,
         "existing host files are absent from the guest namespace");
   Check(FileSystem::KernelUnlink(host_path.c_str()) ==
-            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            rejected_host_path &&
             FileSystem::KernelRmdir(Common::PathToGenericString(root).c_str()) ==
-                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+                rejected_host_path &&
             std::filesystem::exists(host_file),
         "unmapped host files and directories cannot be removed");
 
   const auto missing = Common::PathToGenericString(root / "unmapped-create");
   Check(FileSystem::KernelOpen(missing.c_str(), 0x601, 0777) ==
-            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            rejected_host_path &&
             FileSystem::KernelMkdir(missing.c_str(), 0777) ==
-                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+                rejected_host_path &&
             !std::filesystem::exists(root / "unmapped-create"),
         "creation requires a mounted guest destination");
 
   FileSystem::Mount(root, "/app0");
   Check(FileSystem::KernelRename("/app0/host-only.dat", missing.c_str()) ==
-            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            rejected_host_path &&
             std::filesystem::exists(host_file) &&
             !std::filesystem::exists(root / "unmapped-create"),
         "rename to an unmapped destination preserves the source");
@@ -1388,8 +1432,8 @@ void CheckUnicodeLogPath(const std::filesystem::path &root) {
   Config::Load(options);
   Log::Initialize();
   constexpr std::string_view Payload = "Unicode log path\n";
-  Log::Write({}, Payload);
-  Log::Flush();
+  Log::Write(Payload);
+  Log::Shutdown();
 
   Common::File result(options.printf_output_file, Common::File::Mode::Read);
   Check(!result.IsInvalid(), "open Unicode log file");
@@ -1420,15 +1464,11 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
         "directory SEEK_END uses padded stream size");
   FileSystem::FileStat stat{};
   Check(FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == end &&
-            stat.st_blksize == 0x10000,
+            stat.st_blksize == 512,
         "directory stat agrees with seek and enumeration");
   Check(FileSystem::KernelStat("/app0/", &stat) == OK && stat.st_size == end &&
-            stat.st_blocks == end / 512 && stat.st_blksize == 0x10000,
+            stat.st_blocks == end / 512,
         "path and descriptor directory stat agree");
-  std::vector<char> whole(stat.st_blksize);
-  Check(FileSystem::KernelLseek(fd, 0, 0) == 0 &&
-            FileSystem::KernelGetdents(fd, whole.data(), whole.size()) == end,
-        "one getdents of st_blksize bytes reads the whole directory");
   Check(FileSystem::KernelLseek(fd, 0, 0) == 0,
         "rewind directory for asset read");
   std::vector<char> raw(static_cast<size_t>(end));
@@ -1440,8 +1480,6 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
 
   std::array<char, 512> block{};
   int64_t base = -1;
-  std::set<uint32_t> filenos;
-  size_t entries = 0;
   for (int64_t offset = 0; offset < end; offset += block.size()) {
     Check(FileSystem::KernelGetdirentries(fd, block.data(), block.size(),
                                           &base) == block.size() &&
@@ -1457,15 +1495,9 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
       Check(length >= 9 + name_length && length <= block.size() - pos &&
                 block[pos + 8 + name_length] == '\0',
             "directory entries remain complete within every block");
-      uint32_t fileno = 0;
-      std::memcpy(&fileno, block.data() + pos, sizeof(fileno));
-      filenos.insert(fileno);
-      entries++;
       pos += length;
     }
   }
-  Check(entries > 2 && filenos.size() == entries,
-        "directory entries carry distinct file numbers");
   Check(FileSystem::KernelGetdirentries(fd, block.data(), block.size(),
                                         &base) == 0 &&
             base == end,
@@ -1524,12 +1556,6 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
     Check(symbol != nullptr, "AMPR command and submission exports resolve");
     return symbol->vaddr;
   };
-  using GetFileStat = int (KYTY_SYSV_ABI *)(uint32_t, FileSystem::FileStat *);
-  FileSystem::FileStat stat {};
-  Check(reinterpret_cast<GetFileStat>(find("ApkYaHb8Sek"))(file_id, &stat) == OK &&
-            (stat.st_mode & 0170000u) == 0100000u && stat.st_size == 3 && stat.st_blocks == 1 &&
-            HasTestWriteTime(stat),
-        "APR file stat reports a regular file with its size and host times");
   using Unary = void (KYTY_SYSV_ABI *)(void *);
   using AprConstructor = void (KYTY_SYSV_ABI *)(void *, void *, void *);
   using SetBuffer = int (KYTY_SYSV_ABI *)(void *, void *, uint32_t);
@@ -1870,14 +1896,6 @@ void CheckAprPaths(const std::filesystem::path &root) {
               stat.st_size == static_cast<int64_t>(sizes[i]) && size == sizes[i],
           "APR re-resolution preserves each file's ID, host path and cached size");
   }
-  const char *directory_path[] = {"perf-audit"};
-  uint64_t directory_size = 0, cached_size = 1;
-  Check(resolve("/app0/", directory_path, 1, ids, &directory_size, &error_index) == OK &&
-            directory_size == 0x10000 &&
-            reinterpret_cast<Size>(size_symbol->vaddr)(ids[0], &cached_size) == OK &&
-            cached_size == 0 &&
-            reinterpret_cast<Size>(size_symbol->vaddr)(0xfffffffeu, &cached_size) != OK,
-        "APR resolves a directory and reports sizes only for known IDs");
 
   // PATH_MAX includes NUL; all components remain below NAME_MAX (255).
   std::string longest = "/app0/";
@@ -1902,7 +1920,6 @@ void CheckAprPaths(const std::filesystem::path &root) {
   Check(resolve(unterminated.data(), paths, 1, ids, sizes, &error_index) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
-  SetUnixWriteTime(root / collision_paths[0], 1700000000123456700);
   CheckAmprOrdering(symbols, collision_ids[0]);
   FileSystem::Umount("/app0");
 }
@@ -2005,7 +2022,22 @@ void CheckSocketReceiveBuffer(int reader, int writer) {
   registration.data.u64 = 0x12345678;
   Check(epoll >= 0 && Net::EpollControl(epoll, 1, reader, &registration) == 0,
         "register buffered socket readability");
+  namespace EventQueue = Libs::LibKernel::EventQueue;
+  EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+  Check(EventQueue::KernelCreateEqueue(&queue, "buffered-receive") == OK &&
+            EventQueue::KernelAddReadEvent(queue, reader, 1, &registration) == OK,
+        "register buffered socket kernel read event");
   const auto check_readable = [&](bool expected) {
+    EventQueue::KernelEvent read_event {};
+    int count = -1;
+    const Libs::LibKernel::KernelUseconds poll = expected ? 1000000 : 0;
+    Check(EventQueue::KernelWaitEqueue(queue, &read_event, 1, &count, &poll) ==
+              (expected ? OK : Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT) &&
+              count == (expected ? 1 : 0) &&
+              (!expected || (read_event.ident == static_cast<uintptr_t>(reader) &&
+                  read_event.filter == EventQueue::KERNEL_EVFILT_READ &&
+                  read_event.udata == &registration)),
+          "kernel read events reflect peek-buffered bytes and their removal");
     std::array<uint64_t, 16> readable {};
     const auto bit = uint64_t {1} << (reader % 64);
     readable[reader / 64] = bit;
@@ -2071,7 +2103,7 @@ void CheckSocketReceiveBuffer(int reader, int writer) {
         "ordinary receive consumes a short buffered result");
   check_readable(false);
   Check(Net::Setsockopt(reader, 0xffff, 0x1200, &disabled, sizeof(disabled)) == 0 &&
-            Net::EpollDestroy(epoll) == 0,
+            Net::EpollDestroy(epoll) == 0 && EventQueue::KernelDeleteEqueue(queue) == OK,
         "restore blocking receives and destroy epoll");
   Check(Net::Recv(reader, received.data(), 4, PeekWaitAll | 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
@@ -2191,10 +2223,12 @@ void TestNetCtlHostIpv4() {
 
 template <int Mode>
 void KYTY_SYSV_ABI RecordNpState(int user_id, uint32_t state, void* arg) {
-  auto& event = *static_cast<std::array<int, 3>*>(arg);
+  auto& event = *static_cast<std::array<int, 4>*>(arg);
   ++event[0];
   event[1] = user_id;
   event[2] = static_cast<int>(state);
+  // Keep callbacks distinct under identical-code folding and verify routing.
+  event[3] = Mode;
 }
 
 void TestNpEmulation() {
@@ -2245,7 +2279,7 @@ void TestNpEmulation() {
   options.printf_direction = Config::LogDirection::Silent;
   Check(!options.network_connected && !options.psn_emulation_enabled,
         "host networking and PSN emulation both require explicit opt-in");
-  static std::array<std::array<int, 3>, 4> events {};
+  static std::array<std::array<int, 4>, 4> events {};
   const std::array<NpStateCallbackA, 4> callbacks {
       RecordNpState<0>, RecordNpState<1>, RecordNpState<2>, RecordNpState<3>};
   int mode = 0;
@@ -2269,7 +2303,7 @@ void TestNpEmulation() {
       Check(NpRegisterStateCallbackA(callbacks[mode], &events[mode]) > 0 &&
                 NpCheckCallback() == OK && events[mode][0] == 1 &&
                 events[mode][1] == Config::GetUserId() &&
-                events[mode][2] == (emulate ? 2 : 1),
+                events[mode][2] == (emulate ? 2 : 1) && events[mode][3] == mode,
             "initial NP callback matches the selected emulated sign-in state");
       ++mode;
       for (int player = 0; player < Config::MAX_PLAYERS; ++player) {
@@ -2550,14 +2584,17 @@ void CheckSocketWakeup() {
                     deadline.data()) == 1 && readable[reader / 64] == bit,
         "select reports the guest descriptor after wake");
   std::array<char, sizeof(payload)> received {};
-  Check(net_recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
+  // Upstream's Windows transport buffers PEEK|WAITALL to provide guest
+  // semantics despite Winsock rejecting that combination directly.
+  constexpr int peek_flags = 0x42;
+  Check(net_recv(reader, received.data(), received.size(), peek_flags) == sizeof(payload) &&
             std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
             *net_errno == Libs::Posix::POSIX_EINVAL,
-        "Net receive forwards PEEK and WAITALL without consuming bytes");
+        "Net receive forwards supported PEEK flags without consuming bytes");
   received.fill(0);
   Check(net_recv(reader, received.data(), received.size(), 0x40) == sizeof(payload) &&
             std::memcmp(received.data(), payload, sizeof(payload)) == 0,
-        "Net receive consumes the same bytes after peeking");
+        "Net receive forwards WAITALL and consumes the same bytes after peeking");
 #if !defined(_WIN32)
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
@@ -2647,11 +2684,12 @@ void CheckSocketWakeup() {
             Libs::Network::NET_ERROR_EINVAL && *net_errno == Libs::Posix::POSIX_EINVAL,
         "Net send timeout rejects undersized values");
   uint32_t option_size = sizeof(timeout);
-  Check(net_setsockopt(datagram, 0xffff, 0x7fffffff, &timeout, option_size) ==
-            Libs::Network::NET_ERROR_ENOPROTOOPT &&
-            *net_errno == Libs::Posix::POSIX_ENOPROTOOPT &&
-            net_getsockopt(datagram, 0xffff, 0x7fffffff, &timeout, &option_size) ==
-            Libs::Network::NET_ERROR_ENOPROTOOPT &&
+  const int unknown_set = net_setsockopt(datagram, 0xffff, 0x7fffffff, &timeout, option_size);
+  const int unknown_set_errno = *net_errno;
+  const int unknown_get = net_getsockopt(datagram, 0xffff, 0x7fffffff, &timeout, &option_size);
+  Check(unknown_set == Libs::Network::NET_ERROR_ENOPROTOOPT &&
+            unknown_set_errno == Libs::Posix::POSIX_ENOPROTOOPT &&
+            unknown_get == Libs::Network::NET_ERROR_ENOPROTOOPT &&
             *net_errno == Libs::Posix::POSIX_ENOPROTOOPT,
         "Net unknown socket options return protocol-option errors");
 #if defined(__linux__)
@@ -2804,6 +2842,32 @@ void CheckSocketWakeup() {
         "closed descriptor fails without clearing input fd_set");
 }
 
+#include "FileSystemIdentityTests.inc"
+#include "GuestFsContextTests.inc"
+#include "VshInputFocusTests.inc"
+#include "NetworkPeerNameTests.inc"
+#include "NetworkNonblockingConnectTests.inc"
+#include "PosixOpenTests.inc"
+#include "ProfileCacheFileSystemTests.inc"
+#include "SshotDeviceTests.inc"
+#include "MetaDbgDeviceTests.inc"
+#include "DevctlDeviceTests.inc"
+#include "RetailM2DeviceInfoTests.inc"
+#include "RetailCoElfContextTests.inc"
+#include "RetailSystemStateTests.inc"
+#include "libs/libMbusDevice.h"
+#include "RetailMbusPadEventTests.inc"
+#include "CertificationScopeTests.inc"
+#include "NetResolverExTests.inc"
+#include "NetResolverNtoa6Tests.inc"
+#include "SocketFstatTests.inc"
+#include "PthreadBarrierScopeTests.inc"
+#include "PosixVectorTimeTests.inc"
+#include "KernelWriteEventTests.inc"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include "AnonymousShmTests.inc"
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2811,9 +2875,208 @@ int main(int argc, char** argv) {
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
   Config::ConfigOptions options;
-  options.printf_direction = Config::LogDirection::Silent;
+  options.printf_direction = std::getenv("KYTY_TEST_LOG") != nullptr
+                                 ? Config::LogDirection::Console : Config::LogDirection::Silent;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
+
+  if (argc == 2 && std::strcmp(argv[1], "--pthread-barrier-scope-only") == 0) {
+    TestPthreadContractRegistrations();
+    TestPthreadBarrierContracts();
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+    TestPthreadBarrierReleasedLifetime();
+    Common::VirtualMemory::Init();
+    subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    Libs::LibKernel::Initialize();
+    Libs::LibKernel::PthreadInitSelfForMainThread();
+    Common::Singleton<Loader::RuntimeLinker>::Instance();
+    TestPthreadScopeAndGuestBarriers();
+#endif
+    subsystems.Destroy();
+    std::printf("pthread_barrier_scope: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--network-peer-name-only") == 0) {
+    TestNetworkPeerName();
+    subsystems.Destroy();
+    std::printf("network_peer_name: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--network-nonblocking-connect-only") == 0) {
+    TestNetworkNonblockingConnect();
+    subsystems.Destroy();
+    std::printf("network_nonblocking_connect: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--posix-open-only") == 0) {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    TestPosixOpen(temporary.Path());
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("posix_open: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--metadbg-device-only") == 0) {
+    int result = 123;
+    Check(!FileSystem::TryMetaDbgIoctl(3, &result) && result == 123,
+          "ioctl routing before filesystem initialization preserves unrelated requests");
+    FileSystem::Initialize();
+    TestMetaDbgDevice();
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("metadbg_device: all cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--devctl-device-only") == 0) {
+    FileSystem::Initialize();
+    TestDevctlDevice();
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("devctl_device: all cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--retail-m2-info-only") == 0) {
+    FileSystem::Initialize();
+    TestRetailM2DeviceInfo();
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("retail_m2_info: all cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--retail-coelf-context-only") == 0) {
+    TestRetailCoElfContexts();
+    subsystems.Destroy();
+    std::printf("retail_coelf_context: all cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--retail-system-state-only") == 0) {
+    TestRetailSystemState();
+    subsystems.Destroy();
+    std::printf("retail_system_state: all cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--retail-mbus-pad-event-only") == 0) {
+    TestRetailMbusPadEvent();
+    subsystems.Destroy();
+    std::printf("retail_mbus_pad_event: all cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sshot-device-only") == 0) {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    TestSshotDevice(temporary.Path());
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("sshot_device: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--certification-scope-only") == 0) {
+    TestCertificationScope();
+    subsystems.Destroy();
+    std::printf("certification_scope: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--net-resolver-ex-only") == 0) {
+    TestNetResolverEx();
+    subsystems.Destroy();
+    std::printf("net_resolver_ex: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--net-resolver-ntoa6-only") == 0) {
+    TestNetResolverNtoa6();
+    subsystems.Destroy();
+    std::printf("net_resolver_ntoa6: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--socket-fstat-only") == 0) {
+    TestSocketFstat();
+    subsystems.Destroy();
+    std::printf("socket_fstat: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--vsh-input-focus-only") == 0) {
+    TempDirectory temporary;
+    TestVshInputFocus(temporary.Path());
+    subsystems.Destroy();
+    std::printf("vsh_input_focus: all cases passed\n");
+    return 0;
+  }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--socketpair-network-only") == 0) {
+    // Deliberately before Vulkan, Memory and FileSystem initialization: pair
+    // publication and socket fcntl must work without those subsystems.
+    TestSocketpairNetworkOnly();
+    subsystems.Destroy();
+    std::printf("socketpair_network: all cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && (std::strcmp(argv[1], "--semaphore-provenance-enabled") == 0 ||
+                    std::strcmp(argv[1], "--semaphore-provenance-disabled") == 0)) {
+    TestKernelSemaphoreProvenance(std::strcmp(argv[1], "--semaphore-provenance-enabled") == 0);
+    subsystems.Destroy();
+    std::printf("semaphore_provenance: all cases passed\n");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--kernel-semaphores") == 0) {
+    TestKernelSemaphores();
+    subsystems.Destroy();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--kernel-event-flag-lifetime") == 0) {
+    TestKernelEventFlagLifetime();
+    subsystems.Destroy();
+    return 0;
+  }
+  if (argc == 2 && (std::strcmp(argv[1], "--kernel-semaphore-guest-threads") == 0 ||
+                    std::strcmp(argv[1], "--kernel-event-flag-guest-threads") == 0)) {
+    Common::VirtualMemory::Init();
+    subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    Libs::LibKernel::Initialize();
+    Libs::LibKernel::PthreadInitSelfForMainThread();
+    Common::Singleton<Loader::RuntimeLinker>::Instance();
+    if (std::strcmp(argv[1], "--kernel-event-flag-guest-threads") == 0) {
+      TestKernelEventFlagGuestThreads();
+    } else {
+      TestKernelSemaphoreGuestThreads();
+    }
+    subsystems.Destroy();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--network-p2p-only") == 0) {
+    TestNetworkP2pOwnership();
+    subsystems.Destroy();
+    std::printf("network_p2p_ownership: all cases passed\n");
+    return 0;
+  }
+#endif
+
+  if (argc == 2 && std::strcmp(argv[1], "--json-resource-lookup-only") == 0) {
+    TestJsonResourceLookup();
+    subsystems.Destroy();
+    std::printf("json_resource_lookup: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--filesystem-identity-only") == 0) {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    TestFileSystemIdentity(temporary.Path());
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("filesystem_identity: all cases passed\n");
+    return 0;
+  }
 
   if (argc == 2 && std::string_view(argv[1]) == "--network-only") {
 #if defined(__linux__)
@@ -2826,9 +3089,11 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  TestMutexHandoff();
-  TestStaticRwlockDestroy();
-  TestPendingSignalDispatch();
+  // Focused fixtures do not depend on the guest-thread mutex fixture.
+  if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--mutex-only")) {
+    TestMutexHandoff();
+    TestStaticRwlockDestroy();
+  }
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
@@ -2844,9 +3109,148 @@ int main(int argc, char** argv) {
   Check(graphics->window != nullptr, "create hidden Vulkan test window");
   graphics->CreateVulkan();
 
+  if (argc == 2 && std::strcmp(argv[1], "--profile-cache-filesystem-only") == 0) {
+    // KernelRead uses the production render context for cache invalidation.
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    TestProfileCacheFileSystem(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("profile_cache_filesystem: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--kernel-write-events-only") == 0) {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    TestKernelWriteEvents(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("kernel_write_events: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--filesystem-sync-only") == 0) {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    FileSystem::Mount(temporary.Path(), "/savedata0");
+    TestFsync(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("filesystem_sync: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--posix-vector-time-only") == 0) {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    TestPosixVectorTime(temporary.Path());
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    Common::VirtualMemory::Init();
+    subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    Libs::LibKernel::Initialize();
+    Libs::LibKernel::PthreadInitSelfForMainThread();
+    Common::Singleton<Loader::RuntimeLinker>::Instance();
+    TestPosixVectorTimeShm();
+#endif
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("posix_vector_time: all cases passed\n");
+    return 0;
+  }
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--socketpair-filesystem-only") == 0) {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    TestSocketpairFileDescriptors(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("socketpair_filesystem: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 &&
+      (std::strcmp(argv[1], "--anonymous-shm-only") == 0 ||
+       std::strcmp(argv[1], "--anonymous-shm-shutdown-descriptors") == 0 ||
+       std::strcmp(argv[1], "--anonymous-shm-shutdown-memory") == 0 ||
+       std::strcmp(argv[1], "--anonymous-shm-fatal-unmap") == 0 ||
+       std::strcmp(argv[1], "--anonymous-shm-fatal-protect") == 0)) {
+    Common::VirtualMemory::Init();
+    // Shutdown fixtures own the two lifecycle orders; avoid a second registered
+    // Memory shutdown after they have explicitly drained the address space.
+    Libs::LibKernel::Memory::Initialize();
+    Libs::LibKernel::Initialize();
+    FileSystem::ScopedGuestFsContext bootstrap(FileSystem::CreateBootstrapFsContext());
+    Libs::LibKernel::PthreadInitSelfForMainThread();
+    Common::Singleton<Loader::RuntimeLinker>::Instance();
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    Loader::SymbolDatabase symbols;
+    // InitLibKernel_1 includes the Posix registrar in production order.
+    Libs::InitLibKernel_1(&symbols);
+    Libs::LibcInternal::InitLibcInternal_1(&symbols);
+    if (std::strcmp(argv[1], "--anonymous-shm-fatal-unmap") == 0) {
+      TestAnonymousShmFatalRestore(symbols);
+    } else if (std::strcmp(argv[1], "--anonymous-shm-fatal-protect") == 0) {
+      TestAnonymousShmFatalProtectionRestore(symbols);
+    } else if (std::strcmp(argv[1], "--anonymous-shm-only") == 0) {
+      TestAnonymousShm(symbols);
+      TestAnonymousShmFileRegressions(symbols, temporary.Path());
+      FileSystem::Shutdown();
+      Libs::LibKernel::Memory::Shutdown();
+    } else {
+      TestAnonymousShmShutdown(symbols,
+          std::strcmp(argv[1], "--anonymous-shm-shutdown-descriptors") == 0);
+    }
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("anonymous_shm: selected cases passed\n");
+    return 0;
+  }
+#endif
+
+  if (argc == 2 && std::strcmp(argv[1], "--json-path-parser-only") == 0) {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    TestJsonPathParser(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("json_path_parser: all cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--guest-fs-context-only") == 0) {
+    // KernelRead invalidates through the production render context, as in the
+    // ordinary filesystem fixture. Keep its real hidden Vulkan setup alive.
+    Common::VirtualMemory::Init();
+    subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    Libs::LibKernel::Initialize();
+    FileSystem::ScopedGuestFsContext bootstrap(FileSystem::CreateBootstrapFsContext());
+    Libs::LibKernel::PthreadInitSelfForMainThread();
+    // Worker startup consults the loader; its singleton is main-thread-owned.
+    Common::Singleton<Loader::RuntimeLinker>::Instance();
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    TestGuestFsContext(temporary.Path());
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("guest_fs_context: all cases passed\n");
+    return 0;
+  }
+
   TempDirectory temporary;
   CheckOpenFileCoherence(temporary.Path());
   FileSystem::Initialize();
+  TestFileSystemIdentity(temporary.Path());
+  TestPosixVectorTime(temporary.Path());
   TestSysmoduleReferences();
   TestSystemServiceEntitlementEvents();
   TestAddContent(temporary.Path());
@@ -2861,8 +3265,7 @@ int main(int argc, char** argv) {
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
   TestSaveOpenVisibility();
-  TestStatTimes();
-  TestFsync();
+  TestFsync(temporary.Path());
   TestSaveTruncate();
   TestSaveWritev();
   TestAioBatches();

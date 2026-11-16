@@ -182,7 +182,7 @@ static Graphics::SizeAlign ReprojectionDisplaySize() {
 	return {size.size, size.align};
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2Initialize(const SceHmd2InitializeParam* param) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2Initialize(const SceHmd2InitializeParam* param) {
 	PRINT_NAME();
 	if (param == nullptr) {
 		return ERROR_PARAMETER_NULL;
@@ -194,7 +194,7 @@ static int32_t KYTY_SYSV_ABI Hmd2Initialize(const SceHmd2InitializeParam* param)
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformation(SceHmd2DeviceInformation* info) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2GetDeviceInformation(SceHmd2DeviceInformation* info) {
 	PRINT_NAME();
 	if (!g_initialized.load()) {
 		return ERROR_NOT_INITIALIZED;
@@ -220,7 +220,7 @@ static int32_t KYTY_SYSV_ABI Hmd2GetDeviceInformation(SceHmd2DeviceInformation* 
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2GetFieldOfViewWithoutHandle(SceHmd2FieldOfView* fov) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2GetFieldOfViewWithoutHandle(SceHmd2FieldOfView* fov) {
 	PRINT_NAME();
 	if (!g_initialized.load()) {
 		return ERROR_NOT_INITIALIZED;
@@ -234,13 +234,13 @@ static int32_t KYTY_SYSV_ABI Hmd2GetFieldOfViewWithoutHandle(SceHmd2FieldOfView*
 	return OK;
 }
 
-static Graphics::SizeAlign KYTY_SYSV_ABI Hmd2ReprojectionQueryBufferSizeAlign() {
+static Graphics::SizeAlign __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2ReprojectionQueryBufferSizeAlign() {
 	const Graphics::SizeAlign size {sizeof(ReprojectionState), alignof(ReprojectionState)};
 	LOGF("Hmd2: reprojection work size=%" PRIu64 " alignment=%zu\n", size.m_size, size.m_align);
 	return size;
 }
 
-static Graphics::SizeAlign KYTY_SYSV_ABI Hmd2ReprojectionQueryDisplayBufferSizeAlign() {
+static Graphics::SizeAlign __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2ReprojectionQueryDisplayBufferSizeAlign() {
 	const auto size = ReprojectionDisplaySize();
 	LOGF("Hmd2: reprojection display size=%" PRIu64 " alignment=%zu\n", size.m_size,
 	     size.m_align);
@@ -270,7 +270,7 @@ Hmd2ReprojectionInitialize(const SceHmd2ReprojectionInitializeParam* param, void
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2ReprojectionEnableVrMode(uint64_t output_mode) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2ReprojectionEnableVrMode(uint64_t output_mode) {
 	auto* state = GetReprojectionState();
 	if (state == nullptr) {
 		return ERROR_REPROJECTION_NOT_INITIALIZED;
@@ -289,7 +289,7 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionEnableVrMode(uint64_t output_mode) 
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2Open(int32_t user_id, int32_t type, int32_t index,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2Open(int32_t user_id, int32_t type, int32_t index,
                                       const void* param) {
 	PRINT_NAME();
 	if (!g_initialized.load()) {
@@ -301,7 +301,7 @@ static int32_t KYTY_SYSV_ABI Hmd2Open(int32_t user_id, int32_t type, int32_t ind
 	return HMD_HANDLE;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2ReprojectionBeginFrame(int64_t flip_arg) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2ReprojectionBeginFrame(int64_t flip_arg) {
 	PRINT_NAME();
 	LOGF("\t flip_arg = %" PRId64 "\n", flip_arg);
 	return OK;
@@ -309,7 +309,7 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionBeginFrame(int64_t flip_arg) {
 
 // Microseconds of process time, the clock VrTracker2 predicts poses for. The headset shows a frame
 // one refresh after it begins.
-static int32_t KYTY_SYSV_ABI Hmd2ReprojectionGetPredictedDisplayTime(int64_t   flip_arg,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2ReprojectionGetPredictedDisplayTime(int64_t   flip_arg,
                                                                      uint64_t* timestamp) {
 	PRINT_NAME();
 	if (timestamp == nullptr) {
@@ -322,7 +322,7 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionGetPredictedDisplayTime(int64_t   f
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetRenderConfig(SceHmd2ReprojectionRenderConfig config,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2ReprojectionSetRenderConfig(SceHmd2ReprojectionRenderConfig config,
                                                              const void* option) {
 	PRINT_NAME();
 	LOGF("\t sync_mode = %u, phase = %u\n", config.syncMode, config.phase);
@@ -332,7 +332,7 @@ static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetRenderConfig(SceHmd2Reprojection
 	return option != nullptr ? ERROR_PARAMETER_INVALID : OK;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetParam(int32_t index, int64_t flip_arg,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2ReprojectionSetParam(int32_t index, int64_t flip_arg,
                                                       const SceHmd2ReprojectionParam* param,
                                                       const void*                     option) {
 	PRINT_NAME();
@@ -367,7 +367,7 @@ static int32_t GazeResult(const SceHmd2GazeGetResultParam* param, Result* result
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2GazeGetResult(const SceHmd2GazeGetResultParam* param,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2GazeGetResult(const SceHmd2GazeGetResultParam* param,
                                                SceHmd2GazeResult*               result) {
 	PRINT_NAME();
 	const auto error = GazeResult(param, result);
@@ -377,7 +377,7 @@ static int32_t KYTY_SYSV_ABI Hmd2GazeGetResult(const SceHmd2GazeGetResultParam* 
 	return error;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2GazeGetResultForFoveatedRendering(
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2GazeGetResultForFoveatedRendering(
     const SceHmd2GazeGetResultParam* param, SceHmd2GazeResultForFoveatedRendering* result) {
 	PRINT_NAME();
 	return GazeResult(param, result);
@@ -416,7 +416,7 @@ bool GetReprojectionSurface(const void* reprojection_buffer, ReprojectionSurface
 	return true;
 }
 
-static int32_t KYTY_SYSV_ABI Hmd2ReprojectionSetTiming(int32_t timing) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Hmd2ReprojectionSetTiming(int32_t timing) {
 	auto* state = GetReprojectionState();
 	if (state == nullptr) {
 		return ERROR_REPROJECTION_NOT_INITIALIZED;

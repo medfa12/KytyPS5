@@ -313,7 +313,7 @@ int ValidateOpen(const Param* param, const ExtendedParam* extended, std::u16stri
 
 } // namespace
 
-void KYTY_SYSV_ABI ImeParamInit(Param* param) {
+void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeParamInit(Param* param) {
 	if (param == nullptr) {
 		return;
 	}
@@ -321,7 +321,7 @@ void KYTY_SYSV_ABI ImeParamInit(Param* param) {
 	param->user_id = -1;
 }
 
-int KYTY_SYSV_ABI ImeGetPanelSize(const Param* param, uint32_t* width, uint32_t* height) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeGetPanelSize(const Param* param, uint32_t* width, uint32_t* height) {
 	if (param == nullptr || width == nullptr || height == nullptr) {
 		return ERROR_INVALID_ADDRESS;
 	}
@@ -340,7 +340,7 @@ int KYTY_SYSV_ABI ImeGetPanelSize(const Param* param, uint32_t* width, uint32_t*
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeOpen(const Param* param, const ExtendedParam* extended) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeOpen(const Param* param, const ExtendedParam* extended) {
 	uint64_t generation = 0;
 	{
 		std::scoped_lock lock(g_mutex);
@@ -387,7 +387,7 @@ int KYTY_SYSV_ABI ImeOpen(const Param* param, const ExtendedParam* extended) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeUpdate(EventHandler handler) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeUpdate(EventHandler handler) {
 	bool apply_inputs = false;
 	{
 		std::scoped_lock lock(g_mutex);
@@ -460,7 +460,7 @@ int KYTY_SYSV_ABI ImeUpdate(EventHandler handler) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeClose() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeClose() {
 	uint64_t generation = 0;
 	{
 		std::scoped_lock lock(g_mutex);
@@ -479,7 +479,7 @@ int KYTY_SYSV_ABI ImeClose() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeSetText(const char16_t* text, uint32_t length) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeSetText(const char16_t* text, uint32_t length) {
 	std::scoped_lock lock(g_mutex);
 	if (!g_state.open) {
 		return ERROR_NOT_OPENED;
@@ -500,7 +500,7 @@ int KYTY_SYSV_ABI ImeSetText(const char16_t* text, uint32_t length) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeSetCaret(const Caret* caret) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeSetCaret(const Caret* caret) {
 	std::scoped_lock lock(g_mutex);
 	if (!g_state.open) {
 		return ERROR_NOT_OPENED;
@@ -516,7 +516,7 @@ int KYTY_SYSV_ABI ImeSetCaret(const Caret* caret) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeSetTextGeometry(TextAreaMode mode, const TextGeometry* geometry) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeSetTextGeometry(TextAreaMode mode, const TextGeometry* geometry) {
 	std::scoped_lock lock(g_mutex);
 	if (!g_state.open) {
 		return ERROR_NOT_OPENED;
@@ -535,7 +535,7 @@ int KYTY_SYSV_ABI ImeSetTextGeometry(TextAreaMode mode, const TextGeometry* geom
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeKeyboardOpen(int32_t user_id, const KeyboardParam* param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeKeyboardOpen(int32_t user_id, const KeyboardParam* param) {
 	std::scoped_lock lock(g_mutex);
 	if (param == nullptr) {
 		return ERROR_INVALID_ADDRESS;
@@ -567,7 +567,7 @@ int KYTY_SYSV_ABI ImeKeyboardOpen(int32_t user_id, const KeyboardParam* param) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeKeyboardClose(int32_t user_id) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeKeyboardClose(int32_t user_id) {
 	std::scoped_lock lock(g_mutex);
 	if (!g_keyboard_state.open) {
 		return ERROR_NOT_OPENED;
@@ -579,7 +579,7 @@ int KYTY_SYSV_ABI ImeKeyboardClose(int32_t user_id) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeKeyboardGetResourceId(int32_t user_id, KeyboardResourceIdArray* resource_ids) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeKeyboardGetResourceId(int32_t user_id, KeyboardResourceIdArray* resource_ids) {
 	if (resource_ids == nullptr) {
 		return ERROR_INVALID_ADDRESS;
 	}
@@ -592,7 +592,7 @@ int KYTY_SYSV_ABI ImeKeyboardGetResourceId(int32_t user_id, KeyboardResourceIdAr
 	return g_keyboard_state.open ? ERROR_CONNECTION_FAILED : ERROR_NOT_OPENED;
 }
 
-int KYTY_SYSV_ABI ImeKeyboardGetInfo(uint32_t resource_id, KeyboardInfo* info) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeKeyboardGetInfo(uint32_t resource_id, KeyboardInfo* info) {
 	if (info == nullptr) {
 		return ERROR_INVALID_ADDRESS;
 	}
@@ -604,7 +604,7 @@ int KYTY_SYSV_ABI ImeKeyboardGetInfo(uint32_t resource_id, KeyboardInfo* info) {
 	return ERROR_NO_RESOURCE_ID;
 }
 
-int KYTY_SYSV_ABI ImeKeyboardSetMode(int32_t user_id, uint32_t mode) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeKeyboardSetMode(int32_t user_id, uint32_t mode) {
 	if (user_id == -1) {
 		return ERROR_INVALID_USER_ID;
 	}

@@ -55,6 +55,7 @@ std::binary_semaphore                 encode_started {0}, allow_encode {0};
 std::binary_semaphore                 write_started {0}, allow_write {0};
 SDL_AudioStream*                      default_stream      = nullptr;
 bool                                  fail_default_resume = false;
+int                                   playback_keepalives = 0;
 int                                   active_controller   = 1;
 float                                 speaker_scale = 1.0f, vibration_scale = 1.0f;
 } // namespace
@@ -142,6 +143,16 @@ void DestroyAudioStream(SDL_AudioStream* stream) {
 }
 SDL_AudioDeviceID GetAudioStreamDevice(SDL_AudioStream*) {
 	return 999;
+}
+SDL_AudioDeviceID OpenAudioDevice(SDL_AudioDeviceID source, const SDL_AudioSpec* spec) {
+	Check((source == 999 || source == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK) && spec == nullptr,
+	      "playback keepalive/warmup changed its source/format");
+	++playback_keepalives;
+	return 1000;
+}
+void CloseAudioDevice(SDL_AudioDeviceID device) {
+	Check(device == 1000 && playback_keepalives > 0, "invalid playback keepalive close");
+	--playback_keepalives;
 }
 // Pads 1 and 3 are DualSenses; pad 2 only supports rumble.
 SDL_GamepadType GetGamepadTypeForID(SDL_JoystickID id) {
@@ -269,6 +280,8 @@ bool SendGamepadEffect(SDL_Gamepad* pad, const void* data, int size) {
 #define SDL_ResumeAudioStreamDevice Fake::ResumeAudioStreamDevice
 #define SDL_DestroyAudioStream      Fake::DestroyAudioStream
 #define SDL_GetAudioStreamDevice    Fake::GetAudioStreamDevice
+#define SDL_OpenAudioDevice         Fake::OpenAudioDevice
+#define SDL_CloseAudioDevice        Fake::CloseAudioDevice
 #define SDL_GetGamepadTypeForID     Fake::GetGamepadTypeForID
 #define SDL_GetGamepadType          Fake::GetGamepadType
 #define SDL_GetGamepadVendor        Fake::GetGamepadVendor
@@ -302,6 +315,8 @@ bool SendGamepadEffect(SDL_Gamepad* pad, const void* data, int size) {
 #undef SDL_ResumeAudioStreamDevice
 #undef SDL_DestroyAudioStream
 #undef SDL_GetAudioStreamDevice
+#undef SDL_OpenAudioDevice
+#undef SDL_CloseAudioDevice
 #undef SDL_GetGamepadTypeForID
 #undef SDL_GetGamepadType
 #undef SDL_GetGamepadVendor
@@ -376,7 +391,8 @@ struct Fixture {
 	}
 	~Fixture() {
 		Haptics::Shutdown();
-		Check(streams.empty() && audio_refs == 0, "stream or audio subsystem reference leaked");
+		Check(streams.empty() && audio_refs == 0 && playback_keepalives == 0,
+		      "stream/device or audio subsystem reference leaked");
 	}
 };
 
@@ -1183,6 +1199,8 @@ void TestAudioSpeakerFallback() {
 void TestAudioSpeakerRouting() {
 	Fixture f;
 	Libs::Audio::Audio audio;
+	Check(audio.WarmOutput() && streams.empty() && playback_keepalives == 1,
+	      "early playback warmup created a pad/PCM stream or failed to retain its device");
 	const auto port = audio.AudioOutOpen(4, 2, 48000, Libs::Audio::Audio::Format::FloatStereo);
 	Check(port.IsValid() && default_stream != nullptr, "pad speaker port did not open");
 	Libs::Audio::Audio::OutputParam output {port, pcm.data()};

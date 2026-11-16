@@ -1,4 +1,5 @@
 #include "loader/systemContent.h"
+#include "loader/runtimeLinker.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -13,9 +14,12 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Loader {
@@ -33,10 +37,10 @@ public:
 
 	bool IsValid();
 
-	bool     GetParamInt(const char* name, int32_t* value);
-	bool     GetParamString(const char* name, std::string* value);
-	bool     GetParamString(const char* name, char* value, size_t value_size);
-	MemoryParams GetMemoryParams();
+	bool     GetParamInt(const char* name, int32_t* value) const;
+	bool     GetParamString(const char* name, std::string* value) const;
+	bool     GetParamString(const char* name, char* value, size_t value_size) const;
+	MemoryParams GetMemoryParams() const;
 
 	void DbgPrint();
 
@@ -58,8 +62,9 @@ private:
 	void   AddParamString(const std::string& name, const std::string& value);
 	void   AddParamInt(const std::string& name, int32_t value);
 	Param* FindParam(const char* name);
+	const Param* FindParam(const char* name) const;
 
-	Common::Mutex      m_mutex;
+	mutable Common::Mutex m_mutex;
 	bool               m_opened = false;
 	std::vector<Param> m_params;
 	MemoryParams       m_memory_params;
@@ -79,13 +84,13 @@ public:
 
 	bool IsValid();
 
-	bool GetChunksNum(uint32_t* num);
+	bool GetChunksNum(uint32_t* num) const;
 
 	void DbgPrint();
 
 private:
 	Common::File  m_f;
-	Common::Mutex m_mutex;
+	mutable Common::Mutex m_mutex;
 	bool          m_opened     = false;
 	uint16_t      m_chunks_num = 0;
 };
@@ -97,13 +102,49 @@ struct SystemContent {
 	std::filesystem::path playgo_path;
 	PlayGo                playgo;
 	std::filesystem::path icon_path;
+	std::filesystem::path rnps_manifest_path;
+	RnpsManifest          rnps_manifest;
+	bool                  rnps_manifest_valid = false;
 };
+
+struct ApplicationContentRegistry {
+	std::mutex mutex;
+	std::unordered_map<const Program*, std::shared_ptr<const SystemContent>> content;
+};
+
+static ApplicationContentRegistry& ApplicationContents() {
+	// Like the legacy singleton, records live for the session. Avoid destroying
+	// guarded Psf/PlayGo objects after the main thread's suspension-counter TLS.
+	static auto* registry = new ApplicationContentRegistry;
+	return *registry;
+}
+
+static const Program* CurrentApplicationOwner() {
+	const auto* program = RuntimeLinker::GetCurrentProgram();
+	return program != nullptr ? program->application_owner : nullptr;
+}
+
+static std::shared_ptr<const SystemContent> CurrentSystemContent() {
+	Common::HostLockCriticalGuard critical;
+	if (const auto* owner = CurrentApplicationOwner(); owner != nullptr) {
+		auto& registry = ApplicationContents();
+		std::lock_guard lock(registry.mutex);
+		const auto it = registry.content.find(owner);
+		return it != registry.content.end() ? it->second : nullptr;
+	}
+	// Alias the session-lifetime singleton without taking ownership. Runtime
+	// snapshots instead retain shared ownership until the accessor finishes.
+	return {std::shared_ptr<const SystemContent> {}, Common::Singleton<SystemContent>::Instance()};
+}
+
+static bool LoadRnpsManifest(SystemContent* sc, const std::filesystem::path& dir);
 
 Psf::~Psf() {
 	Close();
 }
 
 void Psf::Open(const std::filesystem::path& file_name) {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	Close();
@@ -169,6 +210,7 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 	AddParamInt("ATTRIBUTE", 0);
 	add_int_param("attribute", "ATTRIBUTE");
 	add_int_param("attribute3", "ATTRIBUTE3");
+	add_int_param("applicationCategoryType", "APPLICATION_CATEGORY_TYPE");
 	add_int_param("userDefinedParam1", "USER_DEFINED_PARAM_1");
 	add_int_param("userDefinedParam2", "USER_DEFINED_PARAM_2");
 	add_int_param("userDefinedParam3", "USER_DEFINED_PARAM_3");
@@ -236,6 +278,7 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 }
 
 void Psf::Close() {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	m_params.clear();
@@ -244,12 +287,14 @@ void Psf::Close() {
 }
 
 bool Psf::IsValid() {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	return m_opened;
 }
 
 void Psf::DbgPrint() {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	if (!m_opened) {
@@ -283,6 +328,15 @@ Psf::Param* Psf::FindParam(const char* name) {
 	return nullptr;
 }
 
+const Psf::Param* Psf::FindParam(const char* name) const {
+	for (const auto& param: m_params) {
+		if (param.name == name) {
+			return &param;
+		}
+	}
+	return nullptr;
+}
+
 void Psf::AddParamString(const std::string& name, const std::string& value) {
 	auto* param = FindParam(name.c_str());
 	if (param == nullptr) {
@@ -308,7 +362,8 @@ void Psf::AddParamInt(const std::string& name, int32_t value) {
 	param->int_value = value;
 }
 
-bool Psf::GetParamInt(const char* name, int32_t* value) {
+bool Psf::GetParamInt(const char* name, int32_t* value) const {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	if (!m_opened) {
@@ -322,7 +377,8 @@ bool Psf::GetParamInt(const char* name, int32_t* value) {
 	return false;
 }
 
-bool Psf::GetParamString(const char* name, std::string* value) {
+bool Psf::GetParamString(const char* name, std::string* value) const {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	if (!m_opened) {
@@ -336,7 +392,8 @@ bool Psf::GetParamString(const char* name, std::string* value) {
 	return false;
 }
 
-bool Psf::GetParamString(const char* name, char* value, size_t value_size) {
+bool Psf::GetParamString(const char* name, char* value, size_t value_size) const {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	if (!m_opened) {
@@ -351,7 +408,8 @@ bool Psf::GetParamString(const char* name, char* value, size_t value_size) {
 	return false;
 }
 
-MemoryParams Psf::GetMemoryParams() {
+MemoryParams Psf::GetMemoryParams() const {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	return m_memory_params;
@@ -362,6 +420,7 @@ PlayGo::~PlayGo() {
 }
 
 void PlayGo::Open(const std::filesystem::path& file_name) {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	Close();
@@ -431,6 +490,7 @@ static bool ParseXmlUintAttr(std::string_view tag, std::string_view attr, uint32
 }
 
 void PlayGo::OpenChunkDefs(const std::filesystem::path& file_name) {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	if (m_opened) {
@@ -504,6 +564,7 @@ void PlayGo::OpenChunkDefs(const std::filesystem::path& file_name) {
 }
 
 void PlayGo::OpenChunkManifest(const std::filesystem::path& file_name) {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	if (m_opened) {
@@ -556,6 +617,7 @@ void PlayGo::OpenChunkManifest(const std::filesystem::path& file_name) {
 }
 
 void PlayGo::Close() {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	if (!m_f.IsInvalid()) {
@@ -566,12 +628,14 @@ void PlayGo::Close() {
 }
 
 bool PlayGo::IsValid() {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	return m_opened;
 }
 
-bool PlayGo::GetChunksNum(uint32_t* num) {
+bool PlayGo::GetChunksNum(uint32_t* num) const {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	if (m_opened) {
@@ -582,6 +646,7 @@ bool PlayGo::GetChunksNum(uint32_t* num) {
 }
 
 void PlayGo::DbgPrint() {
+	Common::HostLockCriticalGuard critical;
 	Common::LockGuard lock(m_mutex);
 
 	if (!m_opened) {
@@ -590,30 +655,7 @@ void PlayGo::DbgPrint() {
 	LOGF("PlayGo: chunks num = %" PRIu16 "\n", m_chunks_num);
 }
 
-void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
-	auto* sc = Common::Singleton<SystemContent>::Instance();
-
-	if (!Common::File::IsFileExisting(file_name)) {
-		EXIT("Can't find file: %s\n", Common::PathToString(file_name).c_str());
-	}
-
-	sc->psf.Open(file_name);
-
-	if (!sc->psf.IsValid()) {
-		EXIT("invalid file: %s\n", Common::PathToString(file_name).c_str());
-	}
-
-	sc->psf_path = file_name;
-	sc->psf.DbgPrint();
-	int32_t attribute3 = 0;
-	const bool title_supports_trinity = sc->psf.GetParamInt("ATTRIBUTE3", &attribute3) &&
-	                                    (static_cast<uint32_t>(attribute3) & (1u << 22u)) != 0;
-	sc->trinity_mode = Config::Ps5ProEnabled() && title_supports_trinity;
-	if (Config::Ps5ProEnabled()) {
-		Log::WriteToConsoleAndLog(fmt::format("[PS5] title Trinity support={}\n",
-		                                    title_supports_trinity ? "yes" : "no"));
-	}
-
+static void LoadCompanionContent(SystemContent* sc, const std::filesystem::path& file_name) {
 	sc->icon_path = file_name.parent_path() / "icon0.png";
 
 	if (!Common::File::IsFileExisting(sc->icon_path)) {
@@ -636,6 +678,66 @@ void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
 	}
 }
 
+void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
+	// Runtime apps must publish their own snapshot through the explicit API.
+	if (CurrentApplicationOwner() != nullptr) {
+		LOGF("SystemContent: runtime app requires SystemContentLoadForProgram\n");
+		return;
+	}
+	auto* sc = Common::Singleton<SystemContent>::Instance();
+	if (!Common::File::IsFileExisting(file_name)) {
+		EXIT("Can't find file: %s\n", Common::PathToString(file_name).c_str());
+	}
+	sc->psf.Open(file_name);
+	if (!sc->psf.IsValid()) {
+		EXIT("invalid file: %s\n", Common::PathToString(file_name).c_str());
+	}
+	sc->psf_path = file_name;
+	sc->psf.DbgPrint();
+	int32_t attribute3 = 0;
+	const bool title_supports_trinity = sc->psf.GetParamInt("ATTRIBUTE3", &attribute3) &&
+	                                    (static_cast<uint32_t>(attribute3) & (1u << 22u)) != 0;
+	sc->trinity_mode = Config::Ps5ProEnabled() && title_supports_trinity;
+	if (Config::Ps5ProEnabled()) {
+		Log::WriteToConsoleAndLog(fmt::format("[PS5] title Trinity support={}\n",
+		                                    title_supports_trinity ? "yes" : "no"));
+	}
+	LoadCompanionContent(sc, file_name);
+}
+
+bool SystemContentLoadForProgram(const Program* owner, const std::filesystem::path& param_json) {
+	if (owner == nullptr || owner->application_owner != owner) {
+		return false;
+	}
+	auto content = std::make_shared<SystemContent>();
+	try {
+		content->psf.Open(param_json);
+		if (!content->psf.IsValid()) {
+			return false;
+		}
+		content->psf_path = param_json;
+		LoadCompanionContent(content.get(), param_json);
+		const auto app_root = param_json.parent_path().parent_path();
+		if (Common::File::IsFileExisting(app_root / "manifest.json") &&
+		    !LoadRnpsManifest(content.get(), app_root)) {
+			return false;
+		}
+	} catch (const nlohmann::json::exception& error) {
+		LOGF("SystemContent: invalid app metadata %s: %s\n",
+		     Common::PathToString(param_json).c_str(), error.what());
+		return false;
+	}
+	// Keep the retired snapshot alive until after releasing the registry lock.
+	std::shared_ptr<const SystemContent> snapshot = std::move(content);
+	{
+		Common::HostLockCriticalGuard critical;
+		auto& registry = ApplicationContents();
+		std::lock_guard lock(registry.mutex);
+		registry.content[owner].swap(snapshot);
+	}
+	return true;
+}
+
 bool SystemContentIsTrinityMode() {
 	return Common::Singleton<SystemContent>::Instance()->trinity_mode;
 }
@@ -645,9 +747,8 @@ bool SystemContentParamSfoGetInt(const char* name, int32_t* value) {
 		return false;
 	}
 
-	auto* sc = Common::Singleton<SystemContent>::Instance();
-
-	return sc->psf.GetParamInt(name, value);
+	const auto sc = CurrentSystemContent();
+	return sc != nullptr && sc->psf.GetParamInt(name, value);
 }
 
 bool SystemContentParamSfoGetString(const char* name, std::string* value) {
@@ -655,9 +756,8 @@ bool SystemContentParamSfoGetString(const char* name, std::string* value) {
 		return false;
 	}
 
-	auto* sc = Common::Singleton<SystemContent>::Instance();
-
-	return sc->psf.GetParamString(name, value);
+	const auto sc = CurrentSystemContent();
+	return sc != nullptr && sc->psf.GetParamString(name, value);
 }
 
 bool SystemContentParamSfoGetString(const char* name, char* value, size_t value_size) {
@@ -665,15 +765,13 @@ bool SystemContentParamSfoGetString(const char* name, char* value, size_t value_
 		return false;
 	}
 
-	auto* sc = Common::Singleton<SystemContent>::Instance();
-
-	return sc->psf.GetParamString(name, value, value_size);
+	const auto sc = CurrentSystemContent();
+	return sc != nullptr && sc->psf.GetParamString(name, value, value_size);
 }
 
 MemoryParams SystemContentGetMemoryParams() {
-	auto* sc = Common::Singleton<SystemContent>::Instance();
-
-	return sc->psf.GetMemoryParams();
+	const auto sc = CurrentSystemContent();
+	return sc != nullptr ? sc->psf.GetMemoryParams() : MemoryParams {};
 }
 
 bool SystemContentGetIconPath(std::filesystem::path* path) {
@@ -681,9 +779,9 @@ bool SystemContentGetIconPath(std::filesystem::path* path) {
         return false;
     }
 
-    auto* sc = Common::Singleton<SystemContent>::Instance();
+    const auto sc = CurrentSystemContent();
 
-    if (sc->icon_path.empty()) {
+    if (sc == nullptr || sc->icon_path.empty()) {
         return false;
     }
 
@@ -697,9 +795,121 @@ bool SystemContentGetChunksNum(uint32_t* num) {
 		return false;
 	}
 
-	auto* sc = Common::Singleton<SystemContent>::Instance();
+	const auto sc = CurrentSystemContent();
+	return sc != nullptr && sc->playgo.GetChunksNum(num);
+}
 
-	return sc->playgo.GetChunksNum(num);
+bool SystemContentLoadRnpsManifest(const std::filesystem::path& dir) {
+	if (CurrentApplicationOwner() != nullptr) {
+		return false;
+	}
+	return LoadRnpsManifest(Common::Singleton<SystemContent>::Instance(), dir);
+}
+
+static bool LoadRnpsManifest(SystemContent* sc, const std::filesystem::path& dir) {
+	sc->rnps_manifest_path.clear();
+	sc->rnps_manifest       = RnpsManifest {};
+	sc->rnps_manifest_valid = false;
+
+	const auto file_name = dir / "manifest.json";
+
+	if (!Common::File::IsFileExisting(file_name)) {
+		LOGF("Can't find file: %s\n", Common::PathToString(file_name).c_str());
+		return false;
+	}
+
+	Common::File f;
+
+	f.Open(file_name, Common::File::Mode::Read);
+
+	if (f.IsInvalid()) {
+		LOGF("Can't open %s\n", Common::PathToString(file_name).c_str());
+		return false;
+	}
+
+	auto buf = f.ReadWholeBuffer();
+	f.Close();
+
+	if (buf.empty()) {
+		LOGF("invalid json file: %s\n", Common::PathToString(file_name).c_str());
+		return false;
+	}
+
+	const auto* json_begin   = reinterpret_cast<const char*>(buf.data());
+	const auto* json_end     = json_begin + buf.size();
+	auto        manifest_json = nlohmann::ordered_json::parse(json_begin, json_end, nullptr, false);
+	if (manifest_json.is_discarded() || !manifest_json.is_object()) {
+		LOGF("invalid json file: %s\n", Common::PathToString(file_name).c_str());
+		return false;
+	}
+
+	RnpsManifest manifest;
+
+	auto get_string = [&](const char* json_key, std::string* out) {
+		auto it = manifest_json.find(json_key);
+		if (it != manifest_json.end() && it->is_string()) {
+			*out = it->get_ref<const std::string&>();
+		}
+	};
+
+	auto get_bool = [&](const char* json_key, bool* out) {
+		auto it = manifest_json.find(json_key);
+		if (it != manifest_json.end() && it->is_boolean()) {
+			*out = it->get<bool>();
+		}
+	};
+
+	get_string("applicationName", &manifest.applicationName);
+	get_string("applicationVersion", &manifest.applicationVersion);
+	get_string("commitHash", &manifest.commitHash);
+	get_string("titleId", &manifest.titleId);
+	get_string("reactNativePlaystationVersion", &manifest.rnVersion);
+	get_string("jsBackend", &manifest.jsBackend);
+
+	get_bool("twinTurbo", &manifest.twinTurbo);
+	get_bool("enableHttpCache", &manifest.enableHttpCache);
+	get_bool("webSocketTLSWorkaround", &manifest.webSocketTLSWorkaround);
+
+	if (auto it = manifest_json.find("enableAccessibility");
+	    it != manifest_json.end() && it->is_array()) {
+		for (const auto& entry: *it) {
+			if (entry.is_string()) {
+				manifest.accessibility.push_back(entry.get_ref<const std::string&>());
+			}
+		}
+	}
+
+	sc->rnps_manifest       = std::move(manifest);
+	sc->rnps_manifest_path  = file_name;
+	sc->rnps_manifest_valid = true;
+
+	LOGF("RNPS manifest: app=%s ver=%s title=%s rn=%s backend=%s\n",
+	     sc->rnps_manifest.applicationName.c_str(), sc->rnps_manifest.applicationVersion.c_str(),
+	     sc->rnps_manifest.titleId.c_str(), sc->rnps_manifest.rnVersion.c_str(),
+	     sc->rnps_manifest.jsBackend.c_str());
+
+	return true;
+}
+
+bool SystemContentGetRnpsManifest(RnpsManifest* out) {
+	if (out == nullptr) {
+		return false;
+	}
+
+	const auto sc = CurrentSystemContent();
+
+	if (sc == nullptr || !sc->rnps_manifest_valid) {
+		return false;
+	}
+
+	*out = sc->rnps_manifest;
+
+	return true;
+}
+
+bool SystemContentIsRnpsApp(const std::filesystem::path& dir) {
+	return Common::File::IsFileExisting(dir / "manifest.json") &&
+	       Common::File::IsFileExisting(dir / "application.ps.bundle");
 }
 
 } // namespace Loader

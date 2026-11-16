@@ -6,9 +6,12 @@
 #include "common/stringUtils.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
+#include "libs/libAppContent.h"
+#include "libs/libSystemService.h"
 #include "libs/libs.h"
-#include "libs/systemService.h"
 #include "loader/additionalContent.h"
+#include "loader/runtimeGuestExecution.h"
+#include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
@@ -31,7 +34,9 @@ LIB_VERSION("AppContent", 1, "AppContentUtil", 1, 1);
 namespace AppContent {
 
 constexpr uint32_t APP_CONTENT_APPPARAM_SKU_FLAG_FULL = 3;
+constexpr int      APP_CONTENT_ERROR_NOT_INITIALIZED  = static_cast<int>(0x80d90001u);
 constexpr int      APP_CONTENT_ERROR_PARAMETER        = -2133262334; /* 0x80D90002 */
+constexpr int      APP_CONTENT_ERROR_INTERNAL         = static_cast<int>(0x80d9000au);
 constexpr int      APP_CONTENT_ERROR_BUSY             = -2133262333; /* 0x80D90003 */
 constexpr int      APP_CONTENT_ERROR_NOT_MOUNTED      = -2133262332; /* 0x80D90004 */
 constexpr int      APP_CONTENT_ERROR_NOT_FOUND        = -2133262331; /* 0x80D90005 */
@@ -45,18 +50,6 @@ struct AddcontMount {
 
 static std::mutex                g_addcont_mutex;
 static std::vector<AddcontMount> g_addcont_mounts;
-
-static std::string g_title_id;
-
-struct AppContentInitParam {
-	char reserved[32];
-};
-
-struct AppContentBootParam {
-	char     reserved1[4];
-	uint32_t attr;
-	char     reserved2[32];
-};
 
 struct AppContentMountPoint {
 	char data[16];
@@ -100,7 +93,7 @@ static bool ResolveTitleId(std::string* title_id) {
 	return false;
 }
 
-int KYTY_SYSV_ABI AppContentInitialize(const AppContentInitParam* init_param,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AppContentInitialize(const AppContentInitParam* init_param,
                                        AppContentBootParam*       boot_param) {
 	PRINT_NAME();
 
@@ -108,24 +101,46 @@ int KYTY_SYSV_ABI AppContentInitialize(const AppContentInitParam* init_param,
 	     "\t boot_param = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(init_param), reinterpret_cast<uint64_t>(boot_param));
 
-	if (boot_param != nullptr) {
-		std::memset(boot_param, 0, sizeof(*boot_param));
-	}
-
-	if (ResolveTitleId(&g_title_id)) {
-		LOGF("\t title_id   = %s\n", g_title_id.c_str());
+	// Capture the actual incarnation, not just a reusable Program address. Never
+	// borrow the session service when a runtime owner lacks a live subscription.
+	const auto* program = Loader::RuntimeLinker::GetCurrentProgram();
+	const bool application = program != nullptr && program->application_owner != nullptr;
+	const auto execution = Loader::GetApplicationExecution(program);
+	if (application && !execution) { return APP_CONTENT_ERROR_NOT_INITIALIZED; }
+	// Title identity is diagnostic only here; retaining it globally let a second
+	// app overwrite the shell's identity. SystemContent already owns the snapshot.
+	std::string title_id;
+	if (ResolveTitleId(&title_id)) {
+		LOGF("\t title_id   = %s\n", title_id.c_str());
 	} else {
 		LOGF("\t TITLE_ID missing\n");
 	}
 
-	SystemService::NotifyEntitlementUpdate();
+	if (application) {
+		if (!SystemService::NotifyApplicationEntitlementUpdate(execution)) {
+			return APP_CONTENT_ERROR_NOT_INITIALIZED;
+		}
+	} else {
+		SystemService::NotifyEntitlementUpdate();
+	}
+	if (boot_param != nullptr) { std::memset(boot_param, 0, sizeof(*boot_param)); }
 	return OK;
 }
 
-int KYTY_SYSV_ABI AppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(value == nullptr);
+	// 13.60 client +1d9b/+1da0 and ShellCore +26fb71/+26fb82:
+	// bad output/unknown selector returns PARAMETER without writing output.
+	if (value == nullptr) { return APP_CONTENT_ERROR_PARAMETER; }
+	if (param_id == 1100) {
+		// ShellCore +26fbcc accepts 0x44c and reads registry key 0x7802c700.
+		// No real provider for that setting is available here. The client's
+		// +1d65 maps an unrecognized provider failure to INTERNAL; do not claim
+		// selector 1100 is invalid or invent a successful setting value.
+		return APP_CONTENT_ERROR_INTERNAL;
+	}
+	if (param_id > 4) { return APP_CONTENT_ERROR_PARAMETER; }
 
 	*value     = 0;
 	bool found = false;
@@ -141,7 +156,7 @@ int KYTY_SYSV_ABI AppContentAppParamGetInt(uint32_t param_id, int32_t* value) {
 		case 2: found = Loader::SystemContentParamSfoGetInt("USER_DEFINED_PARAM_2", value); break;
 		case 3: found = Loader::SystemContentParamSfoGetInt("USER_DEFINED_PARAM_3", value); break;
 		case 4: found = Loader::SystemContentParamSfoGetInt("USER_DEFINED_PARAM_4", value); break;
-		default: EXIT("unknown param_id: %u\n", param_id);
+		default: return APP_CONTENT_ERROR_PARAMETER;
 	}
 
 	LOGF("\t value    = %d [%s]\n", *value, found ? "found" : "not found");
@@ -178,13 +193,13 @@ static int GetAvailableSpaceKb(const AppContentMountPoint* mount_point,
 	return OK;
 }
 
-int KYTY_SYSV_ABI AppContentDownloadDataGetAvailableSpaceKb(const AppContentMountPoint* mount_point,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AppContentDownloadDataGetAvailableSpaceKb(const AppContentMountPoint* mount_point,
                                                             size_t* available_space_kb) {
 	PRINT_NAME();
 	return GetAvailableSpaceKb(mount_point, available_space_kb);
 }
 
-int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         service_label,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         service_label,
                                          const NpUnifiedEntitlementLabel* entitlement_label,
                                          AppContentMountPoint*            mount_point) {
 	PRINT_NAME();
@@ -251,7 +266,7 @@ int KYTY_SYSV_ABI AppContentAddcontMount(uint32_t                         servic
 	return OK;
 }
 
-int KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_point) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AppContentAddcontUnmount(const AppContentMountPoint* mount_point) {
 	PRINT_NAME();
 
 	LOGF("\t mount_point = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(mount_point));
@@ -289,7 +304,7 @@ namespace AppContentTemporary {
 
 using AppContentMountPoint = AppContent::AppContentMountPoint;
 
-static int KYTY_SYSV_ABI AppContentTemporaryDataMount2(uint32_t              option,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AppContentTemporaryDataMount2(uint32_t              option,
                                                        AppContentMountPoint* mount_point) {
 	PRINT_NAME();
 
@@ -309,7 +324,7 @@ static int KYTY_SYSV_ABI AppContentTemporaryDataMount2(uint32_t              opt
 	return OK;
 }
 
-static int KYTY_SYSV_ABI AppContentTemporaryDataFormat(const AppContentMountPoint* mount_point) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AppContentTemporaryDataFormat(const AppContentMountPoint* mount_point) {
 	PRINT_NAME();
 
 	LOGF("\t mount_point = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(mount_point));
@@ -321,7 +336,7 @@ static int KYTY_SYSV_ABI AppContentTemporaryDataFormat(const AppContentMountPoin
 	return OK;
 }
 
-static int KYTY_SYSV_ABI AppContentTemporaryDataGetAvailableSpaceKb(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AppContentTemporaryDataGetAvailableSpaceKb(
     const AppContentMountPoint* mount_point, size_t* available_space_kb) {
 	PRINT_NAME();
 	return AppContent::GetAvailableSpaceKb(mount_point, available_space_kb);

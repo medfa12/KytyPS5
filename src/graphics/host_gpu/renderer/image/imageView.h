@@ -37,15 +37,11 @@ namespace ImageViewOps {
 	     static_cast<int>(image_format), static_cast<int>(view_format), swizzle);
 }
 
-[[nodiscard]] inline vk::Format SrgbUnormViewFormat(vk::Format image_format) noexcept {
+[[nodiscard]] inline vk::Format SrgbStorageViewFormat(vk::Format image_format) noexcept {
 	switch (image_format) {
 		case vk::Format::eR8G8B8A8Srgb:
 		case vk::Format::eB8G8R8A8Srgb: return vk::Format::eR8G8B8A8Unorm;
-		case vk::Format::eBc1RgbaSrgbBlock: return vk::Format::eBc1RgbaUnormBlock;
-		case vk::Format::eBc2SrgbBlock: return vk::Format::eBc2UnormBlock;
-		case vk::Format::eBc3SrgbBlock: return vk::Format::eBc3UnormBlock;
-		case vk::Format::eBc7SrgbBlock: return vk::Format::eBc7UnormBlock;
-		default: return image_format;
+		default: return vk::Format::eUndefined;
 	}
 }
 

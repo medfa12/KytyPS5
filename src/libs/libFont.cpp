@@ -69,9 +69,9 @@ using FontWritingLine           = void*;
 
 struct FontTextSource;
 union FontTextParseResult;
-using FontTextParseFunction = KYTY_SYSV_ABI int (*)(FontTextSource* font_text_source, void** order,
+using FontTextParseFunction = __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI int (*)(FontTextSource* font_text_source, void** order,
                                                     FontTextParseResult* result);
-using FontCreateStringOrdersFunction = KYTY_SYSV_ABI void (*)(void*       order_callback_object,
+using FontCreateStringOrdersFunction = __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI void (*)(void*       order_callback_object,
                                                               uint32_t    order_sheet_form,
                                                               const void* order_sheet);
 
@@ -379,7 +379,7 @@ struct FontWritingLineStep {
 };
 
 struct FontWritingState {
-	FontCharacterState*   next;
+	FontStringState*      string;
 	FontCharacterState*   character;
 	FontWritingStep       step;
 	FontWritingLetterStep letter_step;
@@ -563,12 +563,12 @@ static uint32_t count_characters_until(FontCharacterState* first, FontCharacterS
 
 	uint32_t count = 0;
 	for (auto* c = first; c != nullptr; c = get_next_character(c)) {
-		count++;
-		if (c == last) {
-			return count;
+		if (last != nullptr && c == last) {
+			break;
 		}
+		count++;
 	}
-	return last == nullptr ? count : 0;
+	return count;
 }
 
 static void fill_text_codes(FontTextCodes* text_codes, FontCharacterState* character,
@@ -601,25 +601,41 @@ static void fill_writing_metrics(FontWritingMetrics* metrics, uint32_t character
 	metrics->extent.right  = advance;
 }
 
-static void fill_writing_step(FontWritingStep* step, const FontCharacterState* character, float x) {
+static void fill_writing_step(FontWritingStep* step, FontCharacterState* character) {
+	if (step == nullptr) {
+		return;
+	}
+
 	std::memset(step, 0, sizeof(FontWritingStep));
-	step->x                       = x;
-	step->font                    = character->font;
-	step->profile.character_count = 1;
-	step->glyph_code              = character->code;
-	step->positioning.x           = x;
-	fill_metrics_for_code(&step->glyph_metrics, static_cast<FontState*>(character->font),
-	                      character->code);
-	step->advance_x = step->glyph_metrics.horizontal.advance;
+	step->advance_x               = 8.0f;
+	step->advance_y               = 0.0f;
+	step->font                    = character != nullptr ? character->font : nullptr;
+	step->profile.character_count = character != nullptr ? 1u : 0u;
+	step->profile.invisible_glyph = 0u;
+	step->glyph_code              = character != nullptr ? character->code : 0u;
+	fill_metrics_for_code(&step->glyph_metrics,
+	                      static_cast<FontState*>(character != nullptr ? character->font : nullptr),
+	                      character != nullptr ? character->code : static_cast<uint32_t>('?'));
 }
 
 static void fill_writing_letter_step(FontWritingLetterStep* letter_step,
-                                     const FontWritingStep* step) {
+                                     FontCharacterState*    character) {
+	if (letter_step == nullptr) {
+		return;
+	}
+
 	std::memset(letter_step, 0, sizeof(FontWritingLetterStep));
-	letter_step->x                                = step->x;
-	letter_step->advance_x                        = step->advance_x;
+	letter_step->advance_x = 8.0f;
+	letter_step->advance_y = 0.0f;
+
+	if (character == nullptr) {
+		return;
+	}
+
 	letter_step->components.texts_count           = 1;
+	letter_step->components.texts_index           = character->index;
 	letter_step->components.glyphs_count          = 1;
+	letter_step->components.glyphs_index          = 0;
 	letter_step->components.base_components_count = 1;
 	letter_step->components.base_focus_count      = 1;
 	letter_step->components.character_text_count  = 1;
@@ -1013,7 +1029,7 @@ static void draw_to_surface(const FontTransImage& image, FontRenderSurface* surf
 	}
 }
 
-int KYTY_SYSV_ABI FontMemoryInit(FontMemory* font_memory, void* address, uint32_t size_byte,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontMemoryInit(FontMemory* font_memory, void* address, uint32_t size_byte,
                                  const FontMemoryInterface* mem_interface, void* mspace_object,
                                  FontMemoryDestroyCallback destroy_callback, void* destroy_object) {
 	PRINT_NAME();
@@ -1039,7 +1055,7 @@ int KYTY_SYSV_ABI FontMemoryInit(FontMemory* font_memory, void* address, uint32_
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontMemoryTerm(FontMemory* font_memory) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontMemoryTerm(FontMemory* font_memory) {
 	PRINT_NAME();
 
 	if (font_memory != nullptr) {
@@ -1049,7 +1065,7 @@ int KYTY_SYSV_ABI FontMemoryTerm(FontMemory* font_memory) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontCreateLibraryWithEdition(const FontMemory*    memory,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCreateLibraryWithEdition(const FontMemory*    memory,
                                                FontLibrarySelection selection, uint64_t edition,
                                                FontLibrary* library) {
 	PRINT_NAME();
@@ -1072,12 +1088,12 @@ int KYTY_SYSV_ABI FontCreateLibraryWithEdition(const FontMemory*    memory,
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontCreateLibrary(const FontMemory* memory, FontLibrarySelection selection,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCreateLibrary(const FontMemory* memory, FontLibrarySelection selection,
                                     FontLibrary* library) {
 	return FontCreateLibraryWithEdition(memory, selection, 0, library);
 }
 
-int KYTY_SYSV_ABI FontDestroyLibrary(FontLibrary* library) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontDestroyLibrary(FontLibrary* library) {
 	PRINT_NAME();
 
 	if (library != nullptr) {
@@ -1088,7 +1104,7 @@ int KYTY_SYSV_ABI FontDestroyLibrary(FontLibrary* library) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontCreateRendererWithEdition(const FontMemory*     memory,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCreateRendererWithEdition(const FontMemory*     memory,
                                                 FontRendererSelection selection, uint64_t edition,
                                                 FontRenderer* renderer) {
 	PRINT_NAME();
@@ -1112,7 +1128,7 @@ int KYTY_SYSV_ABI FontCreateRendererWithEdition(const FontMemory*     memory,
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontDestroyRenderer(FontRenderer* renderer) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontDestroyRenderer(FontRenderer* renderer) {
 	PRINT_NAME();
 
 	if (renderer != nullptr) {
@@ -1165,14 +1181,14 @@ static int open_font(FontLibrary library, const void* data, uint32_t size, uint3
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontOpenFontSet(FontLibrary library, uint32_t font_set_type, uint32_t open_mode,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontOpenFontSet(FontLibrary library, uint32_t font_set_type, uint32_t open_mode,
                                   const FontOpenDetail* detail, FontHandle* handle) {
 	PRINT_NAME();
 
 	return open_font(library, detail, 0, font_set_type, open_mode, handle);
 }
 
-int KYTY_SYSV_ABI FontOpenFontMemory(FontLibrary library, const void* font_address,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontOpenFontMemory(FontLibrary library, const void* font_address,
                                      uint32_t    font_size, const FontOpenDetail* /*detail*/,
                                      FontHandle* handle) {
 	PRINT_NAME();
@@ -1180,7 +1196,7 @@ int KYTY_SYSV_ABI FontOpenFontMemory(FontLibrary library, const void* font_addre
 	return open_font(library, font_address, font_size, 0, 0, handle);
 }
 
-int KYTY_SYSV_ABI FontOpenFontInstance(FontHandle font_handle, void* setup_font,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontOpenFontInstance(FontHandle font_handle, void* setup_font,
                                        FontHandle* out_font_handle) {
 	PRINT_NAME();
 
@@ -1197,7 +1213,7 @@ int KYTY_SYSV_ABI FontOpenFontInstance(FontHandle font_handle, void* setup_font,
 	                 source->open_mode, out_font_handle);
 }
 
-int KYTY_SYSV_ABI FontCloseFont(FontHandle font_handle) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCloseFont(FontHandle font_handle) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
@@ -1206,7 +1222,7 @@ int KYTY_SYSV_ABI FontCloseFont(FontHandle font_handle) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontDefineAttribute(FontHandle font_handle, int attribute, int* old_attribute) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontDefineAttribute(FontHandle font_handle, int attribute, int* old_attribute) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
@@ -1223,7 +1239,7 @@ int KYTY_SYSV_ABI FontDefineAttribute(FontHandle font_handle, int attribute, int
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontBindRenderer(FontHandle font_handle, FontRenderer renderer) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontBindRenderer(FontHandle font_handle, FontRenderer renderer) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
@@ -1239,7 +1255,7 @@ int KYTY_SYSV_ABI FontBindRenderer(FontHandle font_handle, FontRenderer renderer
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontUnbindRenderer(FontHandle font_handle) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontUnbindRenderer(FontHandle font_handle) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
@@ -1254,7 +1270,7 @@ int KYTY_SYSV_ABI FontUnbindRenderer(FontHandle font_handle) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontRebindRenderer(FontHandle font_handle) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontRebindRenderer(FontHandle font_handle) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
@@ -1268,7 +1284,7 @@ int KYTY_SYSV_ABI FontRebindRenderer(FontHandle font_handle) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontSetScalePixel(FontHandle font_handle, float w, float h) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontSetScalePixel(FontHandle font_handle, float w, float h) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
@@ -1285,7 +1301,18 @@ int KYTY_SYSV_ABI FontSetScalePixel(FontHandle font_handle, float w, float h) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontSetEffectSlant(FontHandle font_handle, float slant_ratio) {
+// ps5-vsh: sw65+7wXCKE. Point-size twin of SetScalePixel; 1pt ~ 1px here.
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontSetScalePoint(FontHandle font_handle, float w, float h) {
+	PRINT_NAME();
+
+	LOGF("\t (point) handle = 0x%016" PRIx64 ", w = %f, h = %f\n",
+	     reinterpret_cast<uint64_t>(font_handle), static_cast<double>(w),
+	     static_cast<double>(h));
+
+	return FontSetScalePixel(font_handle, w, h);
+}
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontSetEffectSlant(FontHandle font_handle, float slant_ratio) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
@@ -1301,7 +1328,7 @@ int KYTY_SYSV_ABI FontSetEffectSlant(FontHandle font_handle, float slant_ratio) 
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontSetEffectWeight(FontHandle font_handle, float weight_x_scale,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontSetEffectWeight(FontHandle font_handle, float weight_x_scale,
                                       float weight_y_scale, uint32_t mode) {
 	PRINT_NAME();
 
@@ -1321,7 +1348,7 @@ int KYTY_SYSV_ABI FontSetEffectWeight(FontHandle font_handle, float weight_x_sca
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontSetupRenderScalePixel(FontHandle font_handle, float w, float h) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontSetupRenderScalePixel(FontHandle font_handle, float w, float h) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
@@ -1338,7 +1365,7 @@ int KYTY_SYSV_ABI FontSetupRenderScalePixel(FontHandle font_handle, float w, flo
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontSetupRenderEffectSlant(FontHandle font_handle, float slant_ratio) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontSetupRenderEffectSlant(FontHandle font_handle, float slant_ratio) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
@@ -1354,7 +1381,7 @@ int KYTY_SYSV_ABI FontSetupRenderEffectSlant(FontHandle font_handle, float slant
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontSetupRenderEffectWeight(FontHandle font_handle, float weight_x_scale,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontSetupRenderEffectWeight(FontHandle font_handle, float weight_x_scale,
                                               float weight_y_scale, uint32_t mode) {
 	PRINT_NAME();
 
@@ -1374,7 +1401,7 @@ int KYTY_SYSV_ABI FontSetupRenderEffectWeight(FontHandle font_handle, float weig
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontGetHorizontalLayout(FontHandle font_handle, FontHorizontalLayout* layout) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontGetHorizontalLayout(FontHandle font_handle, FontHorizontalLayout* layout) {
 	PRINT_NAME();
 
 	if (font_handle == nullptr || layout == nullptr) {
@@ -1403,7 +1430,7 @@ int KYTY_SYSV_ABI FontGetHorizontalLayout(FontHandle font_handle, FontHorizontal
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontGetVerticalLayout(FontHandle font_handle, FontVerticalLayout* layout) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontGetVerticalLayout(FontHandle font_handle, FontVerticalLayout* layout) {
 	PRINT_NAME();
 
 	if (font_handle == nullptr || layout == nullptr) {
@@ -1420,7 +1447,7 @@ int KYTY_SYSV_ABI FontGetVerticalLayout(FontHandle font_handle, FontVerticalLayo
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontSupportSystemFonts(FontLibrary library) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontSupportSystemFonts(FontLibrary library) {
 	PRINT_NAME();
 
 	LOGF("\t library = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(library));
@@ -1428,7 +1455,7 @@ int KYTY_SYSV_ABI FontSupportSystemFonts(FontLibrary library) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontSupportExternalFonts(FontLibrary library, uint32_t font_max,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontSupportExternalFonts(FontLibrary library, uint32_t font_max,
                                            uint32_t formats) {
 	PRINT_NAME();
 
@@ -1438,7 +1465,7 @@ int KYTY_SYSV_ABI FontSupportExternalFonts(FontLibrary library, uint32_t font_ma
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontAttachDeviceCacheBuffer(FontLibrary library, void* buffer, uint32_t size) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontAttachDeviceCacheBuffer(FontLibrary library, void* buffer, uint32_t size) {
 	PRINT_NAME();
 
 	LOGF("\t library = 0x%016" PRIx64 ", buffer = 0x%016" PRIx64 ", size = %" PRIu32 "\n",
@@ -1447,7 +1474,7 @@ int KYTY_SYSV_ABI FontAttachDeviceCacheBuffer(FontLibrary library, void* buffer,
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontTextSourceInit(FontTextSource* font_text_source, const void* text_address,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontTextSourceInit(FontTextSource* font_text_source, const void* text_address,
                                      uint32_t text_size_byte, FontTextParseFunction text_parser,
                                      void* text_object) {
 	PRINT_NAME();
@@ -1487,7 +1514,7 @@ int KYTY_SYSV_ABI FontTextSourceInit(FontTextSource* font_text_source, const voi
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontTextSourceRewind(FontTextSource* font_text_source) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontTextSourceRewind(FontTextSource* font_text_source) {
 	PRINT_NAME();
 
 	if (font_text_source == nullptr) {
@@ -1501,7 +1528,7 @@ int KYTY_SYSV_ABI FontTextSourceRewind(FontTextSource* font_text_source) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontTextSourceSetWritingForm(FontTextSource* font_text_source, int writing_form) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontTextSourceSetWritingForm(FontTextSource* font_text_source, int writing_form) {
 	PRINT_NAME();
 
 	if (font_text_source == nullptr) {
@@ -1516,7 +1543,7 @@ int KYTY_SYSV_ABI FontTextSourceSetWritingForm(FontTextSource* font_text_source,
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontTextSourceSetDefaultFont(FontTextSource* font_text_source,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontTextSourceSetDefaultFont(FontTextSource* font_text_source,
                                                FontHandle      default_font) {
 	PRINT_NAME();
 
@@ -1532,7 +1559,7 @@ int KYTY_SYSV_ABI FontTextSourceSetDefaultFont(FontTextSource* font_text_source,
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontCreateString(const FontMemory* memory, FontTextSource* font_text_source,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCreateString(const FontMemory* memory, FontTextSource* font_text_source,
                                    const FontCreateStringDetail* string_detail,
                                    FontString*                   font_string) {
 	PRINT_NAME();
@@ -1566,7 +1593,7 @@ int KYTY_SYSV_ABI FontCreateString(const FontMemory* memory, FontTextSource* fon
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontDestroyString(FontString* font_string) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontDestroyString(FontString* font_string) {
 	PRINT_NAME();
 
 	LOGF("\t string_ptr = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(font_string));
@@ -1579,28 +1606,28 @@ int KYTY_SYSV_ABI FontDestroyString(FontString* font_string) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontStringGetWritingForm(FontString font_string) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontStringGetWritingForm(FontString font_string) {
 	PRINT_NAME();
 
 	const auto* state = static_cast<const FontStringState*>(font_string);
 	return state != nullptr ? state->writing_form : SCE_FONT_WRITING_FORM_HORIZONTAL;
 }
 
-uint32_t KYTY_SYSV_ABI FontStringGetTerminateCode(FontString font_string) {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontStringGetTerminateCode(FontString font_string) {
 	PRINT_NAME();
 
 	const auto* state = static_cast<const FontStringState*>(font_string);
 	return state != nullptr ? state->terminate_code : 0;
 }
 
-void* KYTY_SYSV_ABI FontStringGetTerminateOrder(FontString font_string) {
+void* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontStringGetTerminateOrder(FontString font_string) {
 	PRINT_NAME();
 
 	const auto* state = static_cast<const FontStringState*>(font_string);
 	return state != nullptr ? state->terminate_order : nullptr;
 }
 
-FontTextCharacter KYTY_SYSV_ABI FontStringRefersTextCharacters(FontString font_string,
+FontTextCharacter __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontStringRefersTextCharacters(FontString font_string,
                                                                uint32_t*  character_count) {
 	PRINT_NAME();
 
@@ -1628,32 +1655,32 @@ FontStringRefersRenderCharacters(FontString font_string, FontTextCharacter start
 		first = &state->characters.front();
 	}
 
-	const uint32_t count = count_characters_until(first, last);
 	if (character_count != nullptr) {
-		*character_count = count;
+		*character_count = count_characters_until(first, last);
 	}
 
 	LOGF("\t string = 0x%016" PRIx64 ", start = 0x%016" PRIx64 ", last = 0x%016" PRIx64
 	     ", count = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(font_string), reinterpret_cast<uint64_t>(start_character),
-	     reinterpret_cast<uint64_t>(last_character), count);
+	     reinterpret_cast<uint64_t>(last_character),
+	     character_count != nullptr ? *character_count : count_characters_until(first, last));
 
-	return count != 0 ? first : nullptr;
+	return first;
 }
 
-FontTextCharacter KYTY_SYSV_ABI FontCharacterRefersTextNext(FontTextCharacter text_character) {
+FontTextCharacter __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCharacterRefersTextNext(FontTextCharacter text_character) {
 	PRINT_NAME();
 
 	return get_next_character(get_character(text_character));
 }
 
-FontTextCharacter KYTY_SYSV_ABI FontCharacterRefersTextBack(FontTextCharacter text_character) {
+FontTextCharacter __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCharacterRefersTextBack(FontTextCharacter text_character) {
 	PRINT_NAME();
 
 	return get_prev_character(get_character(text_character));
 }
 
-FontTextCodes* KYTY_SYSV_ABI FontCharactersRefersTextCodes(FontTextCharacter text_character,
+FontTextCodes* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCharactersRefersTextCodes(FontTextCharacter text_character,
                                                            FontTextCharacter term_character,
                                                            FontTextCodes*    text_codes) {
 	PRINT_NAME();
@@ -1664,7 +1691,7 @@ FontTextCodes* KYTY_SYSV_ABI FontCharactersRefersTextCodes(FontTextCharacter tex
 	return text_codes;
 }
 
-FontTextCodes* KYTY_SYSV_ABI FontTextCodesStepNext(FontTextCodes* text_codes_step) {
+FontTextCodes* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontTextCodesStepNext(FontTextCodes* text_codes_step) {
 	PRINT_NAME();
 
 	if (text_codes_step == nullptr) {
@@ -1682,7 +1709,7 @@ FontTextCodes* KYTY_SYSV_ABI FontTextCodesStepNext(FontTextCodes* text_codes_ste
 	return text_codes_step;
 }
 
-FontTextCodes* KYTY_SYSV_ABI FontTextCodesStepBack(FontTextCodes* text_codes_step) {
+FontTextCodes* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontTextCodesStepBack(FontTextCodes* text_codes_step) {
 	PRINT_NAME();
 
 	if (text_codes_step == nullptr) {
@@ -1700,7 +1727,7 @@ FontTextCodes* KYTY_SYSV_ABI FontTextCodesStepBack(FontTextCodes* text_codes_ste
 	return text_codes_step;
 }
 
-int KYTY_SYSV_ABI FontCharacterGetBidiLevel(FontTextCharacter text_character, int* bidi_level) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCharacterGetBidiLevel(FontTextCharacter text_character, int* bidi_level) {
 	PRINT_NAME();
 
 	if (text_character == nullptr || bidi_level == nullptr) {
@@ -1711,7 +1738,7 @@ int KYTY_SYSV_ABI FontCharacterGetBidiLevel(FontTextCharacter text_character, in
 	return OK;
 }
 
-uint32_t KYTY_SYSV_ABI FontCharacterLooksWhiteSpace(FontTextCharacter text_character) {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCharacterLooksWhiteSpace(FontTextCharacter text_character) {
 	PRINT_NAME();
 
 	auto* character = get_character(text_character);
@@ -1723,13 +1750,13 @@ uint32_t KYTY_SYSV_ABI FontCharacterLooksWhiteSpace(FontTextCharacter text_chara
 	return (code == ' ' || code == '\t' || code == '\n' || code == '\r') ? 1u : 0u;
 }
 
-uint32_t KYTY_SYSV_ABI FontCharacterLooksFormatCharacters(FontTextCharacter text_character) {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCharacterLooksFormatCharacters(FontTextCharacter text_character) {
 	PRINT_NAME();
 
 	return text_character != nullptr ? 0u : 0u;
 }
 
-int KYTY_SYSV_ABI FontCharacterGetTextFontCode(FontTextCharacter text_character,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCharacterGetTextFontCode(FontTextCharacter text_character,
                                                FontHandle* font_handle, uint32_t* text_code) {
 	PRINT_NAME();
 
@@ -1748,7 +1775,7 @@ int KYTY_SYSV_ABI FontCharacterGetTextFontCode(FontTextCharacter text_character,
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontCharacterGetTextOrder(FontTextCharacter text_character, void** text_order) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCharacterGetTextOrder(FontTextCharacter text_character, void** text_order) {
 	PRINT_NAME();
 
 	auto* character = get_character(text_character);
@@ -1760,7 +1787,7 @@ int KYTY_SYSV_ABI FontCharacterGetTextOrder(FontTextCharacter text_character, vo
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontCharacterGetSyllableStringState(FontTextCharacter text_character,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCharacterGetSyllableStringState(FontTextCharacter text_character,
                                                       int*              syllable_string_state) {
 	PRINT_NAME();
 
@@ -1772,7 +1799,7 @@ int KYTY_SYSV_ABI FontCharacterGetSyllableStringState(FontTextCharacter text_cha
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontWritingInit(FontWriting* font_writing, FontString font_string,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontWritingInit(FontWriting* font_writing, FontString font_string,
                                   FontRenderCharacter font_character) {
 	PRINT_NAME();
 
@@ -1786,17 +1813,23 @@ int KYTY_SYSV_ABI FontWritingInit(FontWriting* font_writing, FontString font_str
 	}
 	std::memset(font_writing, 0, sizeof(FontWriting));
 
-	auto* string = static_cast<FontStringState*>(font_string);
-	auto* state  = new FontWritingState {};
-	state->next  = get_character(font_character);
-	if (state->next == nullptr && string != nullptr && !string->characters.empty()) {
-		state->next = &string->characters.front();
+	auto* state           = new FontWritingState {};
+	state->string         = static_cast<FontStringState*>(font_string);
+	state->character      = get_character(font_character);
+	state->invisible_mask = 0;
+	if (state->character == nullptr && state->string != nullptr &&
+	    !state->string->characters.empty()) {
+		state->character = &state->string->characters.front();
 	}
+
+	fill_writing_step(&state->step, state->character);
+	fill_writing_letter_step(&state->letter_step, state->character);
+	fill_writing_metrics(&state->metrics, state->step.profile.character_count);
 	register_writing_state(state);
 
 	font_writing->system_use[0] = state;
 	font_writing->system_use[1] = &state->step;
-	font_writing->system_use[2] = state->next;
+	font_writing->system_use[2] = state->character;
 	font_writing->system_use[3] = &state->letter_step;
 	font_writing->system_use[4] = &state->metrics;
 
@@ -1809,7 +1842,7 @@ int KYTY_SYSV_ABI FontWritingInit(FontWriting* font_writing, FontString font_str
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontWritingSetMaskInvisible(FontWriting* font_writing, int mask) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontWritingSetMaskInvisible(FontWriting* font_writing, int mask) {
 	PRINT_NAME();
 
 	auto* state = get_writing_state(font_writing);
@@ -1821,67 +1854,33 @@ int KYTY_SYSV_ABI FontWritingSetMaskInvisible(FontWriting* font_writing, int mas
 	return OK;
 }
 
-const FontWritingStep* KYTY_SYSV_ABI FontWritingRefersRenderStep(FontWriting* font_writing) {
+const FontWritingStep* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontWritingRefersRenderStep(FontWriting* font_writing) {
 	PRINT_NAME();
 
 	auto* state = get_writing_state(font_writing);
-	if (state == nullptr) {
-		return nullptr;
-	}
-
-	state->character = state->next;
-	if (state->character == nullptr) {
-		return nullptr;
-	}
-	state->next = get_next_character(state->character);
-
-	// The step stays zeroed until the first character is written.
-	const bool first = state->step.profile.character_count == 0;
-	fill_writing_step(&state->step, state->character, state->metrics.advance_x);
-	fill_writing_letter_step(&state->letter_step, &state->step);
-
-	const auto& glyph  = state->step.glyph_metrics;
-	const float left   = state->step.x + glyph.horizontal.bearing_x;
-	const float right  = left + glyph.width;
-	const float top    = -glyph.horizontal.bearing_y;
-	const float bottom = top + glyph.height;
-	auto&       extent = state->metrics.extent;
-	if (first) {
-		extent = {top, bottom, left, right};
-	} else {
-		extent.top    = std::min(extent.top, top);
-		extent.bottom = std::max(extent.bottom, bottom);
-		extent.left   = std::min(extent.left, left);
-		extent.right  = std::max(extent.right, right);
-	}
-	state->metrics.advance_x += state->step.advance_x;
-
+	auto* step  = state != nullptr ? &state->step : nullptr;
 	LOGF("\t writing = 0x%016" PRIx64 ", step = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(&state->step));
-	return &state->step;
+	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(step));
+	return step;
 }
 
-FontTextCharacter KYTY_SYSV_ABI FontWritingRefersRenderStepCharacter(FontWriting* font_writing,
+FontTextCharacter __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontWritingRefersRenderStepCharacter(FontWriting* font_writing,
                                                                      const void** letter_step) {
 	PRINT_NAME();
 
-	auto*               state     = get_writing_state(font_writing);
-	FontCharacterState* character = nullptr;
-	if (state != nullptr) {
-		character        = state->character;
-		state->character = nullptr;
-	}
+	auto* state = get_writing_state(font_writing);
 	if (letter_step != nullptr) {
-		*letter_step = character != nullptr ? &state->letter_step : nullptr;
+		*letter_step = state != nullptr ? &state->letter_step : nullptr;
 	}
 	LOGF("\t writing = 0x%016" PRIx64 ", character = 0x%016" PRIx64 ", letter_step = 0x%016" PRIx64
 	     "\n",
-	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(character),
+	     reinterpret_cast<uint64_t>(font_writing),
+	     reinterpret_cast<uint64_t>(state != nullptr ? state->character : nullptr),
 	     reinterpret_cast<uint64_t>(letter_step != nullptr ? *letter_step : nullptr));
-	return character;
+	return state != nullptr ? state->character : nullptr;
 }
 
-int KYTY_SYSV_ABI FontWritingGetRenderMetrics(FontWriting*        font_writing,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontWritingGetRenderMetrics(FontWriting*        font_writing,
                                               FontWritingMetrics* writing_metrics) {
 	PRINT_NAME();
 
@@ -1894,7 +1893,7 @@ int KYTY_SYSV_ABI FontWritingGetRenderMetrics(FontWriting*        font_writing,
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontCreateWritingLine(const FontMemory* memory, int writing_form,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontCreateWritingLine(const FontMemory* memory, int writing_form,
                                         const void*      writing_line_detail,
                                         FontWritingLine* writing_line) {
 	PRINT_NAME();
@@ -1918,7 +1917,7 @@ int KYTY_SYSV_ABI FontCreateWritingLine(const FontMemory* memory, int writing_fo
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontDestroyWritingLine(FontWritingLine* writing_line) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontDestroyWritingLine(FontWritingLine* writing_line) {
 	PRINT_NAME();
 
 	if (writing_line != nullptr) {
@@ -1929,7 +1928,7 @@ int KYTY_SYSV_ABI FontDestroyWritingLine(FontWritingLine* writing_line) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontWritingLineClear(FontWritingLine writing_line) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontWritingLineClear(FontWritingLine writing_line) {
 	PRINT_NAME();
 
 	auto* state = static_cast<FontWritingLineState*>(writing_line);
@@ -1941,7 +1940,7 @@ int KYTY_SYSV_ABI FontWritingLineClear(FontWritingLine writing_line) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontWritingLineWritesOrder(FontWritingLine           writing_line,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontWritingLineWritesOrder(FontWritingLine           writing_line,
                                              uint64_t                  writing_attribute,
                                              const FontWritingMetrics* writing_metrics,
                                              void*                     writing_orderer) {
@@ -1997,7 +1996,7 @@ int KYTY_SYSV_ABI FontWritingLineWritesOrder(FontWritingLine           writing_l
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontWritingLineGetOrderingSpace(FontWritingLine writing_line, float* head_space,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontWritingLineGetOrderingSpace(FontWritingLine writing_line, float* head_space,
                                                   float* inline_space, float* tail_space,
                                                   float* advance_space) {
 	PRINT_NAME();
@@ -2024,7 +2023,7 @@ int KYTY_SYSV_ABI FontWritingLineGetOrderingSpace(FontWritingLine writing_line, 
 	return OK;
 }
 
-FontWritingLineStep* KYTY_SYSV_ABI FontWritingLineRefersRenderStep(FontWritingLine writing_line) {
+FontWritingLineStep* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontWritingLineRefersRenderStep(FontWritingLine writing_line) {
 	PRINT_NAME();
 
 	auto* state = static_cast<FontWritingLineState*>(writing_line);
@@ -2042,7 +2041,7 @@ FontWritingLineStep* KYTY_SYSV_ABI FontWritingLineRefersRenderStep(FontWritingLi
 	return step;
 }
 
-int KYTY_SYSV_ABI FontWritingLineGetRenderMetrics(FontWritingLine     writing_line,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontWritingLineGetRenderMetrics(FontWritingLine     writing_line,
                                                   FontWritingMetrics* writing_metrics) {
 	PRINT_NAME();
 
@@ -2055,7 +2054,7 @@ int KYTY_SYSV_ABI FontWritingLineGetRenderMetrics(FontWritingLine     writing_li
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontGetRenderCharGlyphMetrics(FontHandle font_handle, uint32_t code,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontGetRenderCharGlyphMetrics(FontHandle font_handle, uint32_t code,
                                                 FontGlyphMetrics* metrics) {
 	PRINT_NAME();
 
@@ -2067,7 +2066,7 @@ int KYTY_SYSV_ABI FontGetRenderCharGlyphMetrics(FontHandle font_handle, uint32_t
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontGetKerning(FontHandle font_handle, uint32_t pre_code, uint32_t code,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontGetKerning(FontHandle font_handle, uint32_t pre_code, uint32_t code,
                                 FontKerning* kerning) {
 	PRINT_NAME();
 	if (kerning == nullptr) {
@@ -2101,7 +2100,7 @@ int KYTY_SYSV_ABI FontGetKerning(FontHandle font_handle, uint32_t pre_code, uint
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontGetCharGlyphMetrics(FontHandle font_handle, uint32_t code,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontGetCharGlyphMetrics(FontHandle font_handle, uint32_t code,
                                           FontGlyphMetrics* metrics) {
 	PRINT_NAME();
 
@@ -2113,7 +2112,7 @@ int KYTY_SYSV_ABI FontGetCharGlyphMetrics(FontHandle font_handle, uint32_t code,
 	return OK;
 }
 
-void KYTY_SYSV_ABI FontRenderSurfaceInit(FontRenderSurface* surf, void* buffer, int buf_width_byte,
+void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontRenderSurfaceInit(FontRenderSurface* surf, void* buffer, int buf_width_byte,
                                          int pixel_size_byte, int width, int height) {
 	PRINT_NAME();
 
@@ -2139,7 +2138,7 @@ void KYTY_SYSV_ABI FontRenderSurfaceInit(FontRenderSurface* surf, void* buffer, 
 	     pixel_size_byte, width, height);
 }
 
-void KYTY_SYSV_ABI FontRenderSurfaceSetScissor(FontRenderSurface* surf, uint32_t x0, uint32_t y0,
+void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontRenderSurfaceSetScissor(FontRenderSurface* surf, uint32_t x0, uint32_t y0,
                                                uint32_t x1, uint32_t y1) {
 	PRINT_NAME();
 
@@ -2157,7 +2156,7 @@ void KYTY_SYSV_ABI FontRenderSurfaceSetScissor(FontRenderSurface* surf, uint32_t
 	     reinterpret_cast<uint64_t>(surf), x0, y0, x1, y1);
 }
 
-int KYTY_SYSV_ABI FontGenerateCharGlyph(FontHandle font_handle, uint32_t code,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontGenerateCharGlyph(FontHandle font_handle, uint32_t code,
                                         const FontGenerateGlyphDetail* detail, void** font_glyph) {
 	PRINT_NAME();
 
@@ -2183,7 +2182,7 @@ int KYTY_SYSV_ABI FontGenerateCharGlyph(FontHandle font_handle, uint32_t code,
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontDeleteGlyph(const FontMemory* memory, void** font_glyph) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontDeleteGlyph(const FontMemory* memory, void** font_glyph) {
 	PRINT_NAME();
 
 	LOGF("\t memory = 0x%016" PRIx64 ", glyph_ptr = 0x%016" PRIx64 "\n",
@@ -2199,7 +2198,7 @@ int KYTY_SYSV_ABI FontDeleteGlyph(const FontMemory* memory, void** font_glyph) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontGlyphDefineAttribute(void* font_glyph, int attribute, int* old_attribute) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontGlyphDefineAttribute(void* font_glyph, int attribute, int* old_attribute) {
 	PRINT_NAME();
 
 	auto* glyph = (is_known_glyph(font_glyph) ? static_cast<GlyphState*>(font_glyph) : nullptr);
@@ -2216,7 +2215,7 @@ int KYTY_SYSV_ABI FontGlyphDefineAttribute(void* font_glyph, int attribute, int*
 	return OK;
 }
 
-int KYTY_SYSV_ABI FontRenderCharGlyphImageHorizontal(FontHandle font_handle, uint32_t code,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI FontRenderCharGlyphImageHorizontal(FontHandle font_handle, uint32_t code,
                                                      FontRenderSurface* surf, float x, float y,
                                                      FontGlyphMetrics* metrics,
                                                      FontRenderResult* result) {
@@ -2255,6 +2254,7 @@ LIB_DEFINE(InitFont_1) {
 	LIB_FUNC("Z2cdsqJH+5k", Font::FontRebindRenderer);
 	LIB_FUNC("1QjhKxrsOB8", Font::FontUnbindRenderer);
 	LIB_FUNC("N1EBMeGhf7E", Font::FontSetScalePixel);
+	LIB_FUNC("sw65+7wXCKE", Font::FontSetScalePoint); // ps5-vsh
 	LIB_FUNC("TMtqoFQjjbA", Font::FontSetEffectSlant);
 	LIB_FUNC("v0phZwa4R5o", Font::FontSetEffectWeight);
 	LIB_FUNC("6vGCkkQJOcI", Font::FontSetupRenderScalePixel);

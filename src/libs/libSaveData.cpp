@@ -266,7 +266,6 @@ static constexpr uint32_t SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END = 1u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_BACKUP_END        = 2u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_MEMORY_SYNC_END   = 3u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END = 4u;
-static constexpr uint32_t SAVE_DATA_EVENT_TYPE_CONVERT_END       = 5u;
 
 static constexpr size_t   SAVE_DATA_MEMORY_MAX_SIZE      = 32 * 1024 * 1024;
 static constexpr uint32_t SAVE_DATA_MEMORY_SET_PARAM     = 1u;
@@ -421,8 +420,9 @@ static int64_t newest_save_time(const std::filesystem::path& directory) {
 			continue;
 		}
 		if (it->is_regular_file(error) && !error) {
-			if (const auto times = Common::File::GetTimes(it->path())) {
-				mtime = std::max(mtime, times->write_ns / 1000000000);
+			const auto time = Common::File::GetLastWriteTimeUTC(it->path());
+			if (!time.IsInvalid()) {
+				mtime = std::max(mtime, static_cast<int64_t>(time.ToUnix()));
 			}
 		}
 		error.clear();
@@ -541,7 +541,7 @@ static int mount_save_data(int slot, const std::filesystem::path& directory,
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(init != nullptr);
@@ -549,7 +549,7 @@ int KYTY_SYSV_ABI SaveDataInitialize3(const void* /*init*/) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataTerminate() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataTerminate() {
 	PRINT_NAME();
 
 	Common::LockGuard lock(g_mount_mutex);
@@ -562,7 +562,7 @@ int KYTY_SYSV_ABI SaveDataTerminate() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataCreateTransactionResource(uint32_t size) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataCreateTransactionResource(uint32_t size) {
 	PRINT_NAME();
 
 	LOGF("\t size = %" PRIu32 "\n", size);
@@ -570,7 +570,7 @@ int KYTY_SYSV_ABI SaveDataCreateTransactionResource(uint32_t size) {
 	return g_next_transaction_resource++;
 }
 
-int KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
 	PRINT_NAME();
 
 	LOGF("\t resource = %" PRId32 "\n", resource);
@@ -578,7 +578,7 @@ int KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
                                         SaveDataDirNameSearchResult*     result) {
 	PRINT_NAME();
 
@@ -690,7 +690,7 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result) {
 	PRINT_NAME();
 
 	if (mount == nullptr || mount_result == nullptr || mount->dir_name == nullptr ||
@@ -729,17 +729,16 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT("unknown mount mode: %u", mount->mount_mode);
 	}
 
-	const bool exists = Common::File::IsDirectoryExisting(mount_dir);
-	if (open && !exists) {
+	if (open && !Common::File::IsDirectoryExisting(mount_dir)) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
-	if (create && exists) {
+	if (create && Common::File::IsDirectoryExisting(mount_dir)) {
 		return SAVE_DATA_ERROR_EXISTS;
 	}
 
 	bool created = false;
-	if ((create || create2) && !exists) {
+	if ((create || create2) && !Common::File::IsDirectoryExisting(mount_dir)) {
 		if (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
@@ -769,7 +768,7 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	return mount_save_data(slot, mount_dir, created ? 1u : 0u, mount_result);
 }
 
-int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,
                                                SaveDataMemorySetupResult*  result) {
 	PRINT_NAME();
 
@@ -829,7 +828,7 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 	PRINT_NAME();
 
 	if (get_param == nullptr || get_param->slot_id >= 4) {
@@ -873,7 +872,7 @@ int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param) {
 	PRINT_NAME();
 
 	if (set_param == nullptr || set_param->slot_id >= 4 || set_param->data_num > 5 ||
@@ -932,7 +931,7 @@ int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param
 	return status;
 }
 
-int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mount,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mount,
                                             SaveDataMountResult*             mount_result) {
 	PRINT_NAME();
 
@@ -970,7 +969,7 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 	return mount_save_data(slot, mount_dir, 0, mount_result);
 }
 
-int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount_point) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount_point) {
 	PRINT_NAME();
 
 	if (mount_point == nullptr) {
@@ -997,7 +996,7 @@ int KYTY_SYSV_ABI SaveDataUmount2(uint32_t mode, const SaveDataMountPoint* mount
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataPrepare(const SaveDataMountPoint*   mount_point,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataPrepare(const SaveDataMountPoint*   mount_point,
                                   const SaveDataPrepareParam* param) {
 	PRINT_NAME();
 
@@ -1013,7 +1012,7 @@ int KYTY_SYSV_ABI SaveDataPrepare(const SaveDataMountPoint*   mount_point,
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataCommit(const SaveDataCommitParam* param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataCommit(const SaveDataCommitParam* param) {
 	PRINT_NAME();
 
 	if (param == nullptr) {
@@ -1032,7 +1031,7 @@ int KYTY_SYSV_ABI SaveDataCommit(const SaveDataCommitParam* param) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 	PRINT_NAME();
 
 	if (del == nullptr || del->dir_name == nullptr || !valid_path_component(del->dir_name->data) ||
@@ -1062,7 +1061,7 @@ int KYTY_SYSV_ABI SaveDataDelete(const SaveDataDelete* del) {
 	return error ? SAVE_DATA_ERROR_INTERNAL : OK;
 }
 
-int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32_t param_type,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32_t param_type,
                                    void* param_buf, size_t param_buf_size, size_t* got_size) {
 	PRINT_NAME();
 
@@ -1118,7 +1117,7 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDataIcon* icon) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDataIcon* icon) {
 	PRINT_NAME();
 
 	if (mount_point == nullptr || icon == nullptr) {
@@ -1135,7 +1134,7 @@ int KYTY_SYSV_ABI SaveDataLoadIcon(const SaveDataMountPoint* mount_point, SaveDa
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, const char* path) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, const char* path) {
 	PRINT_NAME();
 
 	if (mount_point == nullptr || path == nullptr) {
@@ -1149,7 +1148,7 @@ int KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, 
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_param) {
 	PRINT_NAME();
 
 	if (sync_param == nullptr || sync_param->slot_id >= 4 || sync_param->option > 1) {
@@ -1182,7 +1181,7 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_para
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataGetEventResult(const void* /*event_param*/, SaveDataEvent* event) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataGetEventResult(const void* /*event_param*/, SaveDataEvent* event) {
 	PRINT_NAME();
 
 	if (event == nullptr) {
@@ -1208,7 +1207,7 @@ int KYTY_SYSV_ABI SaveDataGetEventResult(const void* /*event_param*/, SaveDataEv
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
 	PRINT_NAME();
 
 	const auto valid_name = [](const SceSaveDataDirName* name) {
@@ -1247,37 +1246,18 @@ int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
 		return SAVE_DATA_ERROR_EXISTS;
 	}
 	uint64_t blocks = 0;
-	int      status = read_save_blocks(source, &blocks);
-	if (status == OK) {
+	if (read_save_blocks(source, &blocks) == OK) {
 		if (convert->dst_blocks == blocks) {
 			return SAVE_DATA_ERROR_NO_NEED_CONVERT;
 		}
 		if (convert->dst_blocks < blocks) {
 			return SAVE_DATA_ERROR_BLOCKS_FEWER_THAN_SRC;
 		}
-		status = write_save_file(source / "sce_sys" / "blocks.bin", &convert->dst_blocks,
-		                         sizeof(convert->dst_blocks));
 	}
-	const auto* dir_name = convert->src_dir_name;
-	if (status == OK && convert->dst_dir_name != nullptr) {
-		std::error_code error;
-		std::filesystem::rename(
-		    source, save_directory(get_title_id(), convert->dst_dir_name->data, convert->user_id),
-		    error);
-		if (error) {
-			status = SAVE_DATA_ERROR_INTERNAL;
-		} else {
-			dir_name = convert->dst_dir_name;
-		}
-	}
-	SceSaveDataTitleId title {};
-	std::snprintf(title.data, sizeof(title.data), "%s", get_title_id().c_str());
-	queue_save_data_event(SAVE_DATA_EVENT_TYPE_CONVERT_END, convert->user_id, &title, dir_name,
-	                      status);
-	return OK;
+	EXIT("save data conversion of %s is not implemented\n", convert->src_dir_name->data);
 }
 
-int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 	PRINT_NAME();
 
 	LOGF("\t backup = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(backup));
@@ -1299,7 +1279,7 @@ int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32_t param_type,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32_t param_type,
                                    const void* param_buf, size_t param_buf_size) {
 	PRINT_NAME();
 
@@ -1352,7 +1332,7 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 	return write_save_file(path, &param, sizeof(param));
 }
 
-int KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
                                        SaveDataMountInfo*        info) {
 	PRINT_NAME();
 
@@ -1377,7 +1357,7 @@ int KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
                                    const SaveDataIcon*       icon) {
 	EXIT_NOT_IMPLEMENTED(mount_point == nullptr);
 	EXIT_NOT_IMPLEMENTED(icon == nullptr);

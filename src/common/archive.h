@@ -21,6 +21,7 @@ public:
 	[[nodiscard]] uint64_t Tell() const;
 	bool                   Seek(uint64_t offset);
 	void                   Read(void* data, uint32_t size, uint32_t* bytes_read);
+	bool                   GetIdentity(FileIdentity& identity, std::error_code& error) const;
 
 	KYTY_CLASS_NO_COPY(ArchiveFile);
 
@@ -29,7 +30,7 @@ private:
 	explicit ArchiveFile(std::unique_ptr<Private> p);
 	std::unique_ptr<Private> m_p;
 
-	friend std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path);
+	friend std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path, bool metadata_only);
 };
 
 // Virtual paths use "archive.ext!/member" and retain native host-path encoding.
@@ -40,7 +41,9 @@ private:
 [[nodiscard]] std::optional<File::Info>   GetArchiveInfo(const std::filesystem::path& path);
 [[nodiscard]] std::vector<File::DirEntry> GetArchiveDirEntries(const std::filesystem::path& path);
 [[nodiscard]] std::filesystem::path       GetArchiveHostPath(const std::filesystem::path& path);
-[[nodiscard]] std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path);
+// Metadata views also admit directories and retain exactly the same cached reader.
+[[nodiscard]] std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path,
+                                                          bool metadata_only = false);
 
 // Retain this handle while a mount or metadata scan is active to reuse the index and block cache.
 // Accepts either a host archive filename or a virtual path inside the archive.

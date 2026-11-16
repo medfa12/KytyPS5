@@ -1,4 +1,5 @@
 #include "libs/dualSenseBluetooth.h"
+#include "loader/runtimeChildClient.h"
 
 #include "common/logging/log.h"
 
@@ -333,6 +334,7 @@ int SDLCALL Sender(void*) {
 } // namespace
 
 Stream* Open(uint32_t freq, bool speaker, int controller, void (*tick)()) {
+	if (Loader::IsRuntimeChild()) { return nullptr; }
 	if (freq == 0 || freq > 192000) {
 		return nullptr;
 	}

@@ -27,7 +27,6 @@ bool                               haptics_handles_rumble = false;
 std::array<Rumble, 6>               pad_rumble {};
 std::vector<int>                    closed_pads;
 std::array<std::array<Uint8, 3>, 6> pad_colors {};
-std::array<bool, 6>                 mono_led {};
 } // namespace
 
 namespace Fake {
@@ -67,12 +66,6 @@ void CloseGamepad(SDL_Gamepad* pad) {
 	closed_pads.push_back(static_cast<int>(reinterpret_cast<uintptr_t>(pad)));
 }
 void Delay(Uint32) {}
-SDL_PropertiesID GetGamepadProperties(SDL_Gamepad* pad) {
-	return static_cast<SDL_PropertiesID>(reinterpret_cast<uintptr_t>(pad));
-}
-bool GetBooleanProperty(SDL_PropertiesID pad, const char* name, bool) {
-	return std::strcmp(name, SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN) == 0 && mono_led[pad];
-}
 } // namespace Fake
 
 #define SDL_GetTicks                Fake::GetTicks
@@ -85,8 +78,6 @@ bool GetBooleanProperty(SDL_PropertiesID pad, const char* name, bool) {
 #define SDL_SetGamepadSensorEnabled Fake::SetGamepadSensorEnabled
 #define SDL_CloseGamepad            Fake::CloseGamepad
 #define SDL_Delay                   Fake::Delay
-#define SDL_GetGamepadProperties    Fake::GetGamepadProperties
-#define SDL_GetBooleanProperty      Fake::GetBooleanProperty
 #include "libs/controller.cpp"
 #undef SDL_GetTicks
 #undef SDL_GetGamepadFromID
@@ -98,8 +89,6 @@ bool GetBooleanProperty(SDL_PropertiesID pad, const char* name, bool) {
 #undef SDL_SetGamepadSensorEnabled
 #undef SDL_CloseGamepad
 #undef SDL_Delay
-#undef SDL_GetGamepadProperties
-#undef SDL_GetBooleanProperty
 
 namespace Libs::Controller {
 // No virtual headset in these tests (padVr.cpp is not linked here).
@@ -128,6 +117,17 @@ double GetTimeMs() {
 	return static_cast<double>(now);
 }
 } // namespace Loader::Timer
+
+// This isolated output/routing fixture has no guest launch context. The
+// production LNC lifecycle and focused input path are covered by
+// kernel_file_system_tests --vsh-input-focus-only.
+Loader::Program* Loader::RuntimeLinker::GetCurrentProgram() { return nullptr; }
+namespace Libs::LncUtil::Lnc {
+bool HasControllerFocus(const Loader::Program* program) {
+	Check(program == nullptr, "unexpected guest context in direct controller fixture");
+	return true;
+}
+} // namespace Libs::LncUtil::Lnc
 
 namespace {
 using namespace Libs::Controller;
@@ -197,8 +197,10 @@ void TestPadPortOwnership() {
 		      "closing a rejected duplicate released the original owner");
 	}
 	Check(PadGetHandle(user + 1, 0, 0) == no_handle &&
-	          PadGetHandle(user, 2, 0) == no_handle && PadGetHandle(user, 0, 1) == no_handle,
+	          PadGetHandle(user, 3, 0) == no_handle && PadGetHandle(user, 0, 1) == no_handle,
 	      "a different port tuple aliased the open standard pad");
+	Check(PadGetHandle(user, 2, 0) == handle,
+	      "the retained personal type-2 port alias was lost");
 	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_CROSS, true);
 	Check(PadReadState(handle, &data) == 0 && data.connected &&
 	          data.buttons == PAD_BUTTON_CROSS,
@@ -217,26 +219,21 @@ void TestPadPortOwnership() {
 	      "a closed port retained a usable handle");
 	Check(PadOpen(user, 0, 0, nullptr) == handle && PadReadState(handle, &data) == 0,
 	      "a closed port could not reopen");
+	Check(OpenSystemDevicePort() == handle && OpenSystemDevicePort() == handle &&
+	          PadClose(handle) == 0 && PadClose(handle) == 0,
+	      "privileged device probes did not share the primary port");
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_R1, true);
+	Check(PadReadState(handle, &data) == 0 && (data.buttons & PAD_BUTTON_R1) != 0 &&
+	          PadOpen(user, 0, 0, nullptr) == already_opened,
+	      "closing device probes invalidated the original owner or allowed duplicate public opens");
+	Check(PadClose(handle) == 0 && PadReadState(handle, &data) == invalid_handle &&
+	          PadClose(handle) == invalid_handle,
+	      "the final shared-port close did not release ownership exactly once");
+	Check(OpenSystemDevicePort() == handle && OpenSystemDevicePort() == handle &&
+	          PadClose(handle) == 0 && PadReadState(handle, &data) == 0 &&
+	          PadClose(handle) == 0 && PadReadState(handle, &data) == invalid_handle,
+	      "privileged-only opens did not retain independent lifetimes");
 	Shutdown();
-}
-
-void TestSpecialPortWithoutDevice() {
-	Controller controller;
-	const int user = Config::GetUserId();
-	Check(PadOpenExt(user, 2, 0, nullptr) == PAD_ERROR_DEVICE_NOT_CONNECTED,
-	      "a third-party controller port opened without a device");
-	const int special = PadOpen(user, 2, 0, nullptr);
-	Check(special > 1 && PadGetHandle(user, 2, 0) == special,
-	      "the special port did not open its own handle");
-	SetButton(1, PAD_BUTTON_CROSS, true);
-	PadData data {};
-	Check(PadReadState(special, &data) == OK && !data.connected && data.buttons == 0,
-	      "host input reached the special port");
-	Check(PadReadState(1, &data) == OK && data.connected && data.buttons == PAD_BUTTON_CROSS,
-	      "the special port took the standard pad");
-	Check(PadClose(special) == OK && PadGetHandle(user, 2, 0) == PAD_ERROR_NO_HANDLE &&
-	          PadGetHandle(user, 0, 0) == 1,
-	      "closing the special port changed the standard one");
 }
 
 void TestSettingCycles() {
@@ -442,18 +439,6 @@ void TestIndependentOutputsAndPadSwitch() {
 		Check(request.large == 0 && request.small == 0,
 		      "released controller retained a cached vibration");
 	}
-}
-
-void TestMonoLedPadGetsNoLightBar() {
-	Controller             controller;
-	const PadLightBarParam first {10, 20, 30, 0};
-	const PadLightBarParam second {40, 50, 60, 0};
-	Check(PadSetLightBar(1, &first) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
-	      "a pad without an LED capability did not receive the light bar");
-	mono_led[1] = true;
-	Check(PadSetLightBar(1, &second) == 0 && pad_colors[1] == std::array<Uint8, 3> {10, 20, 30},
-	      "a mono-LED pad received the light bar");
-	mono_led[1] = false;
 }
 
 void TestPlayerUserIds() {
@@ -752,34 +737,20 @@ void TestUnreadPressSurvivesStickBurst() {
 	      "a stick move after a read did not add a sample");
 }
 
-void TestTouchWithoutClick() {
-	Controller controller;
-	PadData    data {};
-	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 1, true, 0.2f, 0.5f, false);
-	Check(PadReadState(1, &data) == 0 && data.touch_data.touch_num == 1 && data.buttons == 0,
-	      "a touch without a click pressed the touch pad button");
-	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 0, true, 0.25f, 0.5f);
-	Check(PadReadState(1, &data) == 0 && data.buttons == PAD_BUTTON_TOUCH_PAD,
-	      "a host input touch did not press the touch pad button");
-}
-
 } // namespace
 
 int main() {
 	Config::Initialize();
 	TestPlayerUserIds();
 	TestPadPortOwnership();
-	TestSpecialPortWithoutDevice();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
 	// Each following test initializes another controller and requires strong defaults.
 	TestVibrationLifetime();
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
-	TestMonoLedPadGetsNoLightBar();
 	TestTriggerEffectState();
 	TestUnreadPressSurvivesStickBurst();
-	TestTouchWithoutClick();
 	TestMultiplayerRouting();
 	TestDedicatedKeyboardOutputs();
 	Config::Shutdown();

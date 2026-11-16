@@ -24,8 +24,9 @@ struct SurfaceCapabilities {
 };
 
 struct WindowLoopState {
-	SDL_Event             event {};
-	bool                  need_exit = false;
+	SDL_Event        event {};
+	bool             need_exit = false;
+	std::atomic_bool paused    = false;
 	std::atomic<uint64_t> presented_frames {0};
 };
 

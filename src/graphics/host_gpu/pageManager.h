@@ -8,7 +8,7 @@
 
 namespace Libs::Graphics {
 
-enum class PageFaultAccess { Read, Write, Execute };
+enum class PageFaultAccess { Read, Write, Execute, Unknown };
 
 class PageManager final {
 public:
@@ -18,7 +18,9 @@ public:
 
 	KYTY_CLASS_NO_COPY(PageManager);
 
-	template <bool track, bool is_read = false>
+	[[nodiscard]] uint64_t GetPageSize() const;
+
+	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);

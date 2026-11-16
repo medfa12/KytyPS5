@@ -93,13 +93,13 @@ namespace CommonDialog {
 
 LIB_NAME("CommonDialog", "CommonDialog");
 
-int KYTY_SYSV_ABI CommonDialogInitialize() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommonDialogInitialize() {
 	PRINT_NAME();
 
 	return OK;
 }
 
-bool KYTY_SYSV_ABI CommonDialogIsUsed() {
+bool __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommonDialogIsUsed() {
 	PRINT_NAME();
 
 	return false;
@@ -146,7 +146,7 @@ static_assert(sizeof(LoginDialogParam) == 64);
 static int g_login_status        = LOGIN_STATUS_NONE;
 static int g_login_selected_user = LOGIN_USER_INVALID;
 
-int KYTY_SYSV_ABI LoginDialogInitialize() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI LoginDialogInitialize() {
 	PRINT_NAME();
 
 	if (g_login_status != LOGIN_STATUS_NONE) {
@@ -159,7 +159,7 @@ int KYTY_SYSV_ABI LoginDialogInitialize() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI LoginDialogTerminate() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI LoginDialogTerminate() {
 	PRINT_NAME();
 
 	if (g_login_status == LOGIN_STATUS_NONE) {
@@ -172,7 +172,7 @@ int KYTY_SYSV_ABI LoginDialogTerminate() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI LoginDialogOpen(const void* param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI LoginDialogOpen(const void* param) {
 	PRINT_NAME();
 
 	if (g_login_status != LOGIN_STATUS_INITIALIZED && g_login_status != LOGIN_STATUS_FINISHED) {
@@ -202,7 +202,7 @@ int KYTY_SYSV_ABI LoginDialogOpen(const void* param) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI LoginDialogClose() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI LoginDialogClose() {
 	PRINT_NAME();
 
 	if (g_login_status == LOGIN_STATUS_NONE) {
@@ -214,7 +214,7 @@ int KYTY_SYSV_ABI LoginDialogClose() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI LoginDialogUpdateStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI LoginDialogUpdateStatus() {
 	PRINT_NAME();
 
 	if (g_login_status == LOGIN_STATUS_RUNNING) {
@@ -224,13 +224,13 @@ int KYTY_SYSV_ABI LoginDialogUpdateStatus() {
 	return g_login_status;
 }
 
-int KYTY_SYSV_ABI LoginDialogGetStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI LoginDialogGetStatus() {
 	PRINT_NAME();
 
 	return g_login_status;
 }
 
-int KYTY_SYSV_ABI LoginDialogGetResult(void* result) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI LoginDialogGetResult(void* result) {
 	PRINT_NAME();
 
 	if (g_login_status == LOGIN_STATUS_NONE) {
@@ -246,10 +246,18 @@ int KYTY_SYSV_ABI LoginDialogGetResult(void* result) {
 	r->reserved[0]   = 0;
 	r->reserved[1]   = 0;
 
+	// ps5-vsh: a completed login dialog is a real login. Feed the user
+	// store (stage 2) so sceUserService state and its event queue follow;
+	// no-op when the store is disabled.
+	if (Libs::UserService::UserServiceStoreEnabled() &&
+	    r->selected_user != LOGIN_USER_INVALID) {
+		Libs::UserService::UserServiceStoreLogin(r->selected_user);
+	}
+
 	return OK;
 }
 
-void KYTY_SYSV_ABI LoginDialogParamInitialize(void* param) {
+void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI LoginDialogParamInitialize(void* param) {
 	PRINT_NAME();
 
 	if (param == nullptr) {
@@ -298,7 +306,7 @@ struct SigninDialogParam {
 static_assert(sizeof(SigninDialogResult) == 16);
 static_assert(sizeof(SigninDialogParam) == 16);
 
-int KYTY_SYSV_ABI SigninDialogInitialize() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SigninDialogInitialize() {
 	PRINT_NAME();
 	std::scoped_lock lock(g_dialog_mutex);
 	if (g_signin.status != SIGNIN_STATUS_NONE) {
@@ -308,7 +316,7 @@ int KYTY_SYSV_ABI SigninDialogInitialize() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SigninDialogTerminate() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SigninDialogTerminate() {
 	PRINT_NAME();
 	std::unique_lock lock(g_dialog_mutex);
 	if (g_signin.status == SIGNIN_STATUS_NONE) {
@@ -318,7 +326,7 @@ int KYTY_SYSV_ABI SigninDialogTerminate() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SigninDialogOpen(const void* param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SigninDialogOpen(const void* param) {
 	PRINT_NAME();
 	std::unique_lock lock(g_dialog_mutex);
 	if (g_signin.status == SIGNIN_STATUS_NONE) {
@@ -341,7 +349,7 @@ int KYTY_SYSV_ABI SigninDialogOpen(const void* param) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SigninDialogClose() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SigninDialogClose() {
 	PRINT_NAME();
 	std::unique_lock lock(g_dialog_mutex);
 	if (g_signin.status == SIGNIN_STATUS_NONE) {
@@ -351,19 +359,19 @@ int KYTY_SYSV_ABI SigninDialogClose() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SigninDialogUpdateStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SigninDialogUpdateStatus() {
 	PRINT_NAME();
 	std::scoped_lock lock(g_dialog_mutex);
 	return g_signin.status;
 }
 
-int KYTY_SYSV_ABI SigninDialogGetStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SigninDialogGetStatus() {
 	PRINT_NAME();
 	std::scoped_lock lock(g_dialog_mutex);
 	return g_signin.status;
 }
 
-int KYTY_SYSV_ABI SigninDialogGetResult(void* result) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SigninDialogGetResult(void* result) {
 	PRINT_NAME();
 	std::scoped_lock lock(g_dialog_mutex);
 	if (g_signin.status == SIGNIN_STATUS_NONE) {
@@ -443,7 +451,7 @@ static int              g_save_mode           = 0;
 static void*            g_save_user_data      = nullptr;
 static char             g_save_dir_name[sizeof(SaveDataDirName::data)] {};
 
-int KYTY_SYSV_ABI SaveDataDialogInitialize() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDialogInitialize() {
 	PRINT_NAME();
 
 	g_save_status         = SAVE_STATUS_INITIALIZED;
@@ -455,13 +463,13 @@ int KYTY_SYSV_ABI SaveDataDialogInitialize() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDialogGetStatus() {
 	PRINT_NAME();
 
 	return g_save_status;
 }
 
-int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 	PRINT_NAME();
 
 	// Some games require a RUNNING update before FINISHED.
@@ -475,7 +483,7 @@ int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 	return g_save_status;
 }
 
-int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 	PRINT_NAME();
 
 	if (result != nullptr) {
@@ -493,7 +501,7 @@ int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 	PRINT_NAME();
 
 	const auto* p = static_cast<const SaveDataDialogParam*>(param);
@@ -533,7 +541,7 @@ int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param) {
 	PRINT_NAME();
 
 	LOGF("\t close_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(close_param));
@@ -544,13 +552,13 @@ int KYTY_SYSV_ABI SaveDataDialogClose(const void* close_param) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataDialogIsReadyToDisplay() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDialogIsReadyToDisplay() {
 	PRINT_NAME();
 
 	return 1;
 }
 
-int KYTY_SYSV_ABI SaveDataDialogTerminate() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDialogTerminate() {
 	PRINT_NAME();
 
 	g_save_status         = SAVE_STATUS_NONE;
@@ -562,7 +570,7 @@ int KYTY_SYSV_ABI SaveDataDialogTerminate() {
 	return 0;
 }
 
-int KYTY_SYSV_ABI SaveDataDialogProgressBarInc(int target, uint32_t delta) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDialogProgressBarInc(int target, uint32_t delta) {
 	PRINT_NAME();
 
 	LOGF("\t target = %d\n"
@@ -572,7 +580,7 @@ int KYTY_SYSV_ABI SaveDataDialogProgressBarInc(int target, uint32_t delta) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataDialogProgressBarSetValue(int target, uint32_t rate) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SaveDataDialogProgressBarSetValue(int target, uint32_t rate) {
 	PRINT_NAME();
 
 	LOGF("\t target = %d\n"
@@ -617,7 +625,7 @@ struct MsgDialogResult {
 static int g_status = STATUS_NONE;
 static int g_mode   = 0;
 
-int KYTY_SYSV_ABI MsgDialogInitialize() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MsgDialogInitialize() {
 	PRINT_NAME();
 
 	g_status = STATUS_INITIALIZED;
@@ -626,7 +634,7 @@ int KYTY_SYSV_ABI MsgDialogInitialize() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 	PRINT_NAME();
 
 	const auto* p = static_cast<const MsgDialogParam*>(param);
@@ -648,19 +656,19 @@ int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI MsgDialogUpdateStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MsgDialogUpdateStatus() {
 	PRINT_NAME();
 
 	return g_status;
 }
 
-int KYTY_SYSV_ABI MsgDialogGetStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MsgDialogGetStatus() {
 	PRINT_NAME();
 
 	return g_status;
 }
 
-int KYTY_SYSV_ABI MsgDialogGetResult(void* result) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MsgDialogGetResult(void* result) {
 	PRINT_NAME();
 
 	if (result != nullptr) {
@@ -673,7 +681,7 @@ int KYTY_SYSV_ABI MsgDialogGetResult(void* result) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI MsgDialogTerminate() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MsgDialogTerminate() {
 	PRINT_NAME();
 
 	g_status = STATUS_NONE;
@@ -682,7 +690,7 @@ int KYTY_SYSV_ABI MsgDialogTerminate() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI MsgDialogClose() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MsgDialogClose() {
 	PRINT_NAME();
 
 	g_status = STATUS_FINISHED;
@@ -690,7 +698,7 @@ int KYTY_SYSV_ABI MsgDialogClose() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI MsgDialogProgressBarInc(int target, uint32_t delta) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MsgDialogProgressBarInc(int target, uint32_t delta) {
 	PRINT_NAME();
 
 	LOGF("\t target = %d\n"
@@ -700,7 +708,7 @@ int KYTY_SYSV_ABI MsgDialogProgressBarInc(int target, uint32_t delta) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI MsgDialogProgressBarSetValue(int target, uint32_t rate) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MsgDialogProgressBarSetValue(int target, uint32_t rate) {
 	PRINT_NAME();
 
 	LOGF("\t target = %d\n"
@@ -710,7 +718,7 @@ int KYTY_SYSV_ABI MsgDialogProgressBarSetValue(int target, uint32_t rate) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI MsgDialogProgressBarSetMsg(int target, const char* msg) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MsgDialogProgressBarSetMsg(int target, const char* msg) {
 	PRINT_NAME();
 
 	LOGF("\t target = %d\n"
@@ -745,7 +753,7 @@ struct ErrorDialogParam {
 
 static_assert(sizeof(ErrorDialogParam) == 16);
 
-int KYTY_SYSV_ABI ErrorDialogInitialize() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ErrorDialogInitialize() {
 	PRINT_NAME();
 
 	std::scoped_lock lock(g_dialog_mutex);
@@ -758,7 +766,7 @@ int KYTY_SYSV_ABI ErrorDialogInitialize() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ErrorDialogOpen(const void* param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ErrorDialogOpen(const void* param) {
 	PRINT_NAME();
 
 	std::unique_lock lock(g_dialog_mutex);
@@ -785,7 +793,7 @@ int KYTY_SYSV_ABI ErrorDialogOpen(const void* param) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ErrorDialogClose() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ErrorDialogClose() {
 	PRINT_NAME();
 
 	std::unique_lock lock(g_dialog_mutex);
@@ -798,7 +806,7 @@ int KYTY_SYSV_ABI ErrorDialogClose() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ErrorDialogTerminate() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ErrorDialogTerminate() {
 	PRINT_NAME();
 
 	std::unique_lock lock(g_dialog_mutex);
@@ -811,14 +819,14 @@ int KYTY_SYSV_ABI ErrorDialogTerminate() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ErrorDialogUpdateStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ErrorDialogUpdateStatus() {
 	PRINT_NAME();
 
 	std::scoped_lock lock(g_dialog_mutex);
 	return g_error.status;
 }
 
-int KYTY_SYSV_ABI ErrorDialogGetStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ErrorDialogGetStatus() {
 	PRINT_NAME();
 
 	std::scoped_lock lock(g_dialog_mutex);

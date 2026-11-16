@@ -7,7 +7,6 @@
 #include "libs/libs.h"
 
 #include <atomic>
-#include <thread>
 
 namespace Libs::Audio {
 
@@ -38,7 +37,7 @@ struct Audio3dInternal {
 	Audio3dData*          data                        = nullptr;
 	Common::Mutex*        data_mutex                  = nullptr;
 	uint64_t              data_delay                  = 0;
-	Semaphore::KernelSema playback_sema               = nullptr;
+	Semaphore::KernelSema playback_sema               = Semaphore::InvalidKernelSema;
 	Audio3dOpenParameters params                      = {};
 	int                   user_id                     = 0;
 	float                 late_reverb_level           = 0.0f;
@@ -93,7 +92,7 @@ static void playback_simulate(void* arg) {
 	port->playback_finished = true;
 }
 
-int KYTY_SYSV_ABI Audio3dInitialize(int64_t reserved) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Audio3dInitialize(int64_t reserved) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(reserved != 0);
@@ -101,7 +100,7 @@ int KYTY_SYSV_ABI Audio3dInitialize(int64_t reserved) {
 	return OK;
 }
 
-void KYTY_SYSV_ABI Audio3dGetDefaultOpenParameters(Audio3dOpenParameters* p) {
+void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Audio3dGetDefaultOpenParameters(Audio3dOpenParameters* p) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(sizeof(Audio3dOpenParameters) != 0x20);
@@ -109,7 +108,7 @@ void KYTY_SYSV_ABI Audio3dGetDefaultOpenParameters(Audio3dOpenParameters* p) {
 	*p = Audio3dOpenParameters();
 }
 
-int KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* parameters,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* parameters,
                                   uint32_t* id) {
 	PRINT_NAME();
 
@@ -144,7 +143,7 @@ int KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* para
 
 	EXIT_IF(g_ports[port].data != nullptr);
 	EXIT_IF(g_ports[port].data_mutex != nullptr);
-	EXIT_IF(g_ports[port].playback_sema != nullptr);
+	EXIT_IF(g_ports[port].playback_sema != Semaphore::InvalidKernelSema);
 
 	g_ports[port].data       = new Audio3dData[parameters->queue_depth];
 	g_ports[port].data_index = 0;
@@ -160,14 +159,15 @@ int KYTY_SYSV_ABI Audio3dPortOpen(int user_id, const Audio3dOpenParameters* para
 	EXIT_NOT_IMPLEMENTED(result != OK);
 
 	g_ports[port].playback_finished = false;
-	std::thread(playback_simulate, &g_ports[port]).detach();
+	Common::Thread playback_thread(playback_simulate, &g_ports[port]);
+	playback_thread.Detach();
 
 	*id = port;
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI Audio3dPortSetAttribute(uint32_t port_id, uint32_t attribute_id,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Audio3dPortSetAttribute(uint32_t port_id, uint32_t attribute_id,
                                           const void* attribute, size_t attribute_size) {
 	PRINT_NAME();
 
@@ -200,7 +200,7 @@ int KYTY_SYSV_ABI Audio3dPortSetAttribute(uint32_t port_id, uint32_t attribute_i
 	return OK;
 }
 
-int KYTY_SYSV_ABI Audio3dPortGetQueueLevel(uint32_t port_id, uint32_t* queue_level,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Audio3dPortGetQueueLevel(uint32_t port_id, uint32_t* queue_level,
                                            uint32_t* queue_available) {
 	PRINT_NAME();
 
@@ -240,7 +240,7 @@ int KYTY_SYSV_ABI Audio3dPortGetQueueLevel(uint32_t port_id, uint32_t* queue_lev
 	return OK;
 }
 
-int KYTY_SYSV_ABI Audio3dPortAdvance(uint32_t port_id) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Audio3dPortAdvance(uint32_t port_id) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(port_id >= MAX_PORTS);
@@ -268,7 +268,7 @@ int KYTY_SYSV_ABI Audio3dPortAdvance(uint32_t port_id) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI Audio3dPortPush(uint32_t port_id, uint32_t blocking) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Audio3dPortPush(uint32_t port_id, uint32_t blocking) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(port_id >= MAX_PORTS);

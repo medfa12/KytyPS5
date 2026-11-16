@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <array>
 #include <filesystem>
+#include <map>
 #include <limits>
 #include <optional>
 #include <string>
@@ -22,11 +23,11 @@ struct Lifecycle {
 	static constexpr auto        shutdown   = Config::Shutdown;
 };
 
+enum class ShaderOptimizationType { None, Size, Performance };
+
 enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
-
-enum class PssrUpscaler { Linear, DLSS, FSR };
 
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
@@ -51,6 +52,10 @@ constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
 	uint32_t               screen_height               = 720;
+	// Presentation client extent; zero preserves the direct-launch screen size.
+	// Guest VideoOut/internal dimensions remain screen_width/screen_height.
+	uint32_t               window_width                = 0;
+	uint32_t               window_height               = 0;
 	std::string            user_name                   = "Kyty";
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	std::string            audio_input_device;
@@ -68,10 +73,6 @@ struct ConfigOptions {
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   pro_enabled                 = false;
-	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
-	std::filesystem::path  dlss_folder;
-	uint32_t               dlss_preset                 = 0; // 0 is the model default
-	std::filesystem::path  fsr_folder;
 	bool                   amd_cpu_enabled             = false;
 	bool                   guest_tsc_enabled           = false;
 	bool                   network_connected           = false;
@@ -81,6 +82,7 @@ struct ConfigOptions {
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	bool                   shader_cache_enabled        = false;
+	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -94,18 +96,18 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
-	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
-	uint32_t               flush_draws                 = 0; // 0 is off
 	bool                   tessellation_enabled        = false;
 	bool                   occlusion_queries_enabled   = false;
-	bool                   relaxed_shader_float        = false;
-	bool                   native_rt                   = false;
-	bool                   lod_stats_enabled           = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
 	bool                   playgo_hack_enabled         = false;
+	int32_t                devkit_activation_days      = 30;
+	int32_t                pup_expiration_days         = 3;
+	// ps5-vsh: guest process environment (voldemort parity: --guest-env
+	// repeatable; MONO_THREADS_SUSPEND etc. ride here).
+	std::map<std::string, std::string> guest_environment;
 	bool                   skip_notice_screen          = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
@@ -119,6 +121,8 @@ void Load(const ConfigOptions& cfg);
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();
+uint32_t GetWindowWidth();
+uint32_t GetWindowHeight();
 const std::string& GetUserName();
 int32_t  GetUserId();
 const std::string& GetAudioInputDevice();
@@ -140,20 +144,18 @@ bool     HideCursorEnabled();
 bool     StretchEnabled();
 bool     VrEnabled();
 bool     Ps5ProEnabled();
-PssrUpscaler GetPssrUpscaler();
-const std::filesystem::path& GetDlssFolder();
-uint32_t GetDlssPreset();
-const std::filesystem::path& GetFsrFolder();
 bool     AmdCpuEnabled();
 bool     GuestTscEnabled();
 bool     IsNetworkConnected();
 bool     PsnEmulationEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
+uint32_t GetPupExpirationRemainingSeconds();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
 bool                   ShaderCacheEnabled();
+ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 
@@ -174,14 +176,9 @@ bool GpuAssistedValidationEnabled();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool ReadbackTiledImagesEnabled();
-bool ReadbackStorageImagesEnabled();
 bool SyncRawImageBuffersEnabled();
-uint32_t GetFlushDraws();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
-bool RelaxedShaderFloatEnabled();
-bool NativeRtEnabled();
-bool LodStatsEnabled();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
@@ -192,6 +189,8 @@ bool RedZoneProtectionEnabled();
 
 const Keymap& GetKeymap();
 const std::vector<std::string>& GetGuestArguments();
+
+const std::map<std::string, std::string>& GetGuestEnvironment();
 
 } // namespace Config
 

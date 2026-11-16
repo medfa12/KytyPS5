@@ -33,17 +33,20 @@ class FoldWorklist {
 public:
 	struct Location {
 		Block::iterator instruction;
+		uint64_t visited = 0;
 		bool queued = false;
 	};
 
 	void Register(Block::iterator instruction) {
-		Queue(locations.emplace(&*instruction, Location {instruction}).first->second);
+		locations.emplace(&*instruction, Location {instruction});
+		Queue(&*instruction);
 	}
 
-	void Queue(Location& location) {
-		if (!location.queued) {
-			location.queued = true;
-			pending.push_back(&location);
+	void Queue(Inst* inst) {
+		const auto found = locations.find(inst);
+		if (found != locations.end() && !found->second.queued) {
+			found->second.queued = true;
+			pending.push_back(inst);
 		}
 	}
 
@@ -52,14 +55,15 @@ public:
 	}
 
 	void FlushUsers() {
+		++generation;
 		// Pattern folds inspect nested operands even when intermediate operations
-		// stay dynamic. Visit their union once per drain, including cyclic Phi edges;
-		// the drain left nothing queued, so a queued instruction was visited here.
+		// stay dynamic. Visit their union once per drain, including cyclic Phi edges.
 		for (size_t i = 0; i < affected.size(); ++i) {
 			auto* inst = affected[i];
 			const auto found = locations.find(inst);
-			if (found == locations.end() || found->second.queued) continue;
-			Queue(found->second);
+			if (found == locations.end() || found->second.visited == generation) continue;
+			found->second.visited = generation;
+			Queue(inst);
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
 		affected.clear();
@@ -73,45 +77,78 @@ public:
 	}
 
 	std::unordered_map<Inst*, Location> locations;
-	std::vector<Location*>              pending; // Map nodes keep their addresses across rehashes.
+	std::vector<Inst*> pending;
 	std::unordered_set<Inst*> lowered_ancillary;
 
 private:
 	std::vector<Inst*> affected;
+	uint64_t generation = 0;
 };
 
-// Reads an immediate operand of a fold function's parameter type.
-template <typename T>
-bool ReadImmediate(Value value, T& result) {
-	if constexpr (std::is_same_v<T, bool>) {
-		if (!IsImmediate(value, Type::U1)) return false;
-		result = value.U1();
-	} else if constexpr (std::is_same_v<T, uint32_t>) {
-		if (!IsImmediate(value, Type::U32)) return false;
-		result = value.U32();
-	} else {
-		static_assert(std::is_same_v<T, uint64_t>);
-		if (!IsImmediate(value, Type::U64)) return false;
-		result = value.U64();
-	}
-	return true;
-}
-
-// Folds a binary operation on two immediates of the function's parameter types.
-template <typename Function, typename Result, typename Lhs, typename Rhs>
-bool FoldBinary(Inst& inst, Function function, Result (Function::*)(Lhs, Rhs) const) {
-	Lhs lhs {};
-	Rhs rhs {};
-	if (!ReadImmediate(Arg(inst, 0), lhs) || !ReadImmediate(Arg(inst, 1), rhs)) {
+template <typename Function>
+bool FoldU32(Inst& inst, Function function) {
+	const auto lhs = Arg(inst, 0);
+	const auto rhs = Arg(inst, 1);
+	if (!IsImmediate(lhs, Type::U32) || !IsImmediate(rhs, Type::U32)) {
 		return false;
 	}
-	Replace(inst, Value(function(lhs, rhs)));
+	Replace(inst, Value(static_cast<uint32_t>(function(lhs.U32(), rhs.U32()))));
 	return true;
 }
 
 template <typename Function>
-bool FoldBinary(Inst& inst, Function function) {
-	return FoldBinary(inst, function, &Function::operator());
+bool FoldU64(Inst& inst, Function function) {
+	const auto lhs = Arg(inst, 0);
+	const auto rhs = Arg(inst, 1);
+	if (!IsImmediate(lhs, Type::U64) || !IsImmediate(rhs, Type::U64)) {
+		return false;
+	}
+	Replace(inst, Value(static_cast<uint64_t>(function(lhs.U64(), rhs.U64()))));
+	return true;
+}
+
+template <typename Function>
+bool FoldU64Shift(Inst& inst, Function function) {
+	const auto value = Arg(inst, 0);
+	const auto shift = Arg(inst, 1);
+	if (!IsImmediate(value, Type::U64) || !IsImmediate(shift, Type::U32)) {
+		return false;
+	}
+	Replace(inst, Value(static_cast<uint64_t>(function(value.U64(), shift.U32()))));
+	return true;
+}
+
+template <typename Function>
+bool FoldU32Compare(Inst& inst, Function function) {
+	const auto lhs = Arg(inst, 0);
+	const auto rhs = Arg(inst, 1);
+	if (!IsImmediate(lhs, Type::U32) || !IsImmediate(rhs, Type::U32)) {
+		return false;
+	}
+	Replace(inst, Value(function(lhs.U32(), rhs.U32())));
+	return true;
+}
+
+template <typename Function>
+bool FoldU64Compare(Inst& inst, Function function) {
+	const auto lhs = Arg(inst, 0);
+	const auto rhs = Arg(inst, 1);
+	if (!IsImmediate(lhs, Type::U64) || !IsImmediate(rhs, Type::U64)) {
+		return false;
+	}
+	Replace(inst, Value(function(lhs.U64(), rhs.U64())));
+	return true;
+}
+
+template <typename Function>
+bool FoldLogical(Inst& inst, Function function) {
+	const auto lhs = Arg(inst, 0);
+	const auto rhs = Arg(inst, 1);
+	if (!IsImmediate(lhs, Type::U1) || !IsImmediate(rhs, Type::U1)) {
+		return false;
+	}
+	Replace(inst, Value(function(lhs.U1(), rhs.U1())));
+	return true;
 }
 
 bool ReplaceBinaryIdentity(Inst& inst, Type type, uint64_t identity) {
@@ -439,17 +476,17 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		}
 		case ValueOpcode::IAdd32:
-			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return a + b; })) {
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a + b; })) {
 				ReplaceBinaryIdentity(inst, Type::U32, 0u);
 			}
 			return;
 		case ValueOpcode::IAdd64:
-			if (!FoldBinary(inst, [](uint64_t a, uint64_t b) { return a + b; })) {
+			if (!FoldU64(inst, [](uint64_t a, uint64_t b) { return a + b; })) {
 				ReplaceBinaryIdentity(inst, Type::U64, 0u);
 			}
 			return;
 		case ValueOpcode::ISub32: {
-			if (FoldBinary(inst, [](uint32_t a, uint32_t b) { return a - b; })) {
+			if (FoldU32(inst, [](uint32_t a, uint32_t b) { return a - b; })) {
 				return;
 			}
 			const auto rhs = Arg(inst, 1);
@@ -459,7 +496,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		}
 		case ValueOpcode::ISub64: {
-			if (FoldBinary(inst, [](uint64_t a, uint64_t b) { return a - b; })) {
+			if (FoldU64(inst, [](uint64_t a, uint64_t b) { return a - b; })) {
 				return;
 			}
 			const auto rhs = Arg(inst, 1);
@@ -469,7 +506,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		}
 		case ValueOpcode::IMul32:
-			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return a * b; })) {
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a * b; })) {
 				ReplaceBinaryIdentity(inst, Type::U32, 1u);
 			}
 			return;
@@ -493,19 +530,19 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			if (IsImmediate(rhs, Type::U32) && rhs.U32() == 1u) {
 				Replace(inst, Arg(inst, 0));
 			} else if (IsImmediate(rhs, Type::U32) && rhs.U32() != 0u) {
-				FoldBinary(inst, [](uint32_t a, uint32_t b) { return a / b; });
+				FoldU32(inst, [](uint32_t a, uint32_t b) { return a / b; });
 			}
 			return;
 		}
 		case ValueOpcode::SMulHi:
-			FoldBinary(inst, [](uint32_t a, uint32_t b) {
+			FoldU32(inst, [](uint32_t a, uint32_t b) {
 				const auto product = static_cast<int64_t>(std::bit_cast<int32_t>(a)) *
 				                     static_cast<int64_t>(std::bit_cast<int32_t>(b));
 				return static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32u);
 			});
 			return;
 		case ValueOpcode::UMulHi:
-			FoldBinary(inst, [](uint32_t a, uint32_t b) {
+			FoldU32(inst, [](uint32_t a, uint32_t b) {
 				return static_cast<uint32_t>((static_cast<uint64_t>(a) * b) >> 32u);
 			});
 			return;
@@ -518,7 +555,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		}
 		case ValueOpcode::ShiftLeftLogical32:
-			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return a << (b & 31u); })) {
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a << (b & 31u); })) {
 				const auto shift = Arg(inst, 1);
 				if (IsImmediate(shift, Type::U32) && (shift.U32() & 31u) == 0u) {
 					Replace(inst, Arg(inst, 0));
@@ -526,7 +563,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::ShiftRightLogical32:
-			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return a >> (b & 31u); })) {
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a >> (b & 31u); })) {
 				if (IsImmediate(Arg(inst, 0), Type::U32) && Arg(inst, 0).U32() == 0u) {
 					Replace(inst, Value(0u));
 					return;
@@ -538,12 +575,12 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::ShiftRightArithmetic32:
-			FoldBinary(inst, [](uint32_t a, uint32_t b) {
+			FoldU32(inst, [](uint32_t a, uint32_t b) {
 				return static_cast<uint32_t>(std::bit_cast<int32_t>(a) >> (b & 31u));
 			});
 			return;
 		case ValueOpcode::ShiftLeftLogical64:
-			if (!FoldBinary(inst, [](uint64_t a, uint32_t b) { return a << (b & 63u); })) {
+			if (!FoldU64Shift(inst, [](uint64_t a, uint32_t b) { return a << (b & 63u); })) {
 				const auto shift = Arg(inst, 1);
 				if (IsImmediate(shift, Type::U32) && (shift.U32() & 63u) == 0u) {
 					Replace(inst, Arg(inst, 0));
@@ -551,7 +588,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::ShiftRightLogical64:
-			if (!FoldBinary(inst, [](uint64_t a, uint32_t b) { return a >> (b & 63u); })) {
+			if (!FoldU64Shift(inst, [](uint64_t a, uint32_t b) { return a >> (b & 63u); })) {
 				const auto shift = Arg(inst, 1);
 				if (IsImmediate(shift, Type::U32) && (shift.U32() & 63u) == 0u) {
 					Replace(inst, Arg(inst, 0));
@@ -559,12 +596,12 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::ShiftRightArithmetic64:
-			FoldBinary(inst, [](uint64_t a, uint32_t b) {
+			FoldU64Shift(inst, [](uint64_t a, uint32_t b) {
 				return static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
 			});
 			return;
 		case ValueOpcode::BitwiseAnd32:
-			if (FoldBinary(inst, [](uint32_t a, uint32_t b) { return a & b; }) ||
+			if (FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; }) ||
 			    ReplaceBinaryIdentity(inst, Type::U32, UINT32_MAX)) return;
 			for (uint32_t arm = 0; arm < 2u; ++arm) {
 				const auto mask = Arg(inst, arm);
@@ -591,13 +628,13 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::BitwiseAnd64:
-			if (!FoldBinary(inst, [](uint64_t a, uint64_t b) { return a & b; })) {
+			if (!FoldU64(inst, [](uint64_t a, uint64_t b) { return a & b; })) {
 				ReplaceBinaryIdentity(inst, Type::U64, UINT64_MAX);
 			}
 			return;
 		case ValueOpcode::BitwiseOr32:
 		case ValueOpcode::BitwiseXor32:
-			if (!FoldBinary(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
+			if (!FoldU32(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
 				    return opcode == ValueOpcode::BitwiseOr32 ? a | b : a ^ b;
 			    }) && !ReplaceBinaryIdentity(inst, Type::U32, 0u) &&
 			    IsComplementPair(inst, ValueOpcode::BitwiseNot32)) {
@@ -639,46 +676,45 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 		}
 		case ValueOpcode::SMin32:
 		case ValueOpcode::SMax32:
-			FoldBinary(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
+			FoldU32(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
 				const auto lhs = std::bit_cast<int32_t>(a);
 				const auto rhs = std::bit_cast<int32_t>(b);
-				const bool take_a = opcode == ValueOpcode::SMin32 ? lhs < rhs : lhs > rhs;
-				return take_a ? a : b;
+				return opcode == ValueOpcode::SMin32 ? (lhs < rhs ? a : b) : (lhs > rhs ? a : b);
 			});
 			return;
 		case ValueOpcode::UMin32:
-			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return std::min(a, b); })) {
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return std::min(a, b); })) {
 				ReplaceBinaryIdentity(inst, Type::U32, ~0u);
 			}
 			return;
 		case ValueOpcode::UMax32:
-			FoldBinary(inst, [](uint32_t a, uint32_t b) { return std::max(a, b); });
+			FoldU32(inst, [](uint32_t a, uint32_t b) { return std::max(a, b); });
 			return;
 		case ValueOpcode::IEqual32:
-			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return a == b; }))
+			if (!FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a == b; }))
 				FoldZeroComparison(block, instruction, worklist);
 			return;
 		case ValueOpcode::INotEqual32:
-			if (!FoldBinary(inst, [](uint32_t a, uint32_t b) { return a != b; }))
+			if (!FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a != b; }))
 				FoldZeroComparison(block, instruction, worklist);
 			return;
 		case ValueOpcode::ULessThan32:
-			FoldBinary(inst, [](uint32_t a, uint32_t b) { return a < b; });
+			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a < b; });
 			return;
 		case ValueOpcode::ULessThanEqual32:
-			FoldBinary(inst, [](uint32_t a, uint32_t b) { return a <= b; });
+			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a <= b; });
 			return;
 		case ValueOpcode::UGreaterThan32:
-			FoldBinary(inst, [](uint32_t a, uint32_t b) { return a > b; });
+			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a > b; });
 			return;
 		case ValueOpcode::UGreaterThanEqual32:
-			FoldBinary(inst, [](uint32_t a, uint32_t b) { return a >= b; });
+			FoldU32Compare(inst, [](uint32_t a, uint32_t b) { return a >= b; });
 			return;
 		case ValueOpcode::SLessThan32:
 		case ValueOpcode::SLessThanEqual32:
 		case ValueOpcode::SGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
-			FoldBinary(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
+			FoldU32Compare(inst, [opcode = inst.GetOpcode()](uint32_t a, uint32_t b) {
 				const auto lhs = std::bit_cast<int32_t>(a);
 				const auto rhs = std::bit_cast<int32_t>(b);
 				switch (opcode) {
@@ -690,35 +726,35 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			});
 			return;
 		case ValueOpcode::IEqual64:
-			FoldBinary(inst, [](uint64_t a, uint64_t b) { return a == b; });
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a == b; });
 			return;
 		case ValueOpcode::INotEqual64:
-			FoldBinary(inst, [](uint64_t a, uint64_t b) { return a != b; });
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a != b; });
 			return;
 		case ValueOpcode::ULessThan64:
-			FoldBinary(inst, [](uint64_t a, uint64_t b) { return a < b; });
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a < b; });
 			return;
 		case ValueOpcode::UGreaterThan64:
-			FoldBinary(inst, [](uint64_t a, uint64_t b) { return a > b; });
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a > b; });
 			return;
 		case ValueOpcode::ULessThanEqual64:
-			FoldBinary(inst, [](uint64_t a, uint64_t b) { return a <= b; });
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a <= b; });
 			return;
 		case ValueOpcode::UGreaterThanEqual64:
-			FoldBinary(inst, [](uint64_t a, uint64_t b) { return a >= b; });
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) { return a >= b; });
 			return;
 		case ValueOpcode::SLessThanEqual64:
-			FoldBinary(inst, [](uint64_t a, uint64_t b) {
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) {
 				return std::bit_cast<int64_t>(a) <= std::bit_cast<int64_t>(b);
 			});
 			return;
 		case ValueOpcode::SLessThan64:
-			FoldBinary(inst, [](uint64_t a, uint64_t b) {
+			FoldU64Compare(inst, [](uint64_t a, uint64_t b) {
 				return std::bit_cast<int64_t>(a) < std::bit_cast<int64_t>(b);
 			});
 			return;
 		case ValueOpcode::LogicalAnd:
-			if (!FoldBinary(inst, [](bool a, bool b) { return a && b; })) {
+			if (!FoldLogical(inst, [](bool a, bool b) { return a && b; })) {
 				const auto lhs = Arg(inst, 0);
 				const auto rhs = Arg(inst, 1);
 				const auto simplify = [&](Value assumption, Value expression) {
@@ -770,7 +806,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::LogicalOr:
-			if (!FoldBinary(inst, [](bool a, bool b) { return a || b; })) {
+			if (!FoldLogical(inst, [](bool a, bool b) { return a || b; })) {
 				const auto lhs = Arg(inst, 0);
 				const auto rhs = Arg(inst, 1);
 				if (IsImmediate(lhs, Type::U1)) {
@@ -802,7 +838,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::LogicalXor:
-			if (!FoldBinary(inst, [](bool a, bool b) { return a != b; })) {
+			if (!FoldLogical(inst, [](bool a, bool b) { return a != b; })) {
 				const auto lhs = Arg(inst, 0);
 				const auto rhs = Arg(inst, 1);
 				if (IsImmediate(lhs, Type::U1) && !lhs.U1()) {
@@ -945,22 +981,23 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	const auto drain = [&] {
 		do {
 			for (size_t i = 0; i < worklist.pending.size(); ++i) {
-				auto& location    = *worklist.pending[i];
+				auto* inst = worklist.pending[i];
+				auto& location = worklist.locations.at(inst);
 				location.queued = false;
-				auto*      inst   = &*location.instruction;
 				const auto opcode = inst->GetOpcode();
 				if (opcode == ValueOpcode::Identity || opcode == ValueOpcode::Void) continue;
+				const auto where = location.instruction;
 				users.assign(inst->Uses().begin(), inst->Uses().end());
 				operands.clear();
 				for (size_t arg = 0; arg < inst->NumArgs(); ++arg) operands.push_back(inst->Arg(arg));
 				mask_projection.Fold(*inst, wave_size);
-				FoldInstruction(*inst->Parent(), location.instruction, worklist);
+				FoldInstruction(*inst->Parent(), where, worklist);
 				bool changed = opcode != inst->GetOpcode() || operands.size() != inst->NumArgs();
 				for (size_t arg = 0; !changed && arg < operands.size(); ++arg)
 					changed = operands[arg] != inst->Arg(arg);
 				if (changed) {
 					worklist.QueueUsers(users);
-					worklist.Queue(location);
+					worklist.Queue(inst);
 				}
 			}
 			worklist.pending.clear();

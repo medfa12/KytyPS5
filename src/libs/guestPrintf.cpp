@@ -12,13 +12,46 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/threads.h"
 #include "libs/vaContext.h"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstring>
+#include <string_view>
 
-#include <cfloat>
-#include <cmath>
 #include <vector>
 
 namespace Libs {
+
+// Retain the first eight relevant already-formatted diagnostics even with Silent
+// logging. Single publication per slot; crash readers never wait on a writer.
+// No guest reads, callbacks, loader locks, logging or flushes in this observer.
+struct GuestStartupDiagnostic {
+	std::atomic<uint32_t> state {0};
+	std::array<char, 256> text {};
+};
+static std::array<GuestStartupDiagnostic, 8> g_startup_diagnostics;
+static_assert(std::atomic<uint32_t>::is_always_lock_free);
+static void RecordStartupDiagnostic(const std::vector<char>& buffer) {
+	const auto length = (std::min)(buffer.size(), size_t {512});
+	const std::string_view text(buffer.data(), length);
+	if (text.find("P_ASSERT") == std::string_view::npos &&
+	    text.find("arenas.create failed") == std::string_view::npos) {
+		return;
+	}
+	for (auto& slot: g_startup_diagnostics) {
+		uint32_t empty = 0;
+		if (!slot.state.compare_exchange_strong(empty, 1, std::memory_order_relaxed)) {
+			continue;
+		}
+		const auto count = (std::min)(length, slot.text.size() - 1);
+		std::memcpy(slot.text.data(), text.data(), count);
+		slot.text[count] = 0;
+		slot.state.store(2, std::memory_order_release);
+		break;
+	}
+}
 
 constexpr uint32_t FLAGS_ZEROPAD   = (1U << 0U);
 constexpr uint32_t FLAGS_LEFT      = (1U << 1U);
@@ -31,12 +64,8 @@ constexpr uint32_t FLAGS_SHORT     = (1U << 7U);
 constexpr uint32_t FLAGS_LONG      = (1U << 8U);
 constexpr uint32_t FLAGS_LONG_LONG = (1U << 9U);
 constexpr uint32_t FLAGS_PRECISION = (1U << 10U);
-constexpr uint32_t FLAGS_ADAPT_EXP = (1U << 11U);
 
 constexpr size_t   PRINTF_NTOA_BUFFER_SIZE        = 32U;
-constexpr size_t   PRINTF_FTOA_BUFFER_SIZE        = 32U;
-constexpr double   PRINTF_MAX_FLOAT               = 1e9;
-constexpr uint32_t PRINTF_DEFAULT_FLOAT_PRECISION = 6U;
 
 using out_fct_type = void (*)(char character, std::vector<char>* buffer, size_t idx,
                               size_t /*maxlen*/);
@@ -191,244 +220,25 @@ static size_t _ntoa_long(out_fct_type out, std::vector<char>* buffer, size_t idx
 	                    static_cast<unsigned int>(base), prec, width, flags);
 }
 
-static size_t _etoa(out_fct_type out, std::vector<char>* buffer, size_t idx, size_t maxlen,
-                    double value, unsigned int prec, unsigned int width, unsigned int flags);
-
-// internal ftoa for fixed decimal floating point
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
-static size_t _ftoa(out_fct_type out, std::vector<char>* buffer, size_t idx, size_t maxlen,
-                    double value, unsigned int prec, unsigned int width, unsigned int flags) {
-	char   buf[PRINTF_FTOA_BUFFER_SIZE];
-	size_t len  = 0U;
-	double diff = 0.0;
-
-	// powers of 10
-	static const double pow10[] = {1,      10,      100,      1000,      10000,
-	                               100000, 1000000, 10000000, 100000000, 1000000000};
-
-	// test for special values
-	if (value != value) {
-		return _out_rev(out, buffer, idx, maxlen, "nan", 3, width, flags);
-	}
-	if (value < -DBL_MAX) {
-		return _out_rev(out, buffer, idx, maxlen, "fni-", 4, width, flags);
-	}
-	if (value > DBL_MAX) {
-		return _out_rev(out, buffer, idx, maxlen, (flags & FLAGS_PLUS) != 0u ? "fni+" : "fni",
-		                (flags & FLAGS_PLUS) != 0u ? 4U : 3U, width, flags);
-	}
-
-	// test for very large values
-	// standard printf behavior is to print EVERY whole number digit -- which could be 100s of
-	// characters overflowing your buffers == bad
-	if ((value > PRINTF_MAX_FLOAT) || (value < -PRINTF_MAX_FLOAT)) {
-		return _etoa(out, buffer, idx, maxlen, value, prec, width, flags);
-	}
-
-	// test for negative
-	bool negative = false;
-	if (value < 0) {
-		negative = true;
-		value    = 0 - value;
-	}
-
-	// set default precision, if not set explicitly
-	if ((flags & FLAGS_PRECISION) == 0u) {
-		prec = PRINTF_DEFAULT_FLOAT_PRECISION;
-	}
-	// limit precision to 9, cause a prec >= 10 can lead to overflow errors
-	while ((len < PRINTF_FTOA_BUFFER_SIZE) && (prec > 9U)) {
-		buf[len++] = '0';
-		prec--;
-	}
-
-	int    whole = static_cast<int>(value);
-	double tmp   = (value - whole) * pow10[prec];
-	auto   frac  = static_cast<uint32_t>(tmp);
-	diff         = tmp - frac;
-
-	if (diff > 0.5) {
-		++frac;
-		// handle rollover, e.g. case 0.99 with prec 1 is 1.0
-		if (frac >= pow10[prec]) {
-			frac = 0;
-			++whole;
-		}
-	} else if (diff < 0.5) {
-	} else if ((frac == 0U) || ((frac & 1U) != 0u)) {
-		// if halfway, round up if odd OR if last digit is 0
-		++frac;
-	}
-
-	if (prec == 0U) {
-		diff = value - static_cast<double>(whole);
-		if ((!(diff < 0.5) || (diff > 0.5)) && ((static_cast<uint32_t>(whole) & 1u) != 0)) {
-			// exactly 0.5 and ODD, then round up
-			// 1.5 -> 2, but 2.5 -> 2
-			++whole;
-		}
-	} else {
-		unsigned int count = prec;
-		// now do fractional part, as an unsigned number
-		while (len < PRINTF_FTOA_BUFFER_SIZE) {
-			--count;
-			buf[len++] = static_cast<char>(48U + (frac % 10U));
-			if ((frac /= 10U) == 0u) {
-				break;
-			}
-		}
-		// add extra 0s
-		while ((len < PRINTF_FTOA_BUFFER_SIZE) && (count-- > 0U)) {
-			buf[len++] = '0';
-		}
-		if (len < PRINTF_FTOA_BUFFER_SIZE) {
-			// add decimal
-			buf[len++] = '.';
-		}
-	}
-
-	// do whole part, number is reversed
-	while (len < PRINTF_FTOA_BUFFER_SIZE) {
-		buf[len++] = static_cast<char>(48 + (whole % 10));
-		if ((whole /= 10) == 0) {
-			break;
-		}
-	}
-
-	// pad leading zeros
-	if (((flags & FLAGS_LEFT) == 0u) && ((flags & FLAGS_ZEROPAD) != 0u)) {
-		if ((width != 0u) && (negative || ((flags & (FLAGS_PLUS | FLAGS_SPACE)) != 0u))) {
-			width--;
-		}
-		while ((len < width) && (len < PRINTF_FTOA_BUFFER_SIZE)) {
-			buf[len++] = '0';
-		}
-	}
-
-	if (len < PRINTF_FTOA_BUFFER_SIZE) {
-		if (negative) {
-			buf[len++] = '-';
-		} else if ((flags & FLAGS_PLUS) != 0u) {
-			buf[len++] = '+'; // ignore the space if the '+' exists
-		} else if ((flags & FLAGS_SPACE) != 0u) {
-			buf[len++] = ' ';
-		}
-	}
-
-	return _out_rev(out, buffer, idx, maxlen, buf, len, width, flags);
-}
-
-// internal ftoa variant for exponential floating-point type, contributed by Martijn Jasperse
-// <m.jasperse@gmail.com>
-static size_t _etoa(out_fct_type out, std::vector<char>* buffer, size_t idx, size_t maxlen,
-                    double value, unsigned int prec, unsigned int width, unsigned int flags) {
-	// check for NaN and special values
-	if ((value != value) || (value > DBL_MAX) || (value < -DBL_MAX)) {
-		return _ftoa(out, buffer, idx, maxlen, value, prec, width, flags);
-	}
-
-	// determine the sign
-	const bool negative = value < 0;
-	if (negative) {
-		value = -value;
-	}
-
-	// default precision
-	if ((flags & FLAGS_PRECISION) == 0u) {
-		prec = PRINTF_DEFAULT_FLOAT_PRECISION;
-	}
-
-	// determine the decimal exponent
-	// based on the algorithm by David Gay (https://www.ampl.com/netlib/fp/dtoa.c)
-	union {
-		uint64_t U;
-		double   F;
-	} conv {};
-
-	conv.F   = value;
-	int exp2 = static_cast<int>((conv.U >> 52U) & 0x07FFU) - 1023; // effectively log2
-	conv.U   = (conv.U & ((1ULL << 52U) - 1U)) |
-	           (1023ULL << 52U); // drop the exponent so conv.F is now in [1,2)
-	// now approximate log10 from the log2 integer part and an expansion of ln around 1.5
-	int expval = static_cast<int>(0.1760912590558 + exp2 * 0.301029995663981 +
-	                              (conv.F - 1.5) * 0.289529654602168);
-	// now we want to compute 10^expval but we want to be sure it won't overflow
-	// exp2            = static_cast<int>(expval * 3.321928094887362 + 0.5);
-	exp2            = static_cast<int>(lround(expval * 3.321928094887362));
-	const double z  = expval * 2.302585092994046 - exp2 * 0.6931471805599453;
-	const double z2 = z * z;
-	conv.U          = static_cast<uint64_t>(exp2 + 1023) << 52U;
-	// compute exp(z) using continued fractions, see
-	// https://en.wikipedia.org/wiki/Exponential_function#Continued_fractions_for_ex
-	conv.F *= 1 + 2 * z / (2 - z + (z2 / (6 + (z2 / (10 + z2 / 14)))));
-	// correct for rounding errors
-	if (value < conv.F) {
-		expval--;
-		conv.F /= 10;
-	}
-
-	// the exponent format is "%+03d" and largest value is "307", so set aside 4-5 characters
-	unsigned int minwidth = ((expval < 100) && (expval > -100)) ? 4U : 5U;
-
-	// in "%g" mode, "prec" is the number of *significant figures* not decimals
-	if ((flags & FLAGS_ADAPT_EXP) != 0u) {
-		// do we want to fall-back to "%f" mode?
-		if ((value >= 1e-4) && (value < 1e6)) {
-			if (static_cast<int>(prec) > expval) {
-				prec = static_cast<unsigned>(static_cast<int>(prec) - expval - 1);
-			} else {
-				prec = 0;
-			}
-			flags |= FLAGS_PRECISION; // make sure _ftoa respects precision
-			// no characters in exponent
-			minwidth = 0U;
-			expval   = 0;
-		} else {
-			// we use one sigfig for the whole part
-			if ((prec > 0) && ((flags & FLAGS_PRECISION) != 0u)) {
-				--prec;
-			}
-		}
-	}
-
-	// will everything fit?
-	unsigned int fwidth = width;
-	if (width > minwidth) {
-		// we didn't fall-back so subtract the characters required for the exponent
-		fwidth -= minwidth;
-	} else {
-		// not enough characters, so go back to default sizing
-		fwidth = 0U;
-	}
-	if (((flags & FLAGS_LEFT) != 0u) && (minwidth != 0u)) {
-		// if we're padding on the right, DON'T pad the floating part
-		fwidth = 0U;
-	}
-
-	// rescale the float value
-	if (expval != 0) {
-		value /= conv.F;
-	}
-
-	// output the floating part
-	const size_t start_idx = idx;
-	idx = _ftoa(out, buffer, idx, maxlen, negative ? -value : value, prec, fwidth,
-	            flags & ~FLAGS_ADAPT_EXP);
-
-	// output the exponent part
-	if (minwidth != 0u) {
-		// output the exponential symbol
-		out((flags & FLAGS_UPPERCASE) != 0u ? 'E' : 'e', buffer, idx++, maxlen);
-		// output the exponent value
-		idx = _ntoa_long(out, buffer, idx, maxlen, (expval < 0) ? -expval : expval, expval < 0, 10,
-		                 0, minwidth - 1, FLAGS_ZEROPAD | FLAGS_PLUS);
-		// might need to right-pad spaces
-		if ((flags & FLAGS_LEFT) != 0u) {
-			while (idx - start_idx < width) {
-				out(' ', buffer, idx++, maxlen);
-			}
-		}
-	}
+// Use the existing locale-independent formatter for the numeric conversion.
+// mscorlib's DoubleToNumber requests %.40e: a fixed reverse mantissa buffer
+// discarded the leading digits, causing nonzero Singles to serialize as 0.0.
+// Only a reconstructed floating-point specifier and a host double reach fmt;
+// guest variadic arguments are still consumed using the SysV cursor below.
+static __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI size_t FormatFloat(
+    out_fct_type out, std::vector<char>* buffer, size_t idx, size_t maxlen, double value,
+    unsigned int precision, unsigned int width, unsigned int flags, char conversion) {
+	std::string spec = "%";
+	if ((flags & FLAGS_LEFT) != 0u) { spec += '-'; }
+	if ((flags & FLAGS_PLUS) != 0u) { spec += '+'; }
+	if ((flags & FLAGS_SPACE) != 0u) { spec += ' '; }
+	if ((flags & FLAGS_HASH) != 0u) { spec += '#'; }
+	if ((flags & FLAGS_ZEROPAD) != 0u) { spec += '0'; }
+	if (width != 0u) { spec += std::to_string(width); }
+	if ((flags & FLAGS_PRECISION) != 0u) { spec += '.'; spec += std::to_string(precision); }
+	spec += conversion;
+	const auto text = fmt::sprintf(spec, value);
+	for (const char c: text) { out(c, buffer, idx++, maxlen); }
 	return idx;
 }
 
@@ -442,8 +252,8 @@ static size_t _strnlen_s(const Char* str, size_t maxsize) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* format,
-                                VaList* va_list) {
+static __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n,
+                                              const char* format, VaList* va_list) {
 	std::vector<char> buffer;
 
 	uint32_t flags     = 0;
@@ -659,25 +469,12 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 			}
 			case 'f':
 			case 'F':
-				if (*format == 'F') {
-					flags |= FLAGS_UPPERCASE;
-				}
-				idx = _ftoa(out, &buffer, idx, maxlen, VaArg_double(va_list), precision, width,
-				            flags);
-				format++;
-				break;
 			case 'e':
 			case 'E':
 			case 'g':
 			case 'G':
-				if ((*format == 'g') || (*format == 'G')) {
-					flags |= FLAGS_ADAPT_EXP;
-				}
-				if ((*format == 'E') || (*format == 'G')) {
-					flags |= FLAGS_UPPERCASE;
-				}
-				idx = _etoa(out, &buffer, idx, maxlen, VaArg_double(va_list), precision, width,
-				            flags);
+				idx = FormatFloat(out, &buffer, idx, maxlen, VaArg_double(va_list), precision, width,
+				                  flags, *format);
 				format++;
 				break;
 			case 'c': {
@@ -703,6 +500,11 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 			case 's': {
 				const size_t limit = (flags & FLAGS_PRECISION) != 0u ? precision : maxlen;
 				const char* p = VaArg_ptr<const char>(va_list);
+				// ps5-vsh: real libc prints "(null)"; the shell relies on it.
+				static constexpr char kNullStr[] = "(null)";
+				if (p == nullptr) {
+					p = kNullStr;
+				}
 				std::string converted;
 				if ((flags & FLAGS_LONG) != 0u) {
 					// The guest ABI uses a 16-bit code unit for wchar_t.
@@ -771,10 +573,14 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 
 	// termination
 	out(static_cast<char>(0), &buffer, idx < maxlen ? idx : maxlen - 1U, maxlen);
+	RecordStartupDiagnostic(buffer);
 
 	if (sn) {
-		int s = snprintf(sn_s, sn_n, "%s", buffer.data());
-		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
+		// ps5-vsh: truncation (or the snprintf(NULL, 0, ...) size query) is
+		// legal C; copy what fits and report the full length below.
+		if (sn_s != nullptr && sn_n > 0) {
+			snprintf(sn_s, sn_n, "%s", buffer.data());
+		}
 	} else {
 		LOGF_COLOR(Log::Color::BrightMagenta, "%s", buffer.data());
 	}
@@ -787,13 +593,54 @@ static int kyty_vprintf(const char* format, VaList* va_list) {
 	return kyty_printf_internal(false, nullptr, 0, format, va_list);
 }
 
+struct PrintfEntrySp {
+	const char* tag;
+	uint64_t    parity;
+	uint64_t    tid;
+};
+static constexpr uint64_t kPrintfEntrySpBits = 6;
+static PrintfEntrySp              g_printf_entry_sp[1u << kPrintfEntrySpBits] = {};
+static std::atomic<uint64_t>      g_printf_entry_sp_n {0};
+static inline void Ps5VshRecordPrintfEntrySp(const char* tag) {
+	uint64_t rrsp = 0;
+#if defined(__x86_64__) || defined(_M_X64)
+	asm volatile("movq %%rsp, %0" : "=r"(rrsp));
+#endif
+	const uint64_t n = g_printf_entry_sp_n.fetch_add(1, std::memory_order_relaxed);
+	auto& slot = g_printf_entry_sp[n & ((1u << kPrintfEntrySpBits) - 1u)];
+	slot.tag    = tag;
+	slot.parity = rrsp & 15u;
+	slot.tid    = static_cast<uint64_t>(Common::Thread::GetThreadIdUnique());
+}
+
+void Ps5VshDumpPrintfEntrySp() {
+	for (const auto& slot: g_startup_diagnostics) {
+		if (slot.state.load(std::memory_order_acquire) == 2) {
+			std::printf(" retained guest diagnostic: %s\n", slot.text.data());
+		}
+	}
+	const uint64_t total = g_printf_entry_sp_n.load(std::memory_order_relaxed);
+	std::printf(" printf-entry-sp: total=%llu\n", (unsigned long long)total);
+	const uint64_t back = total < 16ull ? total : 16ull;
+	for (uint64_t k = 0; k < back; k++) {
+		const auto& s = g_printf_entry_sp[(total - 1 - k) & ((1u << kPrintfEntrySpBits) - 1u)];
+		std::printf("   #%llu %s parity=%llu tid=%llu\n",
+		            (unsigned long long)(total - 1 - k),
+		            s.tag != nullptr ? s.tag : "?",
+		            (unsigned long long)s.parity, (unsigned long long)s.tid);
+	}
+	std::fflush(stdout);
+}
+
 static int kyty_printf_ctx(VaContext* ctx) {
+	Ps5VshRecordPrintfEntrySp("printf_ctx");
 	const char* format = VaArg_ptr<const char>(&ctx->va_list);
 
 	return kyty_printf_internal(false, nullptr, 0, format, &ctx->va_list);
 }
 
 static int kyty_snprintf_ctx(VaContext* ctx) {
+	Ps5VshRecordPrintfEntrySp("snprintf_ctx");
 	char*       s      = VaArg_ptr<char>(&ctx->va_list);
 	size_t      n      = VaArg_size_t(&ctx->va_list);
 	const char* format = VaArg_ptr<const char>(&ctx->va_list);
@@ -801,7 +648,7 @@ static int kyty_snprintf_ctx(VaContext* ctx) {
 	return kyty_printf_internal(true, s, n, format, &ctx->va_list);
 }
 
-static int KYTY_SYSV_ABI kyty_printf_std(VA_ARGS) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI kyty_printf_std(VA_ARGS) {
 	VA_CONTEXT(ctx); // NOLINT(cppcoreguidelines-pro-type-member-init,hicpp-member-init)
 
 	return kyty_printf_ctx(&ctx);
@@ -817,6 +664,19 @@ guest_printf_ctx_func_t GetGuestPrintfCtxFunc() {
 
 guest_snprintf_ctx_func_t GetGuestSnprintfCtxFunc() {
 	return kyty_snprintf_ctx;
+}
+
+static int kyty_vsnprintf(char* s, size_t n, const char* format, VaList* va_list) {
+	Ps5VshRecordPrintfEntrySp("vsnprintf");
+	// Native libc 13.60 +0x5f6de enters the formatter at +0xc10, which copies
+	// the 24-byte SysV cursor via +0x3a50 before consuming arguments. Esvm
+	// relies on this for its size-query/write pair (+0x701, +0x775).
+	VaList copy = *va_list;
+	return kyty_printf_internal(true, s, n, format, &copy);
+}
+
+guest_vsnprintf_func_t GetGuestVsnprintfFunc() {
+	return kyty_vsnprintf;
 }
 
 guest_vprintf_func_t GetGuestVprintfFunc() {

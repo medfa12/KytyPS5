@@ -79,7 +79,6 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
@@ -87,10 +86,10 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
-	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
-	void SynchronizeBda(const RangeSet& mapped);
+	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] RangeSet TakeBdaSync();
 	void               RunGarbageCollector();
 
 private:
@@ -107,12 +106,6 @@ private:
 		bool                has_stream_leap;
 	};
 
-	// Copies [previous upload's end, end) go to `buffer`.
-	struct BufferUpload {
-		Buffer* buffer;
-		size_t  end;
-	};
-
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
@@ -127,8 +120,8 @@ private:
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
-	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
-	                  uint64_t total_size);
+	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
+	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>

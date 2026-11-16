@@ -1,10 +1,12 @@
 #include "libs/agc.h"
+#include "libs/agcRegisterData.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/virtualMemory.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -21,6 +23,7 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "libs/agcQueueIdentity.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
@@ -33,6 +36,15 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+
+#include "graphics/graphicsObserve.h"
 
 namespace Libs::Graphics {
 
@@ -54,17 +66,15 @@ static void ReleaseDmem();
 
 } // namespace Gen5Driver
 
-// Logs each call's arguments when true.
-static constexpr bool TraceCalls = false;
-
 template <typename... Args>
 static void AgcTrace(const char* format, const Args&... args) {
-	if constexpr (TraceCalls) {
+	if (Config::GraphicsDebugDumpEnabled()) {
 		LOGF(format, args...);
 	}
 }
 
 void Initialize() {
+	Observe::Initialize();
 	// Some games lock up if this is not called first
 	if (Config::RenderDocEnabled()) {
 		RenderDocInit();
@@ -73,7 +83,7 @@ void Initialize() {
 	auto width  = Config::GetScreenWidth();
 	auto height = Config::GetScreenHeight();
 
-	auto& presenter = WindowInit(width, height);
+	auto& presenter = WindowInit(Config::GetWindowWidth(), Config::GetWindowHeight());
 	auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
 	g_renderer      = &presenter.Renderer();
 	g_renderer->InitializeGpu(&video_out);
@@ -162,7 +172,21 @@ struct RegisterDefaultsStorage {
 	bool                         initialized = false;
 };
 
-#include "libs/agcRegisterDefaults.inc"
+static CompactRegisterDefaults* load_register_defaults(bool internal, uint32_t version) {
+	try {
+		static AgcRegisterData::Data<ShaderRegister, CompactRegisterDefaults> data([] {
+			const char* path = std::getenv("KYTY_AGC_REGISTER_DATA");
+			if (!path || !*path) {
+				throw std::runtime_error("AGC register data missing: run retail setup or set KYTY_AGC_REGISTER_DATA");
+			}
+			return std::filesystem::u8path(path);
+		}());
+		return data.Get(internal, version);
+	} catch (const std::exception& error) {
+		EXIT("AGC firmware data: %s\n", error.what());
+		return nullptr;
+	}
+}
 
 #include <fmt/format.h>
 
@@ -235,17 +259,17 @@ static uint32_t normalize_register_defaults_version(uint32_t ver) {
 static RegisterDefaults* get_public_register_defaults(uint32_t ver) {
 	static RegisterDefaultsStorage storage[GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION + 1] = {};
 	const auto                     index = normalize_register_defaults_version(ver);
-	return get_register_defaults(g_agc_public_reg_defaults_by_version[index], &storage[index]);
+	return get_register_defaults(load_register_defaults(false, index), &storage[index]);
 }
 
 static RegisterDefaults* get_internal_register_defaults(uint32_t ver) {
 	static RegisterDefaultsStorage storage[GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION + 1] = {};
 	const auto                     index = normalize_register_defaults_version(ver);
-	return get_register_defaults(g_agc_internal_reg_defaults_by_version[index], &storage[index]);
+	return get_register_defaults(load_register_defaults(true, index), &storage[index]);
 }
 
 struct CommandBuffer {
-	using Callback = KYTY_SYSV_ABI bool (*)(CommandBuffer*, uint32_t, void*);
+	using Callback = __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI bool (*)(CommandBuffer*, uint32_t, void*);
 
 	uint32_t* bottom;
 	uint32_t* top;
@@ -255,7 +279,7 @@ struct CommandBuffer {
 	void*     user_data;
 	uint32_t  reserved_dw;
 
-	[[nodiscard]] KYTY_SYSV_ABI uint64_t GetAvailableSizeDW() const {
+	[[nodiscard]] __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI uint64_t GetAvailableSizeDW() const {
 		// Interpret the signed cursor distance as an unsigned 64-bit DWORD count.
 		const auto distance = static_cast<int64_t>(reinterpret_cast<uintptr_t>(cursor_down) -
 		                                           reinterpret_cast<uintptr_t>(cursor_up));
@@ -266,7 +290,7 @@ struct CommandBuffer {
 		return available - reserved_dw;
 	}
 
-	KYTY_SYSV_ABI bool ReserveDW(uint32_t num_dw) {
+	__attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI bool ReserveDW(uint32_t num_dw) {
 		const uint64_t remaining = GetAvailableSizeDW();
 		if (num_dw > remaining) {
 			if (callback == nullptr) {
@@ -298,7 +322,7 @@ struct CommandBuffer {
 		return true;
 	}
 
-	KYTY_SYSV_ABI uint32_t* AllocateDW(uint32_t size_dw) {
+	__attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI uint32_t* AllocateDW(uint32_t size_dw) {
 		if (size_dw == 0 || !ReserveDW(size_dw)) {
 			LOGF_COLOR(Log::Color::Red,
 			           "\t command buffer AllocateDW failed: size_dw = %" PRIu32 "\n", size_dw);
@@ -315,12 +339,12 @@ struct Label {
 	uint64_t          m_reserved[3];
 };
 
-int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	PRINT_NAME();
 
-	AgcTrace("\t state = 0x%016" PRIx64 "\n"
-	         "\t ver   = %u\n",
-	         reinterpret_cast<uint64_t>(state), ver);
+	LOGF("\t state = 0x%016" PRIx64 "\n"
+	     "\t ver   = %u\n",
+	     reinterpret_cast<uint64_t>(state), ver);
 
 	if (ver > GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION) {
 		LOGF_COLOR(Log::Color::Red, "\t unsupported version %u\n", ver);
@@ -331,7 +355,7 @@ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	return OK;
 }
 
-void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver) {
+void* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver) {
 	PRINT_NAME();
 
 	if (ver > GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION) {
@@ -340,7 +364,7 @@ void* KYTY_SYSV_ABI AgcGetRegisterDefaults2(uint32_t ver) {
 	return get_public_register_defaults(ver);
 }
 
-void* KYTY_SYSV_ABI AgcGetRegisterDefaults2Internal(uint32_t ver) {
+void* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcGetRegisterDefaults2Internal(uint32_t ver) {
 	PRINT_NAME();
 
 	if (ver > GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION) {
@@ -350,151 +374,154 @@ void* KYTY_SYSV_ABI AgcGetRegisterDefaults2Internal(uint32_t ver) {
 }
 
 static void dbg_dump_shader(const Shader* h) {
-	AgcTrace("\t file_header  = 0x%08" PRIx32 "\n"
-	         "\t version      = 0x%08" PRIx32 "\n"
-	         "\t user_data    = 0x%016" PRIx64 "\n",
-	         h->file_header, h->version, reinterpret_cast<uint64_t>(h->user_data));
+	if (!Config::GraphicsDebugDumpEnabled()) {
+		return;
+	}
+
+	LOGF("\t file_header  = 0x%08" PRIx32 "\n"
+	     "\t version      = 0x%08" PRIx32 "\n"
+	     "\t user_data    = 0x%016" PRIx64 "\n",
+	     h->file_header, h->version, reinterpret_cast<uint64_t>(h->user_data));
 	if (h->user_data != nullptr) {
-		AgcTrace("\t\t direct_resource_count    = 0x%04" PRIx16 "\n"
-		         "\t\t direct_resource_offset   = 0x%016" PRIx64 "\n",
-		         h->user_data->direct_resource_count,
-		         reinterpret_cast<uint64_t>(h->user_data->direct_resource_offset));
+		LOGF("\t\t direct_resource_count    = 0x%04" PRIx16 "\n"
+		     "\t\t direct_resource_offset   = 0x%016" PRIx64 "\n",
+		     h->user_data->direct_resource_count,
+		     reinterpret_cast<uint64_t>(h->user_data->direct_resource_offset));
 		for (int i = 0; i < static_cast<int>(h->user_data->direct_resource_count); i++) {
-			AgcTrace("\t\t\t offset[%02d] = %04" PRIx16 "\n", i,
-			         h->user_data->direct_resource_offset[i]);
+			LOGF("\t\t\t offset[%02d] = %04" PRIx16 "\n", i,
+			     h->user_data->direct_resource_offset[i]);
 		}
 		for (int imm = 0; imm < 4; imm++) {
-			AgcTrace("\t\t sharp_resource_count  [%d] = 0x%04" PRIx16 "\n", imm,
-			         h->user_data->sharp_resource_count[imm]);
-			AgcTrace("\t\t sharp_resource_offset [%d] = 0x%016" PRIx64 "\n", imm,
-			         reinterpret_cast<uint64_t>(h->user_data->sharp_resource_offset[imm]));
+			LOGF("\t\t sharp_resource_count  [%d] = 0x%04" PRIx16 "\n", imm,
+			     h->user_data->sharp_resource_count[imm]);
+			LOGF("\t\t sharp_resource_offset [%d] = 0x%016" PRIx64 "\n", imm,
+			     reinterpret_cast<uint64_t>(h->user_data->sharp_resource_offset[imm]));
 			for (int i = 0; i < static_cast<int>(h->user_data->sharp_resource_count[imm]); i++) {
-				AgcTrace(
-				    "\t\t\t offset_dw[%d] = %04" PRIx16 ", size = %" PRIu16 "\n", i,
-				    static_cast<uint16_t>(h->user_data->sharp_resource_offset[imm][i].offset_dw),
-				    static_cast<uint16_t>(h->user_data->sharp_resource_offset[imm][i].size));
+				LOGF("\t\t\t offset_dw[%d] = %04" PRIx16 ", size = %" PRIu16 "\n", i,
+				     static_cast<uint16_t>(h->user_data->sharp_resource_offset[imm][i].offset_dw),
+				     static_cast<uint16_t>(h->user_data->sharp_resource_offset[imm][i].size));
 			}
 		}
-		AgcTrace("\t\t eud_size_dw    = 0x%04" PRIx16 "\n"
-		         "\t\t srt_size_dw    = 0x%04" PRIx16 "\n",
-		         h->user_data->eud_size_dw, h->user_data->srt_size_dw);
+		LOGF("\t\t eud_size_dw    = 0x%04" PRIx16 "\n"
+		     "\t\t srt_size_dw    = 0x%04" PRIx16 "\n",
+		     h->user_data->eud_size_dw, h->user_data->srt_size_dw);
 	}
-	AgcTrace("\t code             = 0x%016" PRIx64 "\n"
-	         "\t num_cx_registers = 0x%02" PRIx8 "\n"
-	         "\t cx_registers     = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(h->code), h->num_cx_registers,
-	         reinterpret_cast<uint64_t>(h->cx_registers));
+	LOGF("\t code             = 0x%016" PRIx64 "\n"
+	     "\t num_cx_registers = 0x%02" PRIx8 "\n"
+	     "\t cx_registers     = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(h->code), h->num_cx_registers,
+	     reinterpret_cast<uint64_t>(h->cx_registers));
 	for (int i = 0; i < static_cast<int>(h->num_cx_registers); i++) {
-		AgcTrace("\t\t cx[%d]: offset = %08" PRIx32 ", value = %08" PRIx32 "\n", i,
-		         h->cx_registers[i].offset, h->cx_registers[i].value);
+		LOGF("\t\t cx[%d]: offset = %08" PRIx32 ", value = %08" PRIx32 "\n", i,
+		     h->cx_registers[i].offset, h->cx_registers[i].value);
 	}
-	AgcTrace("\t num_sh_registers = 0x%02" PRIx8 "\n"
-	         "\t sh_registers     = 0x%016" PRIx64 "\n",
-	         h->num_sh_registers, reinterpret_cast<uint64_t>(h->sh_registers));
+	LOGF("\t num_sh_registers = 0x%02" PRIx8 "\n"
+	     "\t sh_registers     = 0x%016" PRIx64 "\n",
+	     h->num_sh_registers, reinterpret_cast<uint64_t>(h->sh_registers));
 	for (int i = 0; i < static_cast<int>(h->num_sh_registers); i++) {
-		AgcTrace("\t\t sh[%d]: offset = %08" PRIx32 ", value = %08" PRIx32 "\n", i,
-		         h->sh_registers[i].offset, h->sh_registers[i].value);
+		LOGF("\t\t sh[%d]: offset = %08" PRIx32 ", value = %08" PRIx32 "\n", i,
+		     h->sh_registers[i].offset, h->sh_registers[i].value);
 	}
-	AgcTrace("\t specials                          = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(h->specials));
-	AgcTrace("\t\t ge_cntl:              offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
-	         h->specials->ge_cntl.offset, h->specials->ge_cntl.value);
-	AgcTrace("\t\t vgt_shader_stages_en: offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
-	         h->specials->vgt_shader_stages_en.offset, h->specials->vgt_shader_stages_en.value);
-	AgcTrace("\t\t vgt_gs_out_prim_type: offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
-	         h->specials->vgt_gs_out_prim_type.offset, h->specials->vgt_gs_out_prim_type.value);
-	AgcTrace("\t\t ge_user_vgpr_en:      offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
-	         h->specials->ge_user_vgpr_en.offset, h->specials->ge_user_vgpr_en.value);
-	AgcTrace("\t\t dispatch_modifier = %08" PRIx32 "\n", h->specials->dispatch_modifier);
-	AgcTrace("\t\t user_data_range: start = %08" PRIx32 ", end = %08" PRIx32 "\n",
-	         h->specials->user_data_range.start, h->specials->user_data_range.end);
-	AgcTrace("\t\t draw_modifier: enbl_start_vertex_offset   = %08" PRIx32 "\n"
-	         "\t\t draw_modifier: enbl_start_index_offset    = %08" PRIx32 "\n"
-	         "\t\t draw_modifier: enbl_start_instance_offset = %08" PRIx32 "\n"
-	         "\t\t draw_modifier: enbl_draw_index            = %08" PRIx32 "\n"
-	         "\t\t draw_modifier: enbl_user_vgprs            = %08" PRIx32 "\n"
-	         "\t\t draw_modifier: render_target_slice_offset = %08" PRIx32 "\n"
-	         "\t\t draw_modifier: fuse_draws                 = %08" PRIx32 "\n"
-	         "\t\t draw_modifier: compiler_flags             = %08" PRIx32 "\n"
-	         "\t\t draw_modifier: is_default                 = %08" PRIx32 "\n"
-	         "\t\t draw_modifier: reserved                   = %08" PRIx32 "\n"
-	         "\t num_input_semantics               = 0x%08" PRIx32 "\n"
-	         "\t input_semantics                   = 0x%016" PRIx64 "\n",
-	         static_cast<uint32_t>(h->specials->draw_modifier.enbl_start_vertex_offset),
-	         static_cast<uint32_t>(h->specials->draw_modifier.enbl_start_index_offset),
-	         static_cast<uint32_t>(h->specials->draw_modifier.enbl_start_instance_offset),
-	         static_cast<uint32_t>(h->specials->draw_modifier.enbl_draw_index),
-	         static_cast<uint32_t>(h->specials->draw_modifier.enbl_user_vgprs),
-	         static_cast<uint32_t>(h->specials->draw_modifier.render_target_slice_offset),
-	         static_cast<uint32_t>(h->specials->draw_modifier.fuse_draws),
-	         static_cast<uint32_t>(h->specials->draw_modifier.compiler_flags),
-	         static_cast<uint32_t>(h->specials->draw_modifier.is_default),
-	         static_cast<uint32_t>(h->specials->draw_modifier.reserved), h->num_input_semantics,
-	         reinterpret_cast<uint64_t>(h->input_semantics));
+	LOGF("\t specials                          = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(h->specials));
+	LOGF("\t\t ge_cntl:              offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
+	     h->specials->ge_cntl.offset, h->specials->ge_cntl.value);
+	LOGF("\t\t vgt_shader_stages_en: offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
+	     h->specials->vgt_shader_stages_en.offset, h->specials->vgt_shader_stages_en.value);
+	LOGF("\t\t vgt_gs_out_prim_type: offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
+	     h->specials->vgt_gs_out_prim_type.offset, h->specials->vgt_gs_out_prim_type.value);
+	LOGF("\t\t ge_user_vgpr_en:      offset = %08" PRIx32 ", value = %08" PRIx32 "\n",
+	     h->specials->ge_user_vgpr_en.offset, h->specials->ge_user_vgpr_en.value);
+	LOGF("\t\t dispatch_modifier = %08" PRIx32 "\n", h->specials->dispatch_modifier);
+	LOGF("\t\t user_data_range: start = %08" PRIx32 ", end = %08" PRIx32 "\n",
+	     h->specials->user_data_range.start, h->specials->user_data_range.end);
+	LOGF("\t\t draw_modifier: enbl_start_vertex_offset   = %08" PRIx32 "\n"
+	     "\t\t draw_modifier: enbl_start_index_offset    = %08" PRIx32 "\n"
+	     "\t\t draw_modifier: enbl_start_instance_offset = %08" PRIx32 "\n"
+	     "\t\t draw_modifier: enbl_draw_index            = %08" PRIx32 "\n"
+	     "\t\t draw_modifier: enbl_user_vgprs            = %08" PRIx32 "\n"
+	     "\t\t draw_modifier: render_target_slice_offset = %08" PRIx32 "\n"
+	     "\t\t draw_modifier: fuse_draws                 = %08" PRIx32 "\n"
+	     "\t\t draw_modifier: compiler_flags             = %08" PRIx32 "\n"
+	     "\t\t draw_modifier: is_default                 = %08" PRIx32 "\n"
+	     "\t\t draw_modifier: reserved                   = %08" PRIx32 "\n"
+	     "\t num_input_semantics               = 0x%08" PRIx32 "\n"
+	     "\t input_semantics                   = 0x%016" PRIx64 "\n",
+	     static_cast<uint32_t>(h->specials->draw_modifier.enbl_start_vertex_offset),
+	     static_cast<uint32_t>(h->specials->draw_modifier.enbl_start_index_offset),
+	     static_cast<uint32_t>(h->specials->draw_modifier.enbl_start_instance_offset),
+	     static_cast<uint32_t>(h->specials->draw_modifier.enbl_draw_index),
+	     static_cast<uint32_t>(h->specials->draw_modifier.enbl_user_vgprs),
+	     static_cast<uint32_t>(h->specials->draw_modifier.render_target_slice_offset),
+	     static_cast<uint32_t>(h->specials->draw_modifier.fuse_draws),
+	     static_cast<uint32_t>(h->specials->draw_modifier.compiler_flags),
+	     static_cast<uint32_t>(h->specials->draw_modifier.is_default),
+	     static_cast<uint32_t>(h->specials->draw_modifier.reserved), h->num_input_semantics,
+	     reinterpret_cast<uint64_t>(h->input_semantics));
 	for (int i = 0; i < static_cast<int>(h->num_input_semantics); i++) {
-		AgcTrace("\t\t input_semantics[%d]: semantic         = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: hardware_mapping = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: size_in_elements = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: is_f16           = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: is_flat_shaded   = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: is_linear        = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: is_custom        = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: static_vb_index  = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: static_attribute = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: reserved         = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: default_value    = %08" PRIx32 "\n"
-		         "\t\t input_semantics[%d]: default_value_hi = %08" PRIx32 "\n",
-		         i, static_cast<uint32_t>(h->input_semantics[i].semantic), i,
-		         static_cast<uint32_t>(h->input_semantics[i].hardware_mapping), i,
-		         static_cast<uint32_t>(h->input_semantics[i].size_in_elements), i,
-		         static_cast<uint32_t>(h->input_semantics[i].is_f16), i,
-		         static_cast<uint32_t>(h->input_semantics[i].is_flat_shaded), i,
-		         static_cast<uint32_t>(h->input_semantics[i].is_linear), i,
-		         static_cast<uint32_t>(h->input_semantics[i].is_custom), i,
-		         static_cast<uint32_t>(h->input_semantics[i].static_vb_index), i,
-		         static_cast<uint32_t>(h->input_semantics[i].static_attribute), i,
-		         static_cast<uint32_t>(h->input_semantics[i].reserved), i,
-		         static_cast<uint32_t>(h->input_semantics[i].default_value), i,
-		         static_cast<uint32_t>(h->input_semantics[i].default_value_hi));
+		LOGF("\t\t input_semantics[%d]: semantic         = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: hardware_mapping = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: size_in_elements = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: is_f16           = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: is_flat_shaded   = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: is_linear        = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: is_custom        = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: static_vb_index  = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: static_attribute = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: reserved         = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: default_value    = %08" PRIx32 "\n"
+		     "\t\t input_semantics[%d]: default_value_hi = %08" PRIx32 "\n",
+		     i, static_cast<uint32_t>(h->input_semantics[i].semantic), i,
+		     static_cast<uint32_t>(h->input_semantics[i].hardware_mapping), i,
+		     static_cast<uint32_t>(h->input_semantics[i].size_in_elements), i,
+		     static_cast<uint32_t>(h->input_semantics[i].is_f16), i,
+		     static_cast<uint32_t>(h->input_semantics[i].is_flat_shaded), i,
+		     static_cast<uint32_t>(h->input_semantics[i].is_linear), i,
+		     static_cast<uint32_t>(h->input_semantics[i].is_custom), i,
+		     static_cast<uint32_t>(h->input_semantics[i].static_vb_index), i,
+		     static_cast<uint32_t>(h->input_semantics[i].static_attribute), i,
+		     static_cast<uint32_t>(h->input_semantics[i].reserved), i,
+		     static_cast<uint32_t>(h->input_semantics[i].default_value), i,
+		     static_cast<uint32_t>(h->input_semantics[i].default_value_hi));
 	}
-	AgcTrace("\t num_output_semantics              = 0x%04" PRIx16 "\n"
-	         "\t output_semantics                  = 0x%016" PRIx64 "\n",
-	         h->num_output_semantics, reinterpret_cast<uint64_t>(h->output_semantics));
+	LOGF("\t num_output_semantics              = 0x%04" PRIx16 "\n"
+	     "\t output_semantics                  = 0x%016" PRIx64 "\n",
+	     h->num_output_semantics, reinterpret_cast<uint64_t>(h->output_semantics));
 	for (int i = 0; i < static_cast<int>(h->num_output_semantics); i++) {
-		AgcTrace("\t\t output_semantics[%d]: semantic         = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: hardware_mapping = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: size_in_elements = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: is_f16           = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: is_flat_shaded   = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: is_linear        = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: is_custom        = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: static_vb_index  = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: static_attribute = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: reserved         = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: default_value    = %08" PRIx32 "\n"
-		         "\t\t output_semantics[%d]: default_value_hi = %08" PRIx32 "\n",
-		         i, static_cast<uint32_t>(h->output_semantics[i].semantic), i,
-		         static_cast<uint32_t>(h->output_semantics[i].hardware_mapping), i,
-		         static_cast<uint32_t>(h->output_semantics[i].size_in_elements), i,
-		         static_cast<uint32_t>(h->output_semantics[i].is_f16), i,
-		         static_cast<uint32_t>(h->output_semantics[i].is_flat_shaded), i,
-		         static_cast<uint32_t>(h->output_semantics[i].is_linear), i,
-		         static_cast<uint32_t>(h->output_semantics[i].is_custom), i,
-		         static_cast<uint32_t>(h->output_semantics[i].static_vb_index), i,
-		         static_cast<uint32_t>(h->output_semantics[i].static_attribute), i,
-		         static_cast<uint32_t>(h->output_semantics[i].reserved), i,
-		         static_cast<uint32_t>(h->output_semantics[i].default_value), i,
-		         static_cast<uint32_t>(h->output_semantics[i].default_value_hi));
+		LOGF("\t\t output_semantics[%d]: semantic         = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: hardware_mapping = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: size_in_elements = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: is_f16           = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: is_flat_shaded   = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: is_linear        = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: is_custom        = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: static_vb_index  = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: static_attribute = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: reserved         = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: default_value    = %08" PRIx32 "\n"
+		     "\t\t output_semantics[%d]: default_value_hi = %08" PRIx32 "\n",
+		     i, static_cast<uint32_t>(h->output_semantics[i].semantic), i,
+		     static_cast<uint32_t>(h->output_semantics[i].hardware_mapping), i,
+		     static_cast<uint32_t>(h->output_semantics[i].size_in_elements), i,
+		     static_cast<uint32_t>(h->output_semantics[i].is_f16), i,
+		     static_cast<uint32_t>(h->output_semantics[i].is_flat_shaded), i,
+		     static_cast<uint32_t>(h->output_semantics[i].is_linear), i,
+		     static_cast<uint32_t>(h->output_semantics[i].is_custom), i,
+		     static_cast<uint32_t>(h->output_semantics[i].static_vb_index), i,
+		     static_cast<uint32_t>(h->output_semantics[i].static_attribute), i,
+		     static_cast<uint32_t>(h->output_semantics[i].reserved), i,
+		     static_cast<uint32_t>(h->output_semantics[i].default_value), i,
+		     static_cast<uint32_t>(h->output_semantics[i].default_value_hi));
 	}
-	AgcTrace("\t header_size                       = 0x%08" PRIx32 "\n"
-	         "\t shader_size                       = 0x%08" PRIx32 "\n"
-	         "\t embedded_constant_buffer_size_dqw = 0x%08" PRIx32 "\n"
-	         "\t target                            = 0x%08" PRIx32 "\n"
-	         "\t scratch_size_dw_per_thread        = 0x%04" PRIx16 "\n"
-	         "\t special_sizes_bytes               = 0x%04" PRIx16 "\n"
-	         "\t type                              = 0x%02" PRIx8 "\n",
-	         h->header_size, h->shader_size, h->embedded_constant_buffer_size_dqw, h->target,
-	         h->scratch_size_dw_per_thread, h->special_sizes_bytes, h->type);
+	LOGF("\t header_size                       = 0x%08" PRIx32 "\n"
+	     "\t shader_size                       = 0x%08" PRIx32 "\n"
+	     "\t embedded_constant_buffer_size_dqw = 0x%08" PRIx32 "\n"
+	     "\t target                            = 0x%08" PRIx32 "\n"
+	     "\t scratch_size_dw_per_thread        = 0x%04" PRIx16 "\n"
+	     "\t special_sizes_bytes               = 0x%04" PRIx16 "\n"
+	     "\t type                              = 0x%02" PRIx8 "\n",
+	     h->header_size, h->shader_size, h->embedded_constant_buffer_size_dqw, h->target,
+	     h->scratch_size_dw_per_thread, h->special_sizes_bytes, h->type);
 }
 
 static constexpr int GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM = static_cast<int>(0x8a6c0005u);
@@ -595,16 +622,16 @@ static void patch_shader_register_address(ShaderRegister* regs, uint32_t num_reg
 	hi->value |= static_cast<uint32_t>((address >> 40u) & 0xffu);
 }
 
-int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile void* code) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile void* code) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(dst == nullptr);
 	EXIT_NOT_IMPLEMENTED(header == nullptr);
 	EXIT_NOT_IMPLEMENTED(code == nullptr);
 
-	AgcTrace("\t header = 0x%016" PRIx64 "\n"
-	         "\t code   = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(header), reinterpret_cast<uint64_t>(code));
+	LOGF("\t header = 0x%016" PRIx64 "\n"
+	     "\t code   = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(header), reinterpret_cast<uint64_t>(code));
 
 	auto* h = static_cast<Shader*>(header);
 
@@ -636,6 +663,8 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 
 	auto base = reinterpret_cast<uint64_t>(code);
 
+	LOGF("\t base   = 0x%016" PRIx64 "\n", base);
+
 	ShaderMappedData map;
 	map.type                = static_cast<Prospero::ShaderBinaryType>(h->type);
 	map.user_data           = h->user_data;
@@ -655,21 +684,36 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	}
 
 	*dst = h;
+	if (Observe::Enabled()) {
+		uint64_t program = 0;
+		uint32_t offset = 0;
+		if (get_shader_program_address_register(h->type, &offset)) {
+			const auto* lo = find_shader_register(h->sh_registers, h->num_sh_registers, offset);
+			const auto* hi = find_shader_register(h->sh_registers, h->num_sh_registers, offset + 1);
+			if (lo != nullptr && hi != nullptr) {
+				program = (static_cast<uint64_t>(lo->value) << 8u) |
+				          ((static_cast<uint64_t>(hi->value) & 0xffu) << 40u);
+			}
+		}
+		Observe::Record(Observe::Event::Shader,
+		                {reinterpret_cast<uint64_t>(h), base, h->type, h->shader_size,
+		                 reinterpret_cast<uint64_t>(h->sh_registers), h->num_sh_registers, program});
+	}
 
 	dbg_dump_shader(h);
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcGetFusedShaderSize(SizeAlign* dst, const Shader* front,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcGetFusedShaderSize(SizeAlign* dst, const Shader* front,
                                                const Shader* back) {
 	PRINT_NAME();
 
-	AgcTrace("\t dst   = 0x%016" PRIx64 "\n"
-	         "\t front = 0x%016" PRIx64 "\n"
-	         "\t back  = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(front),
-	         reinterpret_cast<uint64_t>(back));
+	LOGF("\t dst   = 0x%016" PRIx64 "\n"
+	     "\t front = 0x%016" PRIx64 "\n"
+	     "\t back  = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(dst), reinterpret_cast<uint64_t>(front),
+	     reinterpret_cast<uint64_t>(back));
 
 	EXIT_NOT_IMPLEMENTED(dst == nullptr);
 	EXIT_NOT_IMPLEMENTED(front == nullptr);
@@ -703,12 +747,12 @@ static void merge_shader_register_max_field(ShaderRegister* dst, const ShaderReg
 static int fuse_shader_halves(Shader* fused_result, const Shader* front,
                               const Shader* back, void* scratch_mem,
                               bool recompute_shared_vgprs) {
-	AgcTrace("\t fused_result = 0x%016" PRIx64 "\n"
-	         "\t front        = 0x%016" PRIx64 "\n"
-	         "\t back         = 0x%016" PRIx64 "\n"
-	         "\t scratch_mem  = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(fused_result), reinterpret_cast<uint64_t>(front),
-	         reinterpret_cast<uint64_t>(back), reinterpret_cast<uint64_t>(scratch_mem));
+	LOGF("\t fused_result = 0x%016" PRIx64 "\n"
+	     "\t front        = 0x%016" PRIx64 "\n"
+	     "\t back         = 0x%016" PRIx64 "\n"
+	     "\t scratch_mem  = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(fused_result), reinterpret_cast<uint64_t>(front),
+	     reinterpret_cast<uint64_t>(back), reinterpret_cast<uint64_t>(scratch_mem));
 
 	EXIT_NOT_IMPLEMENTED(fused_result == nullptr);
 	EXIT_NOT_IMPLEMENTED(front == nullptr);
@@ -795,13 +839,13 @@ static int fuse_shader_halves(Shader* fused_result, const Shader* front,
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcFuseShaderHalves_0200(Shader* fused_result, const Shader* front,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcFuseShaderHalves_0200(Shader* fused_result, const Shader* front,
                                            const Shader* back, void* scratch_mem) {
 	PRINT_NAME();
 	return fuse_shader_halves(fused_result, front, back, scratch_mem, true);
 }
 
-int KYTY_SYSV_ABI AgcFuseShaderHalves(Shader* fused_result, const Shader* front,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcFuseShaderHalves(Shader* fused_result, const Shader* front,
                                       const Shader* back, void* scratch_mem) {
 	PRINT_NAME();
 	return fuse_shader_halves(fused_result, front, back, scratch_mem, false);
@@ -884,13 +928,13 @@ static int reg_indirect_patch_add_registers(uint32_t* cmd, uint32_t num_regs,
 	return GRAPHICS5_ERROR_INVALID_PACKET;
 }
 
-int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetAddress(uint32_t*                      cmd,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetAddress(uint32_t*                      cmd,
                                                      const volatile ShaderRegister* regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t cmd  = 0x%016" PRIx64 "\n"
-	         "\t regs = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(regs));
+	     "\t regs = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(regs));
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
@@ -900,13 +944,13 @@ int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetAddress(uint32_t*                  
 	return reg_indirect_patch_set_address(cmd, vaddr, RegIndirectPacket::Cx);
 }
 
-int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetAddress(uint32_t*                      cmd,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetAddress(uint32_t*                      cmd,
                                                      const volatile ShaderRegister* regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t cmd  = 0x%016" PRIx64 "\n"
-	         "\t regs = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(regs));
+	     "\t regs = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(regs));
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
@@ -916,13 +960,13 @@ int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetAddress(uint32_t*                  
 	return reg_indirect_patch_set_address(cmd, vaddr, RegIndirectPacket::Sh);
 }
 
-int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetAddress(uint32_t*                      cmd,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetAddress(uint32_t*                      cmd,
                                                      const volatile ShaderRegister* regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t cmd  = 0x%016" PRIx64 "\n"
-	         "\t regs = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(regs));
+	     "\t regs = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(regs));
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
@@ -932,72 +976,72 @@ int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetAddress(uint32_t*                  
 	return reg_indirect_patch_set_address(cmd, vaddr, RegIndirectPacket::Uc);
 }
 
-int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetCxRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(cmd), num_regs);
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(cmd), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	return reg_indirect_patch_set_num_registers(cmd, num_regs, RegIndirectPacket::Cx);
 }
 
-int KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetShRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(cmd), num_regs);
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(cmd), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	return reg_indirect_patch_set_num_registers(cmd, num_regs, RegIndirectPacket::Sh);
 }
 
-int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetUcRegIndirectPatchSetNumRegisters(uint32_t* cmd, uint32_t num_regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(cmd), num_regs);
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(cmd), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	return reg_indirect_patch_set_num_registers(cmd, num_regs, RegIndirectPacket::Uc);
 }
 
-int KYTY_SYSV_ABI AgcSetCxRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetCxRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(cmd), num_regs);
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(cmd), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	return reg_indirect_patch_add_registers(cmd, num_regs, RegIndirectPacket::Cx);
 }
 
-int KYTY_SYSV_ABI AgcSetShRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetShRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(cmd), num_regs);
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(cmd), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	return reg_indirect_patch_add_registers(cmd, num_regs, RegIndirectPacket::Sh);
 }
 
-int KYTY_SYSV_ABI AgcSetUcRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetUcRegIndirectPatchAddRegisters(uint32_t* cmd, uint32_t num_regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t cmd      = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(cmd), num_regs);
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(cmd), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -1022,17 +1066,17 @@ static uint32_t GraphicsPrimitiveTypeToGsOut(uint32_t prim_type) {
 	}
 }
 
-int KYTY_SYSV_ABI AgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
                                      const Shader* hs, const Shader* gs, uint32_t prim_type) {
 	PRINT_NAME();
 
 	AgcTrace("\t cx_regs   = 0x%016" PRIx64 "\n"
-	         "\t uc_regs   = 0x%016" PRIx64 "\n"
-	         "\t hs        = 0x%016" PRIx64 "\n"
-	         "\t gs        = 0x%016" PRIx64 "\n"
-	         "\t prim_type = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(cx_regs), reinterpret_cast<uint64_t>(uc_regs),
-	         reinterpret_cast<uint64_t>(hs), reinterpret_cast<uint64_t>(gs), prim_type);
+	     "\t uc_regs   = 0x%016" PRIx64 "\n"
+	     "\t hs        = 0x%016" PRIx64 "\n"
+	     "\t gs        = 0x%016" PRIx64 "\n"
+	     "\t prim_type = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(cx_regs), reinterpret_cast<uint64_t>(uc_regs),
+	     reinterpret_cast<uint64_t>(hs), reinterpret_cast<uint64_t>(gs), prim_type);
 
 	if (cx_regs == nullptr && uc_regs == nullptr) {
 		return OK;
@@ -1090,14 +1134,14 @@ int KYTY_SYSV_ABI AgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcUpdatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcUpdatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs,
                                      uint32_t prim_type) {
 	PRINT_NAME();
 
 	AgcTrace("\t cx_regs   = 0x%016" PRIx64 "\n"
-	         "\t uc_regs   = 0x%016" PRIx64 "\n"
-	         "\t prim_type = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(cx_regs), reinterpret_cast<uint64_t>(uc_regs), prim_type);
+	     "\t uc_regs   = 0x%016" PRIx64 "\n"
+	     "\t prim_type = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(cx_regs), reinterpret_cast<uint64_t>(uc_regs), prim_type);
 
 	if (cx_regs != nullptr && (cx_regs[0].value & 0x24u) == 0) {
 		cx_regs[1].value &= ~0x7u;
@@ -1149,7 +1193,7 @@ static GsOccupancyLimits get_gs_occupancy_limits(const Shader* gs, uint32_t vert
 	return {waves * (vertex_limit / output_words), waves * (export_limit / output_words)};
 }
 
-int KYTY_SYSV_ABI AgcGetGsOversubscription(ShaderRegister* regs, const Shader* gs, uint32_t budget,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcGetGsOversubscription(ShaderRegister* regs, const Shader* gs, uint32_t budget,
                                            float factor) {
 	PRINT_NAME();
 
@@ -1295,15 +1339,15 @@ static void set_identity_interpolant_registers(ShaderRegister* regs, uint32_t fi
 	}
 }
 
-int KYTY_SYSV_ABI AgcCreateInterpolantMapping(ShaderRegister* regs, const Shader* gs,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCreateInterpolantMapping(ShaderRegister* regs, const Shader* gs,
                                               const Shader* ps) {
 	PRINT_NAME();
 
 	AgcTrace("\t regs = 0x%016" PRIx64 "\n"
-	         "\t gs   = 0x%016" PRIx64 "\n"
-	         "\t ps   = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(regs), reinterpret_cast<uint64_t>(gs),
-	         reinterpret_cast<uint64_t>(ps));
+	     "\t gs   = 0x%016" PRIx64 "\n"
+	     "\t ps   = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(regs), reinterpret_cast<uint64_t>(gs),
+	     reinterpret_cast<uint64_t>(ps));
 
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
 	EXIT_NOT_IMPLEMENTED(ps != nullptr && ps->num_input_semantics != 0 &&
@@ -1351,15 +1395,15 @@ static uint32_t apply_interpolant_final_mask(uint32_t flags, uint32_t source,
 	return flags;
 }
 
-int KYTY_SYSV_ABI AgcCreateInterpolantMapping2(ShaderRegister* regs, const Shader* gs,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCreateInterpolantMapping2(ShaderRegister* regs, const Shader* gs,
                                                const Shader* ps) {
 	PRINT_NAME();
 
 	AgcTrace("\t regs = 0x%016" PRIx64 "\n"
-	         "\t gs   = 0x%016" PRIx64 "\n"
-	         "\t ps   = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(regs), reinterpret_cast<uint64_t>(gs),
-	         reinterpret_cast<uint64_t>(ps));
+	     "\t gs   = 0x%016" PRIx64 "\n"
+	     "\t ps   = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(regs), reinterpret_cast<uint64_t>(gs),
+	     reinterpret_cast<uint64_t>(ps));
 
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
 	EXIT_NOT_IMPLEMENTED(ps != nullptr && ps->num_input_semantics != 0 &&
@@ -1427,7 +1471,7 @@ int KYTY_SYSV_ABI AgcCreateInterpolantMapping2(ShaderRegister* regs, const Shade
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd, int type) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd, int type) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(addr == nullptr);
@@ -1443,7 +1487,7 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadAddress(uint32_t** addr, uint32_t* cmd,
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd, int type) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd, int type) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(range == nullptr);
@@ -1467,7 +1511,7 @@ int KYTY_SYSV_ABI AgcGetDataPacketPayloadRange(MemoryRange* range, uint32_t* cmd
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcWriteDataPatchSetAddressOrOffset(uint32_t* cmd, uint64_t address_or_offset) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcWriteDataPatchSetAddressOrOffset(uint32_t* cmd, uint64_t address_or_offset) {
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	auto op = (cmd[0] >> 8u) & 0xffu;
@@ -1480,22 +1524,22 @@ int KYTY_SYSV_ABI AgcWriteDataPatchSetAddressOrOffset(uint32_t* cmd, uint64_t ad
 	return GRAPHICS5_ERROR_INVALID_PACKET;
 }
 
-int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* target,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* target,
                                         uint32_t size_in_dwords) {
 	PRINT_NAME();
 
-	AgcTrace("\t cmd            = 0x%016" PRIx64 "\n"
-	         "\t target         = 0x%016" PRIx64 "\n"
-	         "\t size_in_dwords = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(target), size_in_dwords);
+	LOGF("\t cmd            = 0x%016" PRIx64 "\n"
+	     "\t target         = 0x%016" PRIx64 "\n"
+	     "\t size_in_dwords = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(target), size_in_dwords);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
 	auto cmd_id = cmd[0];
 	auto op     = (cmd_id >> 8u) & 0xffu;
 
-	AgcTrace("\t cmd_id         = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", len = %" PRIu32 "\n",
-	         cmd_id, op, KYTY_PM4_LEN(cmd_id));
+	LOGF("\t cmd_id         = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", len = %" PRIu32 "\n", cmd_id,
+	     op, KYTY_PM4_LEN(cmd_id));
 
 	if (op != Pm4::IT_INDIRECT_BUFFER) {
 		return GRAPHICS5_ERROR_INVALID_PACKET;
@@ -1510,9 +1554,10 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcSuspendPoint() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSuspendPoint() {
 	PRINT_NAME();
 
+	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().SuspendPoint();
 
 	return OK;
@@ -1528,9 +1573,9 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 	}
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operation) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operation) {
 	PRINT_NAME();
-	AgcTrace("\t operation = 0x%08" PRIx32 "\n", operation);
+	LOGF("\t operation = 0x%08" PRIx32 "\n", operation);
 
 	const auto size_dw = context_state_op_size_dw(operation);
 	if (buf == nullptr || size_dw == 0) {
@@ -1579,12 +1624,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbContextStateOp(CommandBuffer* buf, uint32_t operat
 	return complete ? first : nullptr;
 }
 
-uint64_t KYTY_SYSV_ABI AgcDcbContextStateOpGetSize(uint32_t operation) {
+uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbContextStateOpGetSize(uint32_t operation) {
 	PRINT_NAME();
 	return static_cast<uint64_t>(context_state_op_size_dw(operation)) * sizeof(uint32_t);
 }
 
-void KYTY_SYSV_ABI AgcGetIsTrinityMode(uint8_t* result) {
+void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcGetIsTrinityMode(uint8_t* result) {
 	*result = is_trinity_mode();
 }
 
@@ -1602,19 +1647,19 @@ static std::mutex g_workload_stream_mutex;
 static uint32_t   g_workload_stream_mask = 0;
 static uint8_t    g_workload_streams[WORKLOAD_STREAM_MAX_ID + 1][WORKLOAD_STREAM_RECORD_SIZE] {};
 
-uint32_t KYTY_SYSV_ABI AgcDriverGetDefaultOwner() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverGetDefaultOwner() {
 	PRINT_NAME();
 
 	return 0x8a6c9018u;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDriverGetResourceRegistrationMaxNameLength() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverGetResourceRegistrationMaxNameLength() {
 	PRINT_NAME();
 
 	return 0x8a6c9018u;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDriverInitResourceRegistration() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverInitResourceRegistration() {
 	PRINT_NAME();
 
 	return 0x8a6c9018u;
@@ -1631,19 +1676,19 @@ AgcDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes
 	return 0x8a6c9018u;
 }
 
-int KYTY_SYSV_ABI AgcDriverRegisterOwner() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverRegisterOwner() {
 	PRINT_NAME();
 
 	return static_cast<int>(0x8a6c9018u);
 }
 
-int KYTY_SYSV_ABI AgcDriverRegisterResource() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverRegisterResource() {
 	PRINT_NAME();
 
 	return static_cast<int>(0x8a6c9018u);
 }
 
-int KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle) {
 	PRINT_NAME();
 
 	(void)owner_handle;
@@ -1651,18 +1696,18 @@ int KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle) {
 	return static_cast<int>(0x8a6c9018u);
 }
 
-int KYTY_SYSV_ABI AgcDriverUnregisterResource() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverUnregisterResource() {
 	PRINT_NAME();
 
 	return static_cast<int>(0x8a6c9018u);
 }
 
-int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream) {
 	PRINT_NAME();
 
-	AgcTrace("\t stream_id = %" PRIu32 "\n"
-	         "\t stream    = 0x%016" PRIx64 "\n",
-	         stream_id, reinterpret_cast<uint64_t>(stream));
+	LOGF("\t stream_id = %" PRIu32 "\n"
+	     "\t stream    = 0x%016" PRIx64 "\n",
+	     stream_id, reinterpret_cast<uint64_t>(stream));
 
 	if (stream_id < WORKLOAD_STREAM_MIN_ID || stream_id > WORKLOAD_STREAM_MAX_ID) {
 		return GRAPHICS5_DRIVER_ERROR_INVALID_VALUE;
@@ -1686,7 +1731,7 @@ int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void
 	return OK;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcCbNop(CommandBuffer* buf, uint32_t size_in_dwords) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbNop(CommandBuffer* buf, uint32_t size_in_dwords) {
 	if (buf == nullptr || size_in_dwords == 0) {
 		return nullptr;
 	}
@@ -1702,11 +1747,11 @@ uint32_t* KYTY_SYSV_ABI AgcCbNop(CommandBuffer* buf, uint32_t size_in_dwords) {
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcCbNopGetSize(uint32_t size_in_dwords) {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbNopGetSize(uint32_t size_in_dwords) {
 	return 4u * size_in_dwords;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_x,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_x,
                                       uint32_t thread_group_y, uint32_t thread_group_z,
                                       uint32_t modifier) {
 	PRINT_NAME();
@@ -1730,7 +1775,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcCbDispatchGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbDispatchGetSize() {
 	PRINT_NAME();
 
 	return 20;
@@ -1746,12 +1791,12 @@ static void write_branch_target(uint32_t* words, uint64_t address, uint8_t cache
 	           ((static_cast<uint32_t>(cache_policy) & 0x3u) << 28u);
 }
 
-uint64_t KYTY_SYSV_ABI AgcCbBranchGetSize() {
+uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbBranchGetSize() {
 	PRINT_NAME();
 	return BranchPacketSizeDw * sizeof(uint32_t);
 }
 
-int KYTY_SYSV_ABI AgcBranchPatchSetThenTarget(uint32_t* cmd, uint8_t cache_policy,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcBranchPatchSetThenTarget(uint32_t* cmd, uint8_t cache_policy,
                                                const volatile uint32_t* target,
                                                uint32_t size_in_dwords) {
 	PRINT_NAME();
@@ -1763,7 +1808,7 @@ int KYTY_SYSV_ABI AgcBranchPatchSetThenTarget(uint32_t* cmd, uint8_t cache_polic
 	return OK;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t compare_function,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t compare_function,
                                     const volatile uint64_t* compare_addr, uint64_t mask,
                                     uint64_t reference, uint8_t cache_policy1,
                                     const volatile uint32_t* buffer1, uint32_t size_in_dwords1,
@@ -1771,20 +1816,20 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
                                     uint32_t size_in_dwords2) {
 	PRINT_NAME();
 
-	AgcTrace("\t mode             = 0x%02" PRIx8 "\n"
-	         "\t compare_function = 0x%02" PRIx8 "\n"
-	         "\t compare_addr     = 0x%016" PRIx64 "\n"
-	         "\t mask             = 0x%016" PRIx64 "\n"
-	         "\t reference        = 0x%016" PRIx64 "\n"
-	         "\t cache_policy1    = 0x%02" PRIx8 "\n"
-	         "\t buffer1          = 0x%016" PRIx64 "\n"
-	         "\t size_in_dwords1  = %" PRIu32 "\n"
-	         "\t cache_policy2    = 0x%02" PRIx8 "\n"
-	         "\t buffer2          = 0x%016" PRIx64 "\n"
-	         "\t size_in_dwords2  = %" PRIu32 "\n",
-	         mode, compare_function, reinterpret_cast<uint64_t>(compare_addr), mask, reference,
-	         cache_policy1, reinterpret_cast<uint64_t>(buffer1), size_in_dwords1, cache_policy2,
-	         reinterpret_cast<uint64_t>(buffer2), size_in_dwords2);
+	LOGF("\t mode             = 0x%02" PRIx8 "\n"
+	     "\t compare_function = 0x%02" PRIx8 "\n"
+	     "\t compare_addr     = 0x%016" PRIx64 "\n"
+	     "\t mask             = 0x%016" PRIx64 "\n"
+	     "\t reference        = 0x%016" PRIx64 "\n"
+	     "\t cache_policy1    = 0x%02" PRIx8 "\n"
+	     "\t buffer1          = 0x%016" PRIx64 "\n"
+	     "\t size_in_dwords1  = %" PRIu32 "\n"
+	     "\t cache_policy2    = 0x%02" PRIx8 "\n"
+	     "\t buffer2          = 0x%016" PRIx64 "\n"
+	     "\t size_in_dwords2  = %" PRIu32 "\n",
+	     mode, compare_function, reinterpret_cast<uint64_t>(compare_addr), mask, reference,
+	     cache_policy1, reinterpret_cast<uint64_t>(buffer1), size_in_dwords1, cache_policy2,
+	     reinterpret_cast<uint64_t>(buffer2), size_in_dwords2);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -1814,7 +1859,7 @@ uint32_t* KYTY_SYSV_ABI AgcCbBranch(CommandBuffer* buf, uint8_t mode, uint8_t co
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32_t offset,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32_t offset,
                                                       const uint32_t* values, uint32_t num_values) {
 	PRINT_NAME();
 
@@ -1837,18 +1882,17 @@ uint32_t* KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirect(CommandBuffer* buf, uint32
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values) {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbSetShRegisterRangeDirectGetSize(uint32_t num_values) {
 	PRINT_NAME();
 
-	AgcTrace("\t num_values = %" PRIu32 "\n", num_values);
+	LOGF("\t num_values = %" PRIu32 "\n", num_values);
 
 	return 4u * num_values + 8u;
 }
 
-// Emits one packet per run of consecutive offsets. A run's values are read after the previous
-// run is allocated; a run that cannot be allocated is skipped.
-static uint32_t* set_registers_direct(CommandBuffer* buf, const volatile ShaderRegister* regs,
-                                      uint32_t num_regs, uint32_t op) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                 buf,
+                                                  const volatile ShaderRegister* regs,
+                                                  uint32_t                       num_regs) {
 	if (num_regs == 0) {
 		return nullptr;
 	}
@@ -1856,8 +1900,75 @@ static uint32_t* set_registers_direct(CommandBuffer* buf, const volatile ShaderR
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(regs == nullptr);
 
-	auto* values = static_cast<uint32_t*>(__builtin_alloca(num_regs * sizeof(uint32_t)));
-	values[0]    = regs[0].value;
+	std::vector<ShaderRegister> local_regs(num_regs);
+	for (uint32_t i = 0; i < num_regs; i++) {
+		local_regs[i].offset = regs[i].offset;
+		local_regs[i].value  = regs[i].value;
+	}
+
+	uint32_t* first_cmd        = nullptr;
+	uint32_t  run_start_index  = 0;
+	uint32_t  run_start_offset = local_regs[0].offset;
+	uint32_t  prev_offset      = run_start_offset;
+
+	for (uint32_t i = 1; i <= num_regs; i++) {
+		const bool flush = (i == num_regs || local_regs[i].offset != prev_offset + 1u);
+
+		if (flush) {
+			const auto run_count = i - run_start_index;
+			auto*      cmd       = buf->AllocateDW(run_count + 2u);
+
+			if (cmd == nullptr) {
+				LOGF_COLOR(Log::Color::Red,
+				           "\t failed to allocate set-sh-registers-direct command\n");
+				return first_cmd;
+			}
+
+			if (first_cmd == nullptr) {
+				first_cmd = cmd;
+			}
+
+			cmd[0] = KYTY_PM4(run_count + 2u, Pm4::IT_SET_SH_REG, 0u);
+			cmd[1] = run_start_offset & 0xffffu;
+
+			for (uint32_t j = 0; j < run_count; j++) {
+				cmd[j + 2u] = local_regs[run_start_index + j].value;
+			}
+
+			if (i < num_regs) {
+				run_start_index  = i;
+				run_start_offset = local_regs[i].offset;
+			}
+		}
+
+		if (i < num_regs) {
+			prev_offset = local_regs[i].offset;
+		}
+	}
+
+	return first_cmd;
+}
+
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                 buf,
+                                                  const volatile ShaderRegister* regs,
+                                                  uint32_t                       num_regs) {
+	PRINT_NAME();
+
+	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(regs), num_regs);
+
+	if (num_regs == 0) {
+		return nullptr;
+	}
+
+	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+	EXIT_NOT_IMPLEMENTED(regs == nullptr);
+
+	// Original implementation stages register values in a temporary DWORD array. It reads each new run only
+	// after the preceding run has been allocated, so preserve that ordering around grow callbacks.
+	std::vector<uint32_t> values(num_regs);
+	values[0] = regs[0].value;
 
 	uint32_t* first_cmd        = nullptr;
 	uint32_t  run_start_index  = 0;
@@ -1884,16 +1995,20 @@ static uint32_t* set_registers_direct(CommandBuffer* buf, const volatile ShaderR
 				first_cmd = cmd;
 			}
 
-			cmd[0] = KYTY_PM4(run_count + 2u, op, 0u);
+			cmd[0] = KYTY_PM4(run_count + 2u, Pm4::IT_SET_UCONFIG_REG, 0u);
 			cmd[1] = run_start_offset & 0xffffu;
-			memcpy(cmd + 2, values + run_start_index,
+			memcpy(cmd + 2, values.data() + run_start_index,
 			       static_cast<size_t>(run_count) * sizeof(uint32_t));
+		} else {
+			LOGF_COLOR(Log::Color::Red,
+			           "\t failed to allocate set-uc-registers-direct command\n");
 		}
 
 		if (i == num_regs) {
 			return first_cmd;
 		}
 
+		// Original implementation skips an intermediate run whose grow callback fails, then keeps scanning.
 		run_start_index  = i;
 		run_start_offset = regs[i].offset;
 		prev_offset      = run_start_offset;
@@ -1902,33 +2017,15 @@ static uint32_t* set_registers_direct(CommandBuffer* buf, const volatile ShaderR
 	}
 }
 
-uint32_t* KYTY_SYSV_ABI AgcCbSetShRegistersDirect(CommandBuffer*                 buf,
-                                                  const volatile ShaderRegister* regs,
-                                                  uint32_t                       num_regs) {
-	return set_registers_direct(buf, regs, num_regs, Pm4::IT_SET_SH_REG);
-}
-
-uint32_t* KYTY_SYSV_ABI AgcCbSetUcRegistersDirect(CommandBuffer*                 buf,
-                                                  const volatile ShaderRegister* regs,
-                                                  uint32_t                       num_regs) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDebugRaiseException(uint32_t exception_id) {
 	PRINT_NAME();
 
-	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(regs), num_regs);
-
-	return set_registers_direct(buf, regs, num_regs, Pm4::IT_SET_UCONFIG_REG);
-}
-
-int KYTY_SYSV_ABI AgcDebugRaiseException(uint32_t exception_id) {
-	PRINT_NAME();
-
-	AgcTrace("\t exception_id = 0x%08" PRIx32 "\n", exception_id);
+	LOGF("\t exception_id = 0x%08" PRIx32 "\n", exception_id);
 
 	return OK;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint16_t gcr_cntl,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint16_t gcr_cntl,
                                         uint8_t dst, uint8_t cache_policy,
                                         const volatile Label* address, uint8_t data_sel,
                                         uint64_t data, uint16_t gds_offset, uint16_t gds_size,
@@ -1979,13 +2076,13 @@ uint32_t* KYTY_SYSV_ABI AgcCbReleaseMem(CommandBuffer* buf, uint8_t action, uint
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcCbQueueEndOfPipeActionGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCbQueueEndOfPipeActionGetSize() {
 	PRINT_NAME();
 
 	return 32;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
 	PRINT_NAME();
 
 	AgcTrace("\t op    = 0x%08" PRIx32 "\n", op);
@@ -2003,10 +2100,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op) {
 	return cmd;
 }
 
-// The marker carries the operations: the CP pops a pushed context and resets the register state.
-// Drains only order GPU work, and the occlusion-query stop and memory mapping masks are not
-// modelled, so they emit nothing.
-uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t state) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t state) {
 	PRINT_NAME();
 
 	AgcTrace("\t op    = 0x%08" PRIx32 "\n"
@@ -2016,45 +2110,51 @@ uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((op & ~0xfffu) != 0);
 
-	std::array<uint32_t, 29> packets {KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG, 1u),
-	                                  Pm4::SQ_THREAD_TRACE_USERDATA_2,
-	                                  Pm4::USERDATA_TAG_RESET_QUEUE | op};
-
-	auto*      end  = packets.data() + 3;
-	const auto emit = [&](uint32_t bit, std::initializer_list<uint32_t> dwords) {
-		if ((op & bit) != 0) {
-			end = std::copy(dwords.begin(), dwords.end(), end);
-		}
-	};
-	emit(Pm4::ResetQueueOp::InstanceCount, {KYTY_PM4(2, Pm4::IT_NUM_INSTANCES, 0u), 1});
-	emit(Pm4::ResetQueueOp::IndexAttributes,
-	     {KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG_INDEX, 0u), 0x20000000u | Pm4::VGT_INDEX_TYPE, 0x480,
-	      KYTY_PM4(3, Pm4::IT_INDEX_BASE, 0u), 0, 0, KYTY_PM4(2, Pm4::IT_INDEX_BUFFER_SIZE, 0u),
-	      0xffffffffu});
-	emit(Pm4::ResetQueueOp::BaseIndirectPointers, {KYTY_PM4(4, Pm4::IT_SET_BASE, 0u) | 2u, 1, 0, 0,
-	                                               KYTY_PM4(4, Pm4::IT_SET_BASE, 0u), 1, 0, 0});
-	// GL2 writeback and invalidation of every cache over the whole address space.
-	emit(Pm4::ResetQueueOp::FlushCaches, {KYTY_PM4(8, Pm4::IT_ACQUIRE_MEM, 0u), 0x86007fc0u,
-	                                      0xfffffffeu, 0xff, 1, 0, 0x19, 0xc3e1});
-
-	auto* cmd = buf->AllocateDW(end - packets.data());
+	auto* cmd = buf->AllocateDW(2);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	std::copy(packets.data(), end, cmd);
+	cmd[0] = KYTY_PM4(2, Pm4::IT_CLEAR_STATE, 0u);
+	cmd[1] = state & 0xfu;
 
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
+                                                        uint32_t       video_out_handle,
+                                                        uint32_t       display_buffer_index) {
+	PRINT_NAME();
+
+	LOGF("\t video_out_handle     = %" PRIu32 "\n"
+	     "\t display_buffer_index = %" PRIu32 "\n",
+	     video_out_handle, display_buffer_index);
+
+	EXIT_NOT_IMPLEMENTED(buf == nullptr);
+
+	auto* cmd = buf->AllocateDW(7);
+
+	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
+
+	cmd[0] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_FLIP_DONE);
+	cmd[1] = video_out_handle;
+	cmd[2] = display_buffer_index;
+	cmd[3] = 0;
+	cmd[4] = 0;
+	cmd[5] = 0;
+	cmd[6] = 0;
+
+	return cmd;
+}
+
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
                                                  const uint32_t* workload_ids,
                                                  uint32_t        workload_count) {
 	PRINT_NAME();
 
-	AgcTrace("\t stream_id      = %" PRIu32 "\n"
-	         "\t workload_ids   = 0x%016" PRIx64 "\n"
-	         "\t workload_count = %" PRIu32 "\n",
-	         stream_id, reinterpret_cast<uint64_t>(workload_ids), workload_count);
+	LOGF("\t stream_id      = %" PRIu32 "\n"
+	     "\t workload_ids   = 0x%016" PRIx64 "\n"
+	     "\t workload_count = %" PRIu32 "\n",
+	     stream_id, reinterpret_cast<uint64_t>(workload_ids), workload_count);
 
 	if (buf == nullptr || workload_ids == nullptr || workload_count == 0 ||
 	    workload_count > WORKLOAD_ACTIVE_COUNT_MAX || stream_id < WORKLOAD_STREAM_MIN_ID ||
@@ -2098,13 +2198,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t st
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t stream_id,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t stream_id,
                                                   uint32_t workload_id) {
 	PRINT_NAME();
 
-	AgcTrace("\t stream_id   = %" PRIu32 "\n"
-	         "\t workload_id = %" PRIu32 "\n",
-	         stream_id, workload_id);
+	LOGF("\t stream_id   = %" PRIu32 "\n"
+	     "\t workload_id = %" PRIu32 "\n",
+	     stream_id, workload_id);
 
 	if (buf == nullptr || stream_id < WORKLOAD_STREAM_MIN_ID ||
 	    stream_id > WORKLOAD_STREAM_MAX_ID || workload_id > WORKLOAD_ID_MAX) {
@@ -2136,7 +2236,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadComplete(CommandBuffer* buf, uint32_t s
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetShRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
@@ -2155,7 +2255,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegisterDirect(CommandBuffer* buf, ShaderRegi
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetCxRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
@@ -2174,13 +2274,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegisterDirect(CommandBuffer* buf, ShaderRegi
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbSetCxRegisterDirectGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetCxRegisterDirectGetSize() {
 	PRINT_NAME();
 
 	return 12;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetUcRegisterDirect(CommandBuffer* buf, ShaderRegister reg) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
@@ -2199,14 +2299,14 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegisterDirect(CommandBuffer* buf, ShaderRegi
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirect(CommandBuffer*                 buf,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirect(CommandBuffer*                 buf,
                                                      const volatile ShaderRegister* regs,
                                                      uint32_t                       num_regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(regs), num_regs);
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(regs), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -2221,19 +2321,19 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirect(CommandBuffer*             
 	return cmd;
 }
 
-uint64_t KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirectGetSize() {
+uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetCxRegistersIndirectGetSize() {
 	PRINT_NAME();
 	return RegIndirectPacketSizeDw * sizeof(uint32_t);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*                 buf,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*                 buf,
                                                      const volatile ShaderRegister* regs,
                                                      uint32_t                       num_regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(regs), num_regs);
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(regs), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -2248,20 +2348,20 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetShRegistersIndirect(CommandBuffer*             
 	return cmd;
 }
 
-uint64_t KYTY_SYSV_ABI AgcDcbSetShRegistersIndirectGetSize() {
+uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetShRegistersIndirectGetSize() {
 	PRINT_NAME();
 
 	return RegIndirectPacketSizeDw * sizeof(uint32_t);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*                 buf,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*                 buf,
                                                      const volatile ShaderRegister* regs,
                                                      uint32_t                       num_regs) {
 	PRINT_NAME();
 
 	AgcTrace("\t regs     = 0x%016" PRIx64 "\n"
-	         "\t num_regs = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(regs), num_regs);
+	     "\t num_regs = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(regs), num_regs);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -2276,13 +2376,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetUcRegistersIndirect(CommandBuffer*             
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize(CommandBuffer* buf, uint8_t index_size,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetIndexSize(CommandBuffer* buf, uint8_t index_size,
                                            uint8_t cache_policy) {
 	PRINT_NAME();
 
 	AgcTrace("\t index_size   = 0x%" PRIx8 "\n"
-	         "\t cache_policy = 0x%" PRIx8 "\n",
-	         index_size, cache_policy);
+	     "\t cache_policy = 0x%" PRIx8 "\n",
+	     index_size, cache_policy);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	auto* cmd = buf->AllocateDW(3);
@@ -2296,7 +2396,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize(CommandBuffer* buf, uint8_t index_siz
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexBuffer(CommandBuffer* buf, uint64_t index_addr) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetIndexBuffer(CommandBuffer* buf, uint64_t index_addr) {
 	PRINT_NAME();
 
 	AgcTrace("\t index_addr = 0x%016" PRIx64 "\n", index_addr);
@@ -2315,7 +2415,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexBuffer(CommandBuffer* buf, uint64_t index_
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexCount(CommandBuffer* buf, uint32_t index_count) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetIndexCount(CommandBuffer* buf, uint32_t index_count) {
 	PRINT_NAME();
 
 	AgcTrace("\t index_count = 0x%" PRIx32 "\n", index_count);
@@ -2332,7 +2432,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexCount(CommandBuffer* buf, uint32_t index_c
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetNumInstances(CommandBuffer* buf, uint32_t num_instances) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetNumInstances(CommandBuffer* buf, uint32_t num_instances) {
 	PRINT_NAME();
 
 	AgcTrace("\t num_instances = 0x%" PRIx32 "\n", num_instances);
@@ -2353,7 +2453,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetNumInstances(CommandBuffer* buf, uint32_t num_i
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbSetNumInstancesGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetNumInstancesGetSize() {
 	PRINT_NAME();
 
 	return 8;
@@ -2409,6 +2509,7 @@ static uint32_t decode_draw_index_initiator(uint64_t modifier) {
 	return (static_cast<uint32_t>(modifier) >> 3u) & 0x20u;
 }
 
+static constexpr uint32_t AGC_INTERNAL_DATA_REGISTER            = 0x342u;
 static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG     = 0xc6000008u;
 static constexpr uint32_t AGC_DRAW_INDIRECT_MULTI_END_TAG       = 0xc6000000u;
 static constexpr uint32_t AGC_WAIT_USER_DATA_BEGIN_32_TAG       = 0xc8010000u;
@@ -2422,18 +2523,18 @@ static constexpr uint32_t AGC_INTERNAL_DATA_PACKET_SIZE_DW      = 3u;
 
 static void write_agc_internal_data_packet(uint32_t* cmd, uint32_t tag) {
 	cmd[0] = KYTY_PM4(AGC_INTERNAL_DATA_PACKET_SIZE_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
-	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
+	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
 	cmd[2] = tag;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count,
                                         const volatile void* index_addr, uint64_t modifier) {
 	PRINT_NAME();
 
 	AgcTrace("\t index_count = 0x%" PRIx32 "\n"
-	         "\t index_addr  = 0x%016" PRIx64 "\n"
-	         "\t modifier    = 0x%016" PRIx64 "\n",
-	         index_count, reinterpret_cast<uint64_t>(index_addr), modifier);
+	     "\t index_addr  = 0x%016" PRIx64 "\n"
+	     "\t modifier    = 0x%016" PRIx64 "\n",
+	     index_count, reinterpret_cast<uint64_t>(index_addr), modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(index_addr == nullptr);
@@ -2455,25 +2556,25 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndexGetSize() {
 	PRINT_NAME();
 
 	return 6u * 4u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t instance_count,
-                                                      const volatile void* object_ids,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t index_count,
                                                       const volatile void* index_addr,
-                                                      uint32_t index_count, uint64_t modifier) {
+                                                      const volatile void* object_ids,
+                                                      uint32_t instance_count, uint64_t modifier) {
 	PRINT_NAME();
 
-	AgcTrace("\t instance_count = 0x%" PRIx32 "\n"
-	         "\t object_ids     = 0x%016" PRIx64 "\n"
-	         "\t index_addr     = 0x%016" PRIx64 "\n"
-	         "\t index_count    = 0x%" PRIx32 "\n"
-	         "\t modifier       = 0x%016" PRIx64 "\n",
-	         instance_count, reinterpret_cast<uint64_t>(object_ids),
-	         reinterpret_cast<uint64_t>(index_addr), index_count, modifier);
+	AgcTrace("\t index_count    = 0x%" PRIx32 "\n"
+	     "\t index_addr     = 0x%016" PRIx64 "\n"
+	     "\t instance_count = 0x%" PRIx32 "\n"
+	     "\t object_ids     = 0x%016" PRIx64 "\n"
+	     "\t modifier       = 0x%016" PRIx64 "\n",
+	     index_count, reinterpret_cast<uint64_t>(index_addr), instance_count,
+	     reinterpret_cast<uint64_t>(object_ids), modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED(index_addr == nullptr);
@@ -2484,41 +2585,41 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	auto object_vaddr = reinterpret_cast<uint64_t>(object_ids);
 	auto index_vaddr  = reinterpret_cast<uint64_t>(index_addr);
+	auto object_vaddr = reinterpret_cast<uint64_t>(object_ids);
 
-	cmd[0] = KYTY_PM4(9, Pm4::IT_DRAW_INDEX_MULTI_INST, 0u);
-	cmd[1] = instance_count;
-	cmd[2] = static_cast<uint32_t>(object_vaddr & 0xffffffffu);
-	cmd[3] = static_cast<uint32_t>((object_vaddr >> 32u) & 0xffffffffu);
-	cmd[4] = (index_count == 0 ? 1u : index_count);
-	cmd[5] = static_cast<uint32_t>(index_vaddr & 0xffffffffu);
-	cmd[6] = static_cast<uint32_t>((index_vaddr >> 32u) & 0xffffffffu);
-	cmd[7] = index_count;
+	cmd[0] = KYTY_PM4(9, Pm4::IT_DISPATCH_DRAW_PREAMBLE, 0u);
+	cmd[1] = index_count;
+	cmd[2] = static_cast<uint32_t>(index_vaddr & 0xffffffffu);
+	cmd[3] = static_cast<uint32_t>((index_vaddr >> 32u) & 0xffffffffu);
+	cmd[4] = (instance_count == 0 ? 1u : instance_count);
+	cmd[5] = static_cast<uint32_t>(object_vaddr & 0xffffffffu);
+	cmd[6] = static_cast<uint32_t>((object_vaddr >> 32u) & 0xffffffffu);
+	cmd[7] = instance_count;
 	cmd[8] = decode_draw_index_initiator(modifier) | 0x80u;
 
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstancedGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstancedGetSize() {
 	PRINT_NAME();
 
 	return 9u * 4u;
 }
 
-int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
                                        const volatile uint32_t* target, uint32_t size_in_dwords,
                                        uint64_t arg4, uint64_t arg5) {
 	PRINT_NAME();
 
-	AgcTrace("\t cmd            = 0x%016" PRIx64 "\n"
-	         "\t arg1           = 0x%016" PRIx64 "\n"
-	         "\t target         = 0x%016" PRIx64 "\n"
-	         "\t size_in_dwords = %" PRIu32 "\n"
-	         "\t arg4           = 0x%016" PRIx64 "\n"
-	         "\t arg5           = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(cmd), arg1, reinterpret_cast<uint64_t>(target),
-	         size_in_dwords, arg4, arg5);
+	LOGF("\t cmd            = 0x%016" PRIx64 "\n"
+	     "\t arg1           = 0x%016" PRIx64 "\n"
+	     "\t target         = 0x%016" PRIx64 "\n"
+	     "\t size_in_dwords = %" PRIu32 "\n"
+	     "\t arg4           = 0x%016" PRIx64 "\n"
+	     "\t arg5           = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), arg1, reinterpret_cast<uint64_t>(target), size_in_dwords,
+	     arg4, arg5);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -2537,13 +2638,13 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
 	return OK;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_count,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_count,
                                             uint64_t modifier) {
 	PRINT_NAME();
 
 	AgcTrace("\t index_count = 0x%" PRIx32 "\n"
-	         "\t modifier    = 0x%016" PRIx64 "\n",
-	         index_count, modifier);
+	     "\t modifier    = 0x%016" PRIx64 "\n",
+	     index_count, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -2554,24 +2655,30 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexAuto(CommandBuffer* buf, uint32_t index_c
 	cmd[0] = KYTY_PM4(3, Pm4::IT_DRAW_INDEX_AUTO, 0u);
 	cmd[1] = index_count;
 	cmd[2] = decode_draw_index_initiator(modifier) | 0x2u;
+	if (Observe::Enabled()) {
+		Observe::Record(Observe::Event::Emit,
+		                {reinterpret_cast<uint64_t>(buf), reinterpret_cast<uint64_t>(cmd),
+		                 index_count, modifier, reinterpret_cast<uint64_t>(buf->cursor_up),
+		                 reinterpret_cast<uint64_t>(buf->bottom), cmd[0], cmd[1], cmd[2]});
+	}
 
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexAutoGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndexAutoGetSize() {
 	PRINT_NAME();
 
 	return 3u * 4u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index_offset,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index_offset,
                                               uint32_t index_count, uint64_t modifier) {
 	PRINT_NAME();
 
 	AgcTrace("\t index_offset = 0x%" PRIx32 "\n"
-	         "\t index_count  = 0x%" PRIx32 "\n"
-	         "\t modifier     = 0x%016" PRIx64 "\n",
-	         index_offset, index_count, modifier);
+	     "\t index_count  = 0x%" PRIx32 "\n"
+	     "\t modifier     = 0x%016" PRIx64 "\n",
+	     index_offset, index_count, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -2588,13 +2695,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexOffset(CommandBuffer* buf, uint32_t index
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbDrawIndexOffsetGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndexOffsetGetSize() {
 	PRINT_NAME();
 
 	return 5u * 4u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t shader_type,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t shader_type,
                                                   const volatile void* indirect_base_addr) {
 	PRINT_NAME();
 
@@ -2618,13 +2725,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetBaseIndirectArgs(CommandBuffer* buf, uint32_t s
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                                 uint64_t modifier) {
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
-	         "\t modifier    = 0x%016" PRIx64 "\n",
-	         data_offset_in_bytes, modifier);
+	     "\t modifier    = 0x%016" PRIx64 "\n",
+	     data_offset_in_bytes, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -2645,13 +2752,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirect(CommandBuffer* buf, uint32_t dat
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                            uint64_t modifier) {
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset = 0x%" PRIx32 "\n"
-	         "\t modifier    = 0x%016" PRIx64 "\n",
-	         data_offset_in_bytes, modifier);
+	     "\t modifier    = 0x%016" PRIx64 "\n",
+	     data_offset_in_bytes, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
@@ -2670,7 +2777,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirect(CommandBuffer* buf, uint32_t data_off
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
                                                 uint32_t             data_offset_in_bytes,
                                                 uint32_t             count_indirect,
                                                 uint32_t             max_count_or_count,
@@ -2679,13 +2786,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset        = 0x%" PRIx32 "\n"
-	         "\t count_indirect     = 0x%" PRIx32 "\n"
-	         "\t max_count_or_count = 0x%" PRIx32 "\n"
-	         "\t count_addr         = 0x%016" PRIx64 "\n"
-	         "\t stride_in_bytes    = 0x%" PRIx32 "\n"
-	         "\t modifier           = 0x%016" PRIx64 "\n",
-	         data_offset_in_bytes, count_indirect, max_count_or_count,
-	         reinterpret_cast<uint64_t>(count_addr), stride_in_bytes, modifier);
+	     "\t count_indirect     = 0x%" PRIx32 "\n"
+	     "\t max_count_or_count = 0x%" PRIx32 "\n"
+	     "\t count_addr         = 0x%016" PRIx64 "\n"
+	     "\t stride_in_bytes    = 0x%" PRIx32 "\n"
+	     "\t modifier           = 0x%016" PRIx64 "\n",
+	     data_offset_in_bytes, count_indirect, max_count_or_count,
+	     reinterpret_cast<uint64_t>(count_addr), stride_in_bytes, modifier);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -2731,7 +2838,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndirectMulti(CommandBuffer*       buf,
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
                                                      uint32_t             data_offset_in_bytes,
                                                      uint32_t             count_indirect,
                                                      uint32_t             max_count_or_count,
@@ -2740,13 +2847,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 	PRINT_NAME();
 
 	AgcTrace("\t data_offset        = 0x%" PRIx32 "\n"
-	         "\t count_indirect     = 0x%" PRIx32 "\n"
-	         "\t max_count_or_count = 0x%" PRIx32 "\n"
-	         "\t count_addr         = 0x%016" PRIx64 "\n"
-	         "\t stride_in_bytes    = 0x%" PRIx32 "\n"
-	         "\t modifier           = 0x%016" PRIx64 "\n",
-	         data_offset_in_bytes, count_indirect, max_count_or_count,
-	         reinterpret_cast<uint64_t>(count_addr), stride_in_bytes, modifier);
+	     "\t count_indirect     = 0x%" PRIx32 "\n"
+	     "\t max_count_or_count = 0x%" PRIx32 "\n"
+	     "\t count_addr         = 0x%016" PRIx64 "\n"
+	     "\t stride_in_bytes    = 0x%" PRIx32 "\n"
+	     "\t modifier           = 0x%016" PRIx64 "\n",
+	     data_offset_in_bytes, count_indirect, max_count_or_count,
+	     reinterpret_cast<uint64_t>(count_addr), stride_in_bytes, modifier);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	EXIT_NOT_IMPLEMENTED((count_indirect & ~1u) != 0);
@@ -2783,13 +2890,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexIndirectMulti(CommandBuffer*       buf,
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbDrawIndirectGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDrawIndirectGetSize() {
 	PRINT_NAME();
 
 	return 5u * 4u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data_offset_in_bytes,
                                                uint32_t flags) {
 	PRINT_NAME();
 
@@ -2810,13 +2917,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDispatchIndirect(CommandBuffer* buf, uint32_t data
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbDispatchIndirectGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDispatchIndirectGetSize() {
 	PRINT_NAME();
 
 	return 3u * 4u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* address) {
 	PRINT_NAME();
 
@@ -2845,13 +2952,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 	return cmd;
 }
 
-uint64_t KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type) {
+uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type) {
 	PRINT_NAME();
 
 	return (event_type & 0xfeu) == 0x38u ? 16u : 8u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* /*address*/) {
 	if (buf == nullptr) {
 		return nullptr;
@@ -2869,7 +2976,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbEventWrite(CommandBuffer* buf, uint8_t event_type,
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uint32_t cb_db_op,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uint32_t cb_db_op,
                                          uint32_t gcr_cntl, const volatile void* base,
                                          uint64_t size_bytes, uint32_t poll_cycles) {
 	PRINT_NAME();
@@ -2900,31 +3007,31 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbAcquireMemGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbAcquireMemGetSize() {
 	PRINT_NAME();
 
 	return 8u * 4u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbAcquireMem(CommandBuffer* buf, uint32_t gcr_cntl,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbAcquireMem(CommandBuffer* buf, uint32_t gcr_cntl,
                                          const volatile void* base, uint64_t size_bytes,
                                          uint32_t poll_cycles) {
 	return AgcDcbAcquireMem(buf, 0, 0, gcr_cntl, base, size_bytes, poll_cycles);
 }
 
-uint32_t KYTY_SYSV_ABI AgcAcbAcquireMemGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbAcquireMemGetSize() {
 	PRINT_NAME();
 
 	return AgcDcbAcquireMemGetSize();
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
                                        uint32_t num_dwords) {
 	PRINT_NAME();
 
-	AgcTrace("\t address    = 0x%016" PRIx64 "\n"
-	         "\t num_dwords = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(address), num_dwords);
+	LOGF("\t address    = 0x%016" PRIx64 "\n"
+	     "\t num_dwords = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(address), num_dwords);
 
 	if (buf == nullptr || address == nullptr) {
 		LOGF_COLOR(Log::Color::Red, "\t invalid arguments\n");
@@ -2957,24 +3064,24 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCondExec(CommandBuffer* buf, const volatile uint32
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbCondExecGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbCondExecGetSize() {
 	PRINT_NAME();
 
 	return 20;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbCondExec(CommandBuffer* buf, const volatile uint32_t* address,
                                        uint32_t num_dwords) {
 	return AgcDcbCondExec(buf, address, num_dwords);
 }
 
-uint32_t KYTY_SYSV_ABI AgcAcbCondExecGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbCondExecGetSize() {
 	PRINT_NAME();
 
 	return AgcDcbCondExecGetSize();
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy,
                                    const uint32_t* target, uint32_t size_in_dwords) {
 	if (buf == nullptr) {
 		return nullptr;
@@ -2995,11 +3102,11 @@ uint32_t* KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy,
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcAcbJumpGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbJumpGetSize() {
 	return 0x10u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, uint8_t offload) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, uint8_t offload) {
 	auto* cmd = AgcDcbRewind(buf, initial_state);
 	if (cmd != nullptr) {
 		cmd[1] |= (static_cast<uint32_t>(offload & 0x1u) << 24u);
@@ -3007,14 +3114,14 @@ uint32_t* KYTY_SYSV_ABI AgcAcbRewind(CommandBuffer* buf, uint8_t initial_state, 
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
                                          uint8_t cache_policy, const volatile void* address,
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles) {
 	return AgcDcbWaitRegMem(buf, size, compare_function, 0, cache_policy, address, reference, mask,
 	                        poll_cycles);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
                                            uint8_t mailbox, uint8_t signal_type, uint8_t op) {
 	EXIT_NOT_IMPLEMENTED(op != 6u && op != 7u);
 
@@ -3027,7 +3134,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile vo
 	const auto address_value = reinterpret_cast<uint64_t>(address);
 	const bool signal        = (op == 6u);
 	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
-	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
+	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
 	cmd[2] = (signal ? AGC_MEM_SEMAPHORE_SIGNAL_BEGIN_TAG : AGC_MEM_SEMAPHORE_WAIT_BEGIN_TAG) |
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
 	cmd[3] = static_cast<uint32_t>(address_value);
@@ -3050,13 +3157,13 @@ uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile vo
 	return cmd;
 }
 
-uint64_t KYTY_SYSV_ABI AgcAcbWaitOnAddressGetSize(uint8_t size) {
+uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbWaitOnAddressGetSize(uint8_t size) {
 	PRINT_NAME();
 
 	return AgcDcbWaitOnAddressGetSize(size);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                       uint64_t dst_address_or_offset, uint8_t src,
                                       uint8_t  src_cache_policy,
                                       uint64_t src_address_or_offset_or_immediate,
@@ -3099,7 +3206,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t d
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                        uint64_t dst_address, uint8_t src, uint8_t src_cache_policy,
                                        uint64_t src_address_or_immediate, uint8_t item_size,
                                        uint8_t write_confirm) {
@@ -3127,13 +3234,13 @@ uint32_t* KYTY_SYSV_ABI AgcAcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
 	return cmd;
 }
 
-uint64_t KYTY_SYSV_ABI AgcAcbCopyDataGetSize() {
+uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbCopyDataGetSize() {
 	PRINT_NAME();
 
 	return AgcDcbCopyDataGetSize();
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
                                                const volatile void* indirect_args,
                                                uint32_t             modifier) {
 	PRINT_NAME();
@@ -3162,7 +3269,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t cache_policy,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t cache_policy,
                                         uint64_t address_or_offset, const void* data,
                                         uint32_t num_dwords, uint8_t increment,
                                         uint8_t write_confirm) {
@@ -3189,7 +3296,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbStallCommandBufferParser(CommandBuffer* buf) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbStallCommandBufferParser(CommandBuffer* buf) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
@@ -3204,22 +3311,22 @@ uint32_t* KYTY_SYSV_ABI AgcDcbStallCommandBufferParser(CommandBuffer* buf) {
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                        uint64_t dst_address, uint8_t src, uint8_t src_cache_policy,
                                        uint64_t src_address_or_immediate, uint8_t item_size,
                                        uint8_t write_confirm) {
 	PRINT_NAME();
 
-	AgcTrace("\t dst                      = 0x%02" PRIx8 "\n"
-	         "\t dst_cache_policy         = 0x%02" PRIx8 "\n"
-	         "\t dst_address              = 0x%016" PRIx64 "\n"
-	         "\t src                      = 0x%02" PRIx8 "\n"
-	         "\t src_cache_policy         = 0x%02" PRIx8 "\n"
-	         "\t src_address_or_immediate = 0x%016" PRIx64 "\n"
-	         "\t item_size                = 0x%02" PRIx8 "\n"
-	         "\t write_confirm            = 0x%02" PRIx8 "\n",
-	         dst, dst_cache_policy, dst_address, src, src_cache_policy, src_address_or_immediate,
-	         item_size, write_confirm);
+	LOGF("\t dst                      = 0x%02" PRIx8 "\n"
+	     "\t dst_cache_policy         = 0x%02" PRIx8 "\n"
+	     "\t dst_address              = 0x%016" PRIx64 "\n"
+	     "\t src                      = 0x%02" PRIx8 "\n"
+	     "\t src_cache_policy         = 0x%02" PRIx8 "\n"
+	     "\t src_address_or_immediate = 0x%016" PRIx64 "\n"
+	     "\t item_size                = 0x%02" PRIx8 "\n"
+	     "\t write_confirm            = 0x%02" PRIx8 "\n",
+	     dst, dst_cache_policy, dst_address, src, src_cache_policy, src_address_or_immediate,
+	     item_size, write_confirm);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3247,13 +3354,13 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
 	return cmd;
 }
 
-uint64_t KYTY_SYSV_ABI AgcDcbCopyDataGetSize() {
+uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbCopyDataGetSize() {
 	PRINT_NAME();
 
 	return 6 * sizeof(uint32_t);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_t dst,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_t dst,
                                       uint8_t dst_cache_policy, uint64_t dst_address_or_offset,
                                       uint8_t src, uint8_t src_cache_policy,
                                       uint64_t src_address_or_offset_or_immediate,
@@ -3298,15 +3405,15 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbJump(CommandBuffer* buf, uint8_t mode, uint8_t cache_policy,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbJump(CommandBuffer* buf, uint8_t mode, uint8_t cache_policy,
                                    const uint32_t* target, uint32_t size_in_dwords) {
 	PRINT_NAME();
 
-	AgcTrace("\t mode           = 0x%02" PRIx8 "\n"
-	         "\t cache_policy   = 0x%02" PRIx8 "\n"
-	         "\t target         = 0x%016" PRIx64 "\n"
-	         "\t size_in_dwords = %" PRIu32 "\n",
-	         mode, cache_policy, reinterpret_cast<uint64_t>(target), size_in_dwords);
+	LOGF("\t mode           = 0x%02" PRIx8 "\n"
+	     "\t cache_policy   = 0x%02" PRIx8 "\n"
+	     "\t target         = 0x%016" PRIx64 "\n"
+	     "\t size_in_dwords = %" PRIu32 "\n",
+	     mode, cache_policy, reinterpret_cast<uint64_t>(target), size_in_dwords);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3329,22 +3436,22 @@ uint32_t* KYTY_SYSV_ABI AgcDcbJump(CommandBuffer* buf, uint8_t mode, uint8_t cac
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbJumpGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbJumpGetSize() {
 	PRINT_NAME();
 
 	return 16;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbRewindGetSize() {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbRewindGetSize() {
 	PRINT_NAME();
 
 	return 8;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbRewind(CommandBuffer* buf, uint32_t initial_state) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbRewind(CommandBuffer* buf, uint32_t initial_state) {
 	PRINT_NAME();
 
-	AgcTrace("\t initial_state = 0x%08" PRIx32 "\n", initial_state);
+	LOGF("\t initial_state = 0x%08" PRIx32 "\n", initial_state);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3362,17 +3469,17 @@ uint32_t* KYTY_SYSV_ABI AgcDcbRewind(CommandBuffer* buf, uint32_t initial_state)
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetPredication(CommandBuffer* buf, uint8_t condition, uint8_t op,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetPredication(CommandBuffer* buf, uint8_t condition, uint8_t op,
                                              uint8_t wait_op, const volatile void* address,
                                              uint32_t count_in_dwords) {
 	PRINT_NAME();
 
-	AgcTrace("\t condition       = 0x%02" PRIx8 "\n"
-	         "\t op              = 0x%02" PRIx8 "\n"
-	         "\t wait_op         = 0x%02" PRIx8 "\n"
-	         "\t address         = 0x%016" PRIx64 "\n"
-	         "\t count_in_dwords = %" PRIu32 "\n",
-	         condition, op, wait_op, reinterpret_cast<uint64_t>(address), count_in_dwords);
+	LOGF("\t condition       = 0x%02" PRIx8 "\n"
+	     "\t op              = 0x%02" PRIx8 "\n"
+	     "\t wait_op         = 0x%02" PRIx8 "\n"
+	     "\t address         = 0x%016" PRIx64 "\n"
+	     "\t count_in_dwords = %" PRIu32 "\n",
+	     condition, op, wait_op, reinterpret_cast<uint64_t>(address), count_in_dwords);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3398,16 +3505,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetPredication(CommandBuffer* buf, uint8_t conditi
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize_0600(CommandBuffer* buf, uint32_t arg1, uint32_t arg2,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetIndexSize_0600(CommandBuffer* buf, uint32_t arg1, uint32_t arg2,
                                              uint32_t arg3) {
-	PRINT_NAME();
-
-	AgcTrace("\t arg0 = 0x%016" PRIx64 "\n"
-	         "\t arg1 = 0x%08" PRIx32 "\n"
-	         "\t arg2 = 0x%08" PRIx32 "\n"
-	         "\t arg3 = 0x%08" PRIx32 "\n",
-	         reinterpret_cast<uint64_t>(buf), arg1, arg2, arg3);
-
 	if (buf == nullptr) {
 		return nullptr;
 	}
@@ -3431,7 +3530,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetIndexSize_0600(CommandBuffer* buf, uint32_t arg
 	return cmd;
 }
 
-int KYTY_SYSV_ABI AgcDmaDataPatchSetDstAddressOrOffset(uint32_t* cmd,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDmaDataPatchSetDstAddressOrOffset(uint32_t* cmd,
                                                        uint64_t  dst_address_or_offset) {
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -3445,7 +3544,7 @@ int KYTY_SYSV_ABI AgcDmaDataPatchSetDstAddressOrOffset(uint32_t* cmd,
 	return GRAPHICS5_ERROR_INVALID_PACKET;
 }
 
-int KYTY_SYSV_ABI AgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate(
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate(
     uint32_t* cmd, uint64_t src_address_or_offset_or_immediate) {
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -3459,27 +3558,27 @@ int KYTY_SYSV_ABI AgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate(
 	return GRAPHICS5_ERROR_INVALID_PACKET;
 }
 
-uint32_t KYTY_SYSV_ABI AgcGetPacketSize(uint32_t* packet) {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcGetPacketSize(uint32_t* packet) {
 	return Pm4::PacketSizeDw(packet[0]);
 }
 
-int KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetPacketPredication(uint32_t* packet, uint32_t predication) {
 	PRINT_NAME();
 
-	AgcTrace("\t packet      = 0x%016" PRIx64 "\n"
-	         "\t predication = 0x%08" PRIx32 "\n",
-	         reinterpret_cast<uint64_t>(packet), predication);
+	LOGF("\t packet      = 0x%016" PRIx64 "\n"
+	     "\t predication = 0x%08" PRIx32 "\n",
+	     reinterpret_cast<uint64_t>(packet), predication);
 
-	AgcTrace("\t packet0     = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", r = 0x%02" PRIx32
-	         ", len = %" PRIu32 "\n",
-	         packet[0], (packet[0] >> 8u) & 0xffu, KYTY_PM4_R(packet[0]), AgcGetPacketSize(packet));
+	LOGF("\t packet0     = 0x%08" PRIx32 ", op = 0x%02" PRIx32 ", r = 0x%02" PRIx32
+	     ", len = %" PRIu32 "\n",
+	     packet[0], (packet[0] >> 8u) & 0xffu, KYTY_PM4_R(packet[0]), AgcGetPacketSize(packet));
 
 	packet[0] = (packet[0] & ~1u) | (static_cast<uint8_t>(predication) == 1 ? 1u : 0u);
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcSetNop(uint32_t* packet) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetNop(uint32_t* packet) {
 	PRINT_NAME();
 
 	packet[0] = (packet[0] & 0xffff0003u) | (Pm4::IT_NOP << 8u);
@@ -3487,14 +3586,14 @@ int KYTY_SYSV_ABI AgcSetNop(uint32_t* packet) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_t* end,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_t* end,
                                          uint32_t predication) {
 	PRINT_NAME();
 
-	AgcTrace("\t start       = 0x%016" PRIx64 "\n"
-	         "\t end         = 0x%016" PRIx64 "\n"
-	         "\t predication = 0x%08" PRIx32 "\n",
-	         reinterpret_cast<uint64_t>(start), reinterpret_cast<uint64_t>(end), predication);
+	LOGF("\t start       = 0x%016" PRIx64 "\n"
+	     "\t end         = 0x%016" PRIx64 "\n"
+	     "\t predication = 0x%08" PRIx32 "\n",
+	     reinterpret_cast<uint64_t>(start), reinterpret_cast<uint64_t>(end), predication);
 
 	auto* packet    = start;
 	auto* range_end = const_cast<uint32_t*>(reinterpret_cast<const volatile uint32_t*>(end));
@@ -3517,7 +3616,7 @@ int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
 	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_REWIND) {
 		return GRAPHICS5_ERROR_INVALID_PACKET;
 	}
@@ -3526,12 +3625,12 @@ int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t* buffer) {
 	PRINT_NAME();
 
-	AgcTrace("\t cmd    = 0x%016" PRIx64 "\n"
-	         "\t buffer = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(buffer));
+	LOGF("\t cmd    = 0x%016" PRIx64 "\n"
+	     "\t buffer = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), reinterpret_cast<uint64_t>(buffer));
 
 	if (cmd == nullptr || buffer == nullptr) {
 		return GRAPHICS5_ERROR_INVALID_PACKET;
@@ -3557,7 +3656,7 @@ int KYTY_SYSV_ABI AgcCondExecPatchSetEnd(uint32_t* cmd, const volatile uint32_t*
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcCondExecPatchSetCommandAddress(uint32_t*                cmd,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcCondExecPatchSetCommandAddress(uint32_t*                cmd,
                                                     const volatile uint32_t* command) {
 	PRINT_NAME();
 
@@ -3581,21 +3680,21 @@ int KYTY_SYSV_ABI AgcCondExecPatchSetCommandAddress(uint32_t*                cmd
 	return OK;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t cache_policy,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t cache_policy,
                                         uint64_t address_or_offset, const void* data,
                                         uint32_t num_dwords, uint8_t increment,
                                         uint8_t write_confirm) {
 	PRINT_NAME();
 
 	AgcTrace("\t dst               = 0x%02" PRIx8 "\n"
-	         "\t cache_policy      = 0x%02" PRIx8 "\n"
-	         "\t address_or_offset = 0x%016" PRIx64 "\n"
-	         "\t data              = 0x%016" PRIx64 "\n"
-	         "\t num_dwords        = %" PRIu32 "\n"
-	         "\t increment         = 0x%02" PRIx8 "\n"
-	         "\t write_confirm     = 0x%02" PRIx8 "\n",
-	         dst, cache_policy, address_or_offset, reinterpret_cast<uint64_t>(data), num_dwords,
-	         increment, write_confirm);
+	     "\t cache_policy      = 0x%02" PRIx8 "\n"
+	     "\t address_or_offset = 0x%016" PRIx64 "\n"
+	     "\t data              = 0x%016" PRIx64 "\n"
+	     "\t num_dwords        = %" PRIu32 "\n"
+	     "\t increment         = 0x%02" PRIx8 "\n"
+	     "\t write_confirm     = 0x%02" PRIx8 "\n",
+	     dst, cache_policy, address_or_offset, reinterpret_cast<uint64_t>(data), num_dwords,
+	     increment, write_confirm);
 
 	if (buf == nullptr || data == nullptr) {
 		LOGF_COLOR(Log::Color::Red, "\t invalid arguments\n");
@@ -3629,30 +3728,30 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWriteData(CommandBuffer* buf, uint8_t dst, uint8_t
 	return cmd;
 }
 
-uint32_t KYTY_SYSV_ABI AgcDcbWriteDataGetSize(uint32_t num_dwords) {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbWriteDataGetSize(uint32_t num_dwords) {
 	PRINT_NAME();
 
-	AgcTrace("\t num_dwords = %" PRIu32 "\n", num_dwords);
+	LOGF("\t num_dwords = %" PRIu32 "\n", num_dwords);
 
 	return 4u * num_dwords + 16u;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbGetLodStats(CommandBuffer* buf, uint8_t cache_policy,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbGetLodStats(CommandBuffer* buf, uint8_t cache_policy,
                                           const volatile void* buffer,
                                           uint32_t buffer_size_in_bytes, uint32_t reset_count,
                                           uint8_t force_reset, uint8_t report_and_reset,
                                           uint32_t reporting_interval_in_100k_clocks) {
 	PRINT_NAME();
 
-	AgcTrace("\t cache_policy                      = 0x%02" PRIx8 "\n"
-	         "\t buffer                            = 0x%016" PRIx64 "\n"
-	         "\t buffer_size_in_bytes              = %" PRIu32 "\n"
-	         "\t reset_count                       = %" PRIu32 "\n"
-	         "\t force_reset                       = 0x%02" PRIx8 "\n"
-	         "\t report_and_reset                  = 0x%02" PRIx8 "\n"
-	         "\t reporting_interval_in_100k_clocks = %" PRIu32 "\n",
-	         cache_policy, reinterpret_cast<uint64_t>(buffer), buffer_size_in_bytes, reset_count,
-	         force_reset, report_and_reset, reporting_interval_in_100k_clocks);
+	LOGF("\t cache_policy                      = 0x%02" PRIx8 "\n"
+	     "\t buffer                            = 0x%016" PRIx64 "\n"
+	     "\t buffer_size_in_bytes              = %" PRIu32 "\n"
+	     "\t reset_count                       = %" PRIu32 "\n"
+	     "\t force_reset                       = 0x%02" PRIx8 "\n"
+	     "\t report_and_reset                  = 0x%02" PRIx8 "\n"
+	     "\t reporting_interval_in_100k_clocks = %" PRIu32 "\n",
+	     cache_policy, reinterpret_cast<uint64_t>(buffer), buffer_size_in_bytes, reset_count,
+	     force_reset, report_and_reset, reporting_interval_in_100k_clocks);
 
 	if (buf == nullptr) {
 		return nullptr;
@@ -3698,7 +3797,7 @@ static uint32_t* get_agc_wait_packet(uint32_t* cmd) {
 	return wait;
 }
 
-int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* address) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* address) {
 	PRINT_NAME();
 
 	AgcTrace("\t cmd     = 0x%016" PRIx64 "\n"
@@ -3722,12 +3821,12 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchAddress(uint32_t* cmd, const volatile void* 
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference) {
 	PRINT_NAME();
 
-	AgcTrace("\t cmd       = 0x%016" PRIx64 "\n"
-	         "\t reference = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(cmd), reference);
+	LOGF("\t cmd       = 0x%016" PRIx64 "\n"
+	     "\t reference = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), reference);
 
 	auto* wait = get_agc_wait_packet(cmd);
 	if (wait == nullptr) {
@@ -3740,7 +3839,7 @@ int KYTY_SYSV_ABI AgcWaitRegMemPatchReference(uint32_t* cmd, uint64_t reference)
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
                                                       const volatile Label* address) {
 	PRINT_NAME();
 
@@ -3764,12 +3863,12 @@ int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchAddress(uint32_t*             cmd,
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcQueueEndOfPipeActionPatchData(uint32_t* cmd, uint64_t data) {
 	PRINT_NAME();
 
-	AgcTrace("\t cmd  = 0x%016" PRIx64 "\n"
-	         "\t data = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(cmd), data);
+	LOGF("\t cmd  = 0x%016" PRIx64 "\n"
+	     "\t data = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(cmd), data);
 
 	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
@@ -3805,7 +3904,7 @@ static uint32_t wait_reg_mem64_control(uint8_t compare_function, uint8_t op, uin
 
 bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 	if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG ||
-	    KYTY_PM4_R(cmd_id) != 1u || payload[0] != Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+	    KYTY_PM4_R(cmd_id) != 1u || payload[0] != AGC_INTERNAL_DATA_REGISTER) {
 		return false;
 	}
 
@@ -3822,22 +3921,22 @@ bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
 	        payload[1] == AGC_DRAW_INDIRECT_MULTI_END_TAG);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
                                          uint8_t op, uint8_t cache_policy,
                                          const volatile void* address, uint64_t reference,
                                          uint64_t mask, uint32_t poll_cycles) {
 	PRINT_NAME();
 
 	AgcTrace("\t size             = 0x%02" PRIx8 "\n"
-	         "\t compare_function = 0x%02" PRIx8 "\n"
-	         "\t op               = 0x%02" PRIx8 "\n"
-	         "\t cache_policy     = 0x%02" PRIx8 "\n"
-	         "\t address          = 0x%016" PRIx64 "\n"
-	         "\t reference        = 0x%016" PRIx64 "\n"
-	         "\t mask             = 0x%016" PRIx64 "\n"
-	         "\t poll_cycles      = %" PRIu32 "\n",
-	         size, compare_function, op, cache_policy, reinterpret_cast<uint64_t>(address),
-	         reference, mask, poll_cycles);
+	     "\t compare_function = 0x%02" PRIx8 "\n"
+	     "\t op               = 0x%02" PRIx8 "\n"
+	     "\t cache_policy     = 0x%02" PRIx8 "\n"
+	     "\t address          = 0x%016" PRIx64 "\n"
+	     "\t reference        = 0x%016" PRIx64 "\n"
+	     "\t mask             = 0x%016" PRIx64 "\n"
+	     "\t poll_cycles      = %" PRIu32 "\n",
+	     size, compare_function, op, cache_policy, reinterpret_cast<uint64_t>(address), reference,
+	     mask, poll_cycles);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 	if (size != 0 && size != 1) {
@@ -3866,7 +3965,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	}
 
 	cmd[0] = KYTY_PM4(AGC_WAIT_USER_DATA_BEGIN_DW, Pm4::IT_SET_UCONFIG_REG, 1u);
-	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
+	cmd[1] = AGC_INTERNAL_DATA_REGISTER;
 	cmd[2] = (wait32 ? AGC_WAIT_USER_DATA_BEGIN_32_TAG : AGC_WAIT_USER_DATA_BEGIN_64_TAG) |
 	         static_cast<uint32_t>((address_value >> 32u) & 0xffffu);
 	cmd[3] = static_cast<uint32_t>(address_value);
@@ -3900,7 +3999,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
 	return cmd;
 }
 
-uint64_t KYTY_SYSV_ABI AgcDcbWaitOnAddressGetSize(uint32_t size) {
+uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbWaitOnAddressGetSize(uint32_t size) {
 	PRINT_NAME();
 
 	switch (size) {
@@ -3910,7 +4009,7 @@ uint64_t KYTY_SYSV_ABI AgcDcbWaitOnAddressGetSize(uint32_t size) {
 	}
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t /*color*/) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t /*color*/) {
 	if (buf == nullptr) {
 		return nullptr;
 	}
@@ -3935,19 +4034,19 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, ui
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
 	return AgcDcbPushMarker(buf, str, color);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color) {
 	return AgcDcbSetMarker(buf, str, color);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color) {
 	return AgcDcbPushMarker(buf, str, color);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf) {
 	if (buf == nullptr) {
 		return nullptr;
 	}
@@ -3964,105 +4063,33 @@ uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf) {
 	return cmd;
 }
 
-uint32_t* KYTY_SYSV_ABI AgcAcbPopMarker(CommandBuffer* buf) {
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcAcbPopMarker(CommandBuffer* buf) {
 	return AgcDcbPopMarker(buf);
 }
 
-uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
+uint32_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_handle,
                                       int32_t display_buffer_index, uint32_t flip_mode,
                                       int64_t flip_arg) {
 	PRINT_NAME();
 
 	AgcTrace("\t video_out_handle     = %" PRIu32 "\n"
-	         "\t display_buffer_index = %" PRId32 "\n"
-	         "\t flip_mode            = %" PRIu32 "\n"
-	         "\t flip_arg             = %" PRId64 "\n",
-	         video_out_handle, display_buffer_index, flip_mode, flip_arg);
+	     "\t display_buffer_index = %" PRId32 "\n"
+	     "\t flip_mode            = %" PRIu32 "\n"
+	     "\t flip_arg             = %" PRId64 "\n",
+	     video_out_handle, display_buffer_index, flip_mode, flip_arg);
 
 	EXIT_NOT_IMPLEMENTED(buf == nullptr);
 
-	int        bus    = 0;
-	auto*      labels = VideoOut::VideoOutGetBufferLabels(static_cast<int>(video_out_handle), &bus);
-	const bool shown  = display_buffer_index >= 0;
-	if (labels == nullptr || display_buffer_index < -2 || display_buffer_index > 15) {
-		return nullptr;
-	}
-	auto* cmd = buf->AllocateDW(Pm4::FLIP_PACKET_DW);
-	if (cmd == nullptr) {
-		return nullptr;
-	}
+	auto* cmd = buf->AllocateDW(6);
 
-	const auto label = (shown ? reinterpret_cast<uint64_t>(labels + display_buffer_index) : 0u);
-	// The tag holds the flip mode and buffer index; bit 16 and bits 0..2 are always set.
-	cmd[0] = KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, 1u);
-	cmd[1] = Pm4::SQ_THREAD_TRACE_USERDATA_2;
-	cmd[2] = Pm4::USERDATA_TAG_FLIP | 0x10000u | ((flip_mode & 0xfu) << 8u) |
-	         ((static_cast<uint32_t>(display_buffer_index) & 0x1fu) << 3u) | 0x7u;
-	cmd[3] = static_cast<uint32_t>(bus);
-	// WRITE_DATA puts both flip-argument dwords into SQ_THREAD_TRACE_USERDATA_3, without
-	// incrementing the address.
-	cmd[4] = KYTY_PM4(6, Pm4::IT_WRITE_DATA, 1u);
-	cmd[5] = 0x06010000u;
-	cmd[6] = 0xc343u;
-	cmd[7] = 0;
-	cmd[8] = static_cast<uint32_t>(static_cast<uint64_t>(flip_arg));
-	cmd[9] = static_cast<uint32_t>(static_cast<uint64_t>(flip_arg) >> 32u);
-	// An end-of-pipe CB/DB and GL2 writeback writes 1 to a shown buffer's label, then interrupts
-	// with the port as context id.
-	cmd[10] = KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u);
-	cmd[11] = 0x06200504u;
-	cmd[12] = (shown ? 0x42010000u : 0x02010000u);
-	cmd[13] = static_cast<uint32_t>(label) & ~0x3u;
-	cmd[14] = static_cast<uint32_t>(label >> 32u);
-	cmd[15] = (shown ? 1u : 0u);
-	cmd[16] = 0;
-	cmd[17] = video_out_handle & 0x0fffffffu;
-	cmd[18] = KYTY_PM4(Pm4::FLIP_PACKET_DW - 18u, Pm4::IT_NOP, 0u);
+	EXIT_NOT_IMPLEMENTED(cmd == nullptr);
 
-	return cmd;
-}
-
-uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
-                                                        uint32_t       video_out_handle,
-                                                        int32_t        display_buffer_index) {
-	PRINT_NAME();
-
-	AgcTrace("\t video_out_handle     = %" PRIu32 "\n"
-	         "\t display_buffer_index = %" PRId32 "\n",
-	         video_out_handle, display_buffer_index);
-
-	EXIT_NOT_IMPLEMENTED(buf == nullptr);
-
-	int        bus    = 0;
-	auto*      labels = VideoOut::VideoOutGetBufferLabels(static_cast<int>(video_out_handle), &bus);
-	const bool shown  = display_buffer_index >= 0;
-	if ((shown && labels == nullptr) || display_buffer_index < -2 || display_buffer_index > 15) {
-		return nullptr;
-	}
-	auto* cmd = buf->AllocateDW(Pm4::WAIT_FLIP_DONE_PACKET_DW);
-	if (cmd == nullptr) {
-		return nullptr;
-	}
-
-	const auto index = static_cast<uint32_t>(display_buffer_index) & 0x1fu;
-	write_agc_internal_data_packet(cmd, Pm4::USERDATA_TAG_WAIT_FLIP_DONE | index);
-	if (shown) {
-		const auto label = reinterpret_cast<uint64_t>(labels + display_buffer_index);
-		// The PFP waits until the buffer's label is 0.
-		cmd[3]  = KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, 0u);
-		cmd[4]  = wait_reg_mem64_control(3, 1, 3);
-		cmd[5]  = static_cast<uint32_t>(label) & ~0x7u;
-		cmd[6]  = static_cast<uint32_t>(label >> 32u) & 0x3ffffu;
-		cmd[7]  = 0;
-		cmd[8]  = 0;
-		cmd[9]  = 0xffffffffu;
-		cmd[10] = 0xffffffffu;
-		cmd[11] = 0x40u;
-	} else {
-		cmd[3] = KYTY_PM4(9, Pm4::IT_NOP, 0u);
-	}
-	write_agc_internal_data_packet(cmd + 12, Pm4::USERDATA_TAG_WAIT_FLIP_DONE | 0x20u | index);
-	cmd[15] = KYTY_PM4(Pm4::WAIT_FLIP_DONE_PACKET_DW - 15u, Pm4::IT_NOP, 0u);
+	cmd[0] = KYTY_PM4(6, Pm4::IT_NOP, Pm4::R_FLIP);
+	cmd[1] = video_out_handle;
+	cmd[2] = display_buffer_index;
+	cmd[3] = flip_mode;
+	cmd[4] = static_cast<uint32_t>(static_cast<uint64_t>(flip_arg) & 0xffffffffu);
+	cmd[5] = static_cast<uint32_t>((static_cast<uint64_t>(flip_arg) >> 32u) & 0xffffffffu);
 
 	return cmd;
 }
@@ -4142,27 +4169,34 @@ struct TessellationDriverState {
 
 static TessellationDriverState g_tessellation_driver_state {};
 
-static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords,
+                       int interrupt_event_id = AgcQueue::DEFAULT_GRAPHICS_EOP_EVENT_ID) {
+	if (Observe::Enabled()) {
+		Observe::Record(Observe::Event::Submit,
+		                {reinterpret_cast<uint64_t>(dcb), size_in_dwords,
+		                 static_cast<uint64_t>(interrupt_event_id)});
+	}
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
-	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords});
+	EXIT_IF(g_renderer == nullptr);
+	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, interrupt_event_id);
 }
 
-int KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverSubmitDcb(const Packet* packet) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(packet == nullptr);
 
 	AgcTrace("\t addr   = 0x%016" PRIx64 "\n"
-	         "\t dw_num = 0x%08" PRIx32 "\n"
-	         "\t flags  = 0x%02" PRIx8 "\n",
-	         reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
+	     "\t dw_num = 0x%08" PRIx32 "\n"
+	     "\t flags  = 0x%02" PRIx8 "\n",
+	     reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
 
 	submit_dcb(packet->addr, packet->dw_num);
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
                                            const uint32_t* dcb_sizes_in_dwords, uint32_t count) {
 	PRINT_NAME();
 
@@ -4180,8 +4214,8 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiDcbs(uint32_t* const* dcb_gpu_addrs,
 		uint32_t size_in_dwords = dcb_sizes_in_dwords[i];
 
 		AgcTrace("\t dcb[%" PRIu32 "]  = 0x%016" PRIx64 "\n"
-		         "\t size[%" PRIu32 "] = 0x%08" PRIx32 "\n",
-		         i, reinterpret_cast<uint64_t>(dcb), i, size_in_dwords);
+		     "\t size[%" PRIu32 "] = 0x%08" PRIx32 "\n",
+		     i, reinterpret_cast<uint64_t>(dcb), i, size_in_dwords);
 
 		if (dcb != nullptr) {
 			submit_dcb(dcb, size_in_dwords);
@@ -4196,13 +4230,20 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 		return;
 	}
 
+	for (uint32_t i = 0; i < std::min<uint32_t>(size_in_dwords, 8); i++) {
+		AgcTrace("\t acb[%u] = 0x%08" PRIx32 "\n", i, acb[i]);
+	}
+
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
+
+	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
 }
 
 static uint32_t get_driver_queue(const void* queue_context) {
 	uint32_t queue = 0;
-	std::memcpy(&queue, static_cast<const uint8_t*>(queue_context) + 4, sizeof(queue));
+	std::memcpy(&queue, static_cast<const uint8_t*>(queue_context) + AgcQueue::CONTEXT_QUEUE_ID_OFFSET,
+	            sizeof(queue));
 	return queue;
 }
 
@@ -4211,44 +4252,44 @@ static void submit_command_buffer(uint32_t queue, uint32_t* commands, uint32_t s
 		return;
 	}
 
-	if (queue >= 0x20 && queue < 0x58) {
+	if (AgcQueue::RouteForQueue(queue) == AgcQueue::Route::Compute) {
 		submit_acb(queue, commands, size_in_dwords);
 	} else {
-		submit_dcb(commands, size_in_dwords);
+		submit_dcb(commands, size_in_dwords, AgcQueue::GraphicsEopEventIdForQueue(queue));
 	}
 }
 
-int KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet) {
 	PRINT_NAME();
 
-	AgcTrace("\t queue_context = 0x%016" PRIx64 "\n"
-	         "\t packet        = 0x%016" PRIx64 "\n",
-	         reinterpret_cast<uint64_t>(queue_context), reinterpret_cast<uint64_t>(packet));
+	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
+	     "\t packet        = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(queue_context), reinterpret_cast<uint64_t>(packet));
 
 	if (queue_context == nullptr || packet == nullptr) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
 	const uint32_t queue = get_driver_queue(queue_context);
-	AgcTrace("\t queue = 0x%08" PRIx32 "\n"
-	         "\t addr  = 0x%016" PRIx64 "\n"
-	         "\t size  = 0x%08" PRIx32 "\n"
-	         "\t flags = 0x%02" PRIx8 "\n",
-	         queue, reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
+	LOGF("\t queue = 0x%08" PRIx32 "\n"
+	     "\t addr  = 0x%016" PRIx64 "\n"
+	     "\t size  = 0x%08" PRIx32 "\n"
+	     "\t flags = 0x%02" PRIx8 "\n",
+	     queue, reinterpret_cast<uint64_t>(packet->addr), packet->dw_num, packet->flags);
 
 	submit_command_buffer(queue, packet->addr, packet->dw_num);
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_context,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_context,
                                                      uint32_t* const* command_buffers,
                                                      const uint32_t*  sizes_in_dwords,
                                                      uint32_t         count) {
 	PRINT_NAME();
 
-	AgcTrace("\t queue_context = 0x%016" PRIx64 "\n"
-	         "\t count         = %" PRIu32 "\n",
-	         reinterpret_cast<uint64_t>(queue_context), count);
+	LOGF("\t queue_context = 0x%016" PRIx64 "\n"
+	     "\t count         = %" PRIu32 "\n",
+	     reinterpret_cast<uint64_t>(queue_context), count);
 
 	if (count == 0) {
 		return OK;
@@ -4259,12 +4300,14 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiCommandBuffers(void*            queue_cont
 
 	const uint32_t queue = get_driver_queue(queue_context);
 	for (uint32_t i = 0; i < count; i++) {
+		LOGF("\t multi_dcb[%u/%u]: queue=%" PRIu32 " addr=0x%016" PRIx64 " size=0x%08" PRIx32 "\n",
+		     i, count, queue, reinterpret_cast<uint64_t>(command_buffers[i]), sizes_in_dwords[i]);
 		submit_command_buffer(queue, command_buffers[i], sizes_in_dwords[i]);
 	}
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
 	PRINT_NAME();
 
 	AgcTrace("\t queue  = 0x%08" PRIx32 "\n"
@@ -4283,13 +4326,13 @@ int KYTY_SYSV_ABI AgcDriverSubmitAcb(uint32_t queue, const Packet* packet) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs,
                                            const uint32_t* sizes_in_dwords, uint32_t count) {
 	PRINT_NAME();
 
-	AgcTrace("\t queue = 0x%08" PRIx32 "\n"
-	         "\t count = %" PRIu32 "\n",
-	         queue, count);
+	LOGF("\t queue = 0x%08" PRIx32 "\n"
+	     "\t count = %" PRIu32 "\n",
+	     queue, count);
 
 	if (count == 0) {
 		return OK;
@@ -4305,27 +4348,32 @@ int KYTY_SYSV_ABI AgcDriverSubmitMultiAcbs(uint32_t queue, uint32_t* const* acbs
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcDriverAddEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id, void* udata) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverAddEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id, void* udata) {
 	PRINT_NAME();
 
 	if (eq == LibKernel::EventQueue::KERNEL_EQUEUE_INVALID) {
 		return LibKernel::KERNEL_ERROR_EBADF;
 	}
 
-	return Sync::AddEqEvent(*g_renderer, eq, id, udata);
+	EXIT_IF(g_renderer == nullptr);
+	const int result = Sync::AddEqEvent(*g_renderer, eq, id, udata);
+	LOGF("\t sceAgcDriverAddEqEvent eq = %" PRId64 " id = %d udata = 0x%016" PRIx64 " -> %d\n",
+	     static_cast<int64_t>(eq), id, reinterpret_cast<uint64_t>(udata), result);
+	return result;
 }
 
-int KYTY_SYSV_ABI AgcDriverDeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverDeleteEqEvent(LibKernel::EventQueue::KernelEqueue eq, int id) {
 	PRINT_NAME();
 
 	if (eq == LibKernel::EventQueue::KERNEL_EQUEUE_INVALID) {
 		return LibKernel::KERNEL_ERROR_EBADF;
 	}
 
+	EXIT_IF(g_renderer == nullptr);
 	return Sync::DeleteEqEvent(*g_renderer, eq, id);
 }
 
-int KYTY_SYSV_ABI AgcDriverGetEqEventType(const LibKernel::EventQueue::KernelEvent* ev) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverGetEqEventType(const LibKernel::EventQueue::KernelEvent* ev) {
 	PRINT_NAME();
 
 	if (ev == nullptr) {
@@ -4339,7 +4387,7 @@ int KYTY_SYSV_ABI AgcDriverGetEqEventType(const LibKernel::EventQueue::KernelEve
 	return static_cast<int>(ev->data);
 }
 
-uint32_t KYTY_SYSV_ABI AgcDriverGetEqContextId(const LibKernel::EventQueue::KernelEvent* ev) {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverGetEqContextId(const LibKernel::EventQueue::KernelEvent* ev) {
 	PRINT_NAME();
 
 	if (ev == nullptr) {
@@ -4353,41 +4401,41 @@ uint32_t KYTY_SYSV_ABI AgcDriverGetEqContextId(const LibKernel::EventQueue::Kern
 	return static_cast<uint32_t>(ev->ident);
 }
 
-int KYTY_SYSV_ABI AgcDriverSetTFRing(const volatile void* base, uint32_t size) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverSetTFRing(const volatile void* base, uint32_t size) {
 	PRINT_NAME();
 
 	g_tessellation_driver_state.tf_ring_base = reinterpret_cast<uint64_t>(base);
 	g_tessellation_driver_state.tf_ring_size = size;
 
-	AgcTrace("\t base = 0x%016" PRIx64 "\n"
-	         "\t size = 0x%08" PRIx32 "\n",
-	         g_tessellation_driver_state.tf_ring_base, g_tessellation_driver_state.tf_ring_size);
+	LOGF("\t base = 0x%016" PRIx64 "\n"
+	     "\t size = 0x%08" PRIx32 "\n",
+	     g_tessellation_driver_state.tf_ring_base, g_tessellation_driver_state.tf_ring_size);
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, uint64_t value2) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, uint64_t value2) {
 	PRINT_NAME();
 
 	g_tessellation_driver_state.hs_offchip_value0 = value0;
 	g_tessellation_driver_state.hs_offchip_value1 = value1;
 	g_tessellation_driver_state.hs_offchip_value2 = value2;
 
-	AgcTrace("\t value0 = 0x%016" PRIx64 "\n"
-	         "\t value1 = 0x%016" PRIx64 "\n"
-	         "\t value2 = 0x%016" PRIx64 "\n",
-	         value0, value1, value2);
+	LOGF("\t value0 = 0x%016" PRIx64 "\n"
+	     "\t value1 = 0x%016" PRIx64 "\n"
+	     "\t value2 = 0x%016" PRIx64 "\n",
+	     value0, value1, value2);
 
 	return OK;
 }
 
-bool KYTY_SYSV_ABI AgcDriverIsCaptureInProgress() {
+bool __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverIsCaptureInProgress() {
 	PRINT_NAME();
 
 	return false;
 }
 
-int KYTY_SYSV_ABI AgcDriverRegisterDefaultOwner() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AgcDriverRegisterDefaultOwner() {
 	PRINT_NAME();
 
 	return static_cast<int>(0x8a6c9018u);

@@ -3,6 +3,7 @@
 #include "common/archive.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/logging/log.h"
 #include "common/platform/sysFileIO.h"
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
@@ -14,6 +15,7 @@
 
 // IWYU pragma: no_include <fileapi.h>
 // IWYU pragma: no_include <windows.h>
+// IWYU pragma: no_include <winbase.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifdef CreateDirectory
@@ -22,9 +24,43 @@
 #ifdef DeleteFile
 #undef DeleteFile
 #endif
+#ifdef CopyFile
+#undef CopyFile
+#endif
 #endif
 
 namespace Common {
+
+namespace {
+
+SysFileTimeStruct DateTimeToFileTimeUtc(const DateTime& date_time) {
+	SysTimeStruct time {};
+	time.is_invalid = false;
+
+	int year  = 0;
+	int month = 0;
+	int day   = 0;
+	date_time.GetDate().Get(&year, &month, &day);
+	time.Year  = year;
+	time.Month = month;
+	time.Day   = day;
+
+	int hour         = 0;
+	int minute       = 0;
+	int second       = 0;
+	int milliseconds = 0;
+	date_time.GetTime().Get(&hour, &minute, &second, &milliseconds);
+	time.Hour         = hour;
+	time.Minute       = minute;
+	time.Second       = second;
+	time.Milliseconds = milliseconds;
+
+	SysFileTimeStruct file_time {};
+	SysSystemToFileTimeUtc(time, file_time);
+	return file_time;
+}
+
+} // namespace
 
 struct File::FilePrivate {
 	sys_file_t*                  f;
@@ -65,7 +101,13 @@ bool File::Create(const std::filesystem::path& name) {
 	m_file_name = name;
 
 	m_p->f = SysFileCreate(name);
-	return m_p->f != nullptr;
+
+	if (SysFileIsError(*m_p->f)) {
+		Close();
+		return false;
+	}
+
+	return true;
 }
 
 bool File::Open(const std::filesystem::path& name, Mode mode) {
@@ -83,9 +125,112 @@ bool File::Open(const std::filesystem::path& name, Mode mode) {
 	switch (mode) {
 		case Mode::Read: m_p->f = SysFileOpenR(name); break;
 		case Mode::Write: m_p->f = SysFileOpenW(name); break;
-		case Mode::ReadWrite: m_p->f = SysFileOpenRw(name); break;
+		case Mode::ReadWrite:
+		case Mode::WriteRead: m_p->f = SysFileOpenRw(name); break;
 	}
+
+	if (SysFileIsError(*m_p->f)) {
+		Close();
+		return false;
+	}
+
+	return true;
+}
+
+bool File::OpenMetadata(const std::filesystem::path& name, std::error_code& error) {
+	EXIT_IF(!IsInvalid());
+	m_file_name = name;
+	if (IsArchivePath(name)) {
+		m_p->archive = OpenArchiveFile(name, true);
+		if (m_p->archive == nullptr) {
+			error = std::make_error_code(std::errc::no_such_file_or_directory);
+			return false;
+		}
+		error.clear();
+		return true;
+	}
+	m_p->f = SysFileOpenMetadata(name, error);
 	return m_p->f != nullptr;
+}
+
+bool File::OpenDirectory(const std::filesystem::path& name, std::error_code& error) {
+	EXIT_IF(!IsInvalid());
+	if (IsArchivePath(name)) {
+		const auto info = GetInfo(name);
+		if (!info || info->is_file) {
+			error = std::make_error_code(info ? std::errc::not_a_directory : std::errc::no_such_file_or_directory);
+			return false;
+		}
+		return OpenMetadata(name, error);
+	}
+	m_file_name = name;
+	m_p->f = SysFileOpenDirectory(name, error);
+	return m_p->f != nullptr;
+}
+
+bool File::GetIdentity(FileIdentity& identity, std::error_code& error) const {
+	if (m_p->archive != nullptr) { return m_p->archive->GetIdentity(identity, error); }
+	if (m_p->f == nullptr) {
+		error = std::make_error_code(std::errc::bad_file_descriptor);
+		return false;
+	}
+	return SysFileGetIdentity(*m_p->f, identity, error);
+}
+
+bool File::GetIdentity(const std::filesystem::path& name, FileIdentity& identity,
+                       std::error_code& error) {
+	File query;
+	return query.OpenMetadata(name, error) && query.GetIdentity(identity, error);
+}
+
+bool File::GetTimestamps(FileTimestamp (&times)[2], std::error_code& error) const {
+	if (m_p->archive != nullptr) {
+		error = std::make_error_code(std::errc::operation_not_supported);
+		return false;
+	}
+	if (m_p->f == nullptr) {
+		error = std::make_error_code(std::errc::bad_file_descriptor);
+		return false;
+	}
+	return SysFileGetTimestamps(*m_p->f, times, error);
+}
+
+bool File::SetTimestamps(const FileTimestamp* times, std::error_code& error) {
+	if (m_p->archive != nullptr) {
+		error = std::make_error_code(std::errc::operation_not_supported);
+		return false;
+	}
+	if (m_p->f == nullptr) {
+		error = std::make_error_code(std::errc::bad_file_descriptor);
+		return false;
+	}
+	return SysFileSetTimestamps(*m_p->f, times, error);
+}
+
+bool File::OpenInMem(void* buf, uint32_t buf_size) {
+	EXIT_IF(!IsInvalid());
+
+	m_p->f = SysFileOpen(static_cast<uint8_t*>(buf), buf_size);
+
+	if (SysFileIsError(*m_p->f)) {
+		Close();
+		return false;
+	}
+
+	return true;
+}
+
+bool File::CreateInMem() {
+	EXIT_IF(!IsInvalid());
+
+	m_p->f = SysFileCreate();
+
+	if (SysFileIsError(*m_p->f)) {
+		Close();
+		return false;
+	}
+
+	return true;
 }
 
 void File::Close() {
@@ -119,8 +264,11 @@ uint64_t File::Remaining() const {
 }
 
 uint64_t File::Size(const std::filesystem::path& name) {
-	const auto info = GetInfo(name);
-	return info ? info->size : 0;
+	if (IsArchivePath(name)) {
+		const auto info = GetArchiveInfo(name);
+		return info ? info->size : 0;
+	}
+	return SysFileSize(name);
 }
 
 std::optional<File::Info> File::GetInfo(const std::filesystem::path& name) {
@@ -129,32 +277,6 @@ std::optional<File::Info> File::GetInfo(const std::filesystem::path& name) {
 	}
 	Info info {};
 	return SysFileGetInfo(name, &info.is_file, &info.size) ? std::optional(info) : std::nullopt;
-}
-
-static std::optional<File::Times> QueryTimes(auto& target) {
-	SysFileTimeStruct access {};
-	SysFileTimeStruct write {};
-	SysFileGetLastAccessAndWriteTimeUtc(target, access, write);
-	if (access.is_invalid || write.is_invalid) {
-		return std::nullopt;
-	}
-	return File::Times {SysFileTimeToNs(access), SysFileTimeToNs(write)};
-}
-
-std::optional<File::Times> File::GetTimes(const std::filesystem::path& name) {
-	if (IsArchivePath(name)) {
-		return GetTimes(GetArchiveHostPath(name));
-	}
-	return QueryTimes(name);
-}
-
-std::optional<File::Times> File::GetTimes() const {
-	EXIT_IF(IsInvalid());
-
-	if (m_p->archive != nullptr) {
-		return GetTimes(m_file_name);
-	}
-	return QueryTimes(*m_p->f);
 }
 
 bool File::Seek(uint64_t offset) {
@@ -266,13 +388,19 @@ static std::filesystem::path WithoutTrailingSeparator(
 
 
 bool File::IsDirectoryExisting(const std::filesystem::path& path) {
-	const auto info = GetInfo(path);
-	return info && !info->is_file;
+	if (IsArchivePath(path)) {
+		const auto info = GetArchiveInfo(path);
+		return info && !info->is_file;
+	}
+	return SysFileIsDirectoryExisting(WithoutTrailingSeparator(path));
 }
 
 bool File::IsFileExisting(const std::filesystem::path& name) {
-	const auto info = GetInfo(name);
-	return info && info->is_file;
+	if (IsArchivePath(name)) {
+		const auto info = GetArchiveInfo(name);
+		return info && info->is_file;
+	}
+	return SysFileIsFileExisting(name);
 }
 
 bool File::CreateDirectory(const std::filesystem::path& path) {
@@ -280,6 +408,14 @@ bool File::CreateDirectory(const std::filesystem::path& path) {
 		return false;
 	}
     return SysFileCreateDirectory(
+        WithoutTrailingSeparator(path));
+}
+
+bool File::DeleteDirectory(const std::filesystem::path& path) {
+	if (IsArchivePath(path)) {
+		return false;
+	}
+    return SysFileDeleteDirectory(
         WithoutTrailingSeparator(path));
 }
 
@@ -301,6 +437,32 @@ bool File::CreateDirectories(const std::filesystem::path& path) {
         }
 
         if (!CreateDirectory(current_path)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool File::DeleteDirectories(const std::filesystem::path& path) {
+	if (IsArchivePath(path)) {
+		return false;
+	}
+    const auto normalized_path =
+        WithoutTrailingSeparator(path);
+
+    std::vector<std::filesystem::path> directories;
+    auto current_path = normalized_path.root_path();
+
+    for (const auto& component:
+         normalized_path.relative_path()) {
+        current_path /= component;
+        directories.push_back(current_path);
+    }
+
+    for (auto it = directories.rbegin();
+         it != directories.rend(); ++it) {
+        if (!DeleteDirectory(*it)) {
             return false;
         }
     }
@@ -343,6 +505,128 @@ std::vector<std::byte> File::ReadWholeBuffer() {
 	return buf;
 }
 
+DateTime File::GetLastAccessTimeUTC(const std::filesystem::path& name) {
+	if (IsArchivePath(name)) {
+		return GetLastAccessTimeUTC(GetArchiveHostPath(name));
+	}
+	SysTimeStruct t {};
+	SysFileToSystemTimeUtc(SysFileGetLastAccessTimeUtc(name), t);
+
+	if (t.is_invalid) {
+		return {};
+	}
+
+	return DateTime(Date(t.Year, t.Month, t.Day), Time(t.Hour, t.Minute, t.Second, t.Milliseconds));
+}
+
+DateTime File::GetLastWriteTimeUTC(const std::filesystem::path& name) {
+	if (IsArchivePath(name)) {
+		return GetLastWriteTimeUTC(GetArchiveHostPath(name));
+	}
+	SysTimeStruct t {};
+	SysFileToSystemTimeUtc(SysFileGetLastWriteTimeUtc(name), t);
+
+	if (t.is_invalid) {
+		return {};
+	}
+
+	return DateTime(Date(t.Year, t.Month, t.Day), Time(t.Hour, t.Minute, t.Second, t.Milliseconds));
+}
+
+void File::GetLastAccessAndWriteTimeUTC(const std::filesystem::path& name, DateTime* access,
+                                        DateTime* write) {
+	EXIT_IF(access == nullptr);
+	EXIT_IF(write == nullptr);
+	if (IsArchivePath(name)) {
+		GetLastAccessAndWriteTimeUTC(GetArchiveHostPath(name), access, write);
+		return;
+	}
+
+	SysTimeStruct     at {};
+	SysTimeStruct     wt {};
+	SysFileTimeStruct af {};
+	SysFileTimeStruct wf {};
+
+	SysFileGetLastAccessAndWriteTimeUtc(name, af, wf);
+
+	SysFileToSystemTimeUtc(af, at);
+	SysFileToSystemTimeUtc(wf, wt);
+
+	if (at.is_invalid || wt.is_invalid) {
+		*access = DateTime();
+		*write  = DateTime();
+	} else {
+		*access = DateTime(Date(at.Year, at.Month, at.Day),
+		                   Time(at.Hour, at.Minute, at.Second, at.Milliseconds));
+		*write  = DateTime(Date(wt.Year, wt.Month, wt.Day),
+		                   Time(wt.Hour, wt.Minute, wt.Second, wt.Milliseconds));
+	}
+}
+
+void File::GetLastAccessAndWriteTimeUTC(DateTime* access, DateTime* write) {
+	EXIT_IF(access == nullptr);
+	EXIT_IF(write == nullptr);
+
+	EXIT_IF(IsInvalid());
+
+	if (m_p->archive != nullptr) {
+		GetLastAccessAndWriteTimeUTC(m_file_name, access, write);
+		return;
+	}
+
+	if (m_p->f == nullptr) {
+		*access = DateTime();
+		*write  = DateTime();
+		return;
+	}
+
+	SysTimeStruct     at {};
+	SysTimeStruct     wt {};
+	SysFileTimeStruct af {};
+	SysFileTimeStruct wf {};
+
+	SysFileGetLastAccessAndWriteTimeUtc(*m_p->f, af, wf);
+
+	SysFileToSystemTimeUtc(af, at);
+	SysFileToSystemTimeUtc(wf, wt);
+
+	if (at.is_invalid || wt.is_invalid) {
+		*access = DateTime();
+		*write  = DateTime();
+	} else {
+		*access = DateTime(Date(at.Year, at.Month, at.Day),
+		                   Time(at.Hour, at.Minute, at.Second, at.Milliseconds));
+		*write  = DateTime(Date(wt.Year, wt.Month, wt.Day),
+		                   Time(wt.Hour, wt.Minute, wt.Second, wt.Milliseconds));
+	}
+}
+
+bool File::SetLastAccessTimeUTC(const std::filesystem::path& name, const DateTime& dt) {
+	if (IsArchivePath(name)) {
+		return false;
+	}
+	auto f = DateTimeToFileTimeUtc(dt);
+	return SysFileSetLastAccessTimeUtc(name, f);
+}
+
+bool File::SetLastWriteTimeUTC(const std::filesystem::path& name, const DateTime& dt) {
+	if (IsArchivePath(name)) {
+		return false;
+	}
+	auto f = DateTimeToFileTimeUtc(dt);
+	return SysFileSetLastWriteTimeUtc(name, f);
+}
+
+bool File::SetLastAccessAndWriteTimeUTC(const std::filesystem::path& name, const DateTime& access,
+                                        const DateTime& write) {
+	if (IsArchivePath(name)) {
+		return false;
+	}
+	auto af = DateTimeToFileTimeUtc(access);
+	auto wf = DateTimeToFileTimeUtc(write);
+	return SysFileSetLastAccessAndWriteTimeUtc(name, af, wf);
+}
+
 std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& path) {
 	if (IsArchivePath(path)) {
 		return GetArchiveDirEntries(path);
@@ -361,6 +645,15 @@ std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& pat
 	return ret;
 }
 
+bool File::CopyFile(const std::filesystem::path& src,
+                    const std::filesystem::path& dst) // @suppress("Member declaration not found")
+{
+	if (IsArchivePath(src) || IsArchivePath(dst)) {
+		return false;
+	}
+	return SysFileCopyFile(src, dst);
+}
+
 bool File::RenameFile(const std::filesystem::path& src,
                       const std::filesystem::path& dst) // @suppress("Member declaration not found")
 {
@@ -372,6 +665,13 @@ bool File::RenameFile(const std::filesystem::path& src,
 	}
 
 	return SysFileRenameFile(src, dst);
+}
+
+void File::RemoveReadonly(const std::filesystem::path& name) {
+	if (IsArchivePath(name)) {
+		return;
+	}
+	SysFileRemoveReadonly(name);
 }
 
 } // namespace Common

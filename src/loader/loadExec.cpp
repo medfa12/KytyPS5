@@ -1,6 +1,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "emulator.h"
+#include "loader/runtimeChildClient.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 
@@ -43,6 +44,7 @@ static std::wstring QuoteArgument(std::wstring_view argument) {
 
 int LoadExec(const char* path, const char* const argv[]) {
 	using namespace Libs::SystemService;
+	if (Loader::RuntimeChildHasStoreLease()) { return SYSTEM_SERVICE_ERROR_PARAMETER; }
 	if (path == nullptr || !std::string_view(path).starts_with("/app0/") ||
 	    !Common::File::IsFileExisting(Libs::LibKernel::FileSystem::GetRealFilename(path))) {
 		return SYSTEM_SERVICE_ERROR_PARAMETER;

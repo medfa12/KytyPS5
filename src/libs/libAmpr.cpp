@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -30,6 +31,13 @@
 #include <variant>
 #include <vector>
 
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+
 namespace Libs {
 
 namespace AprShared {
@@ -37,11 +45,6 @@ namespace AprShared {
 struct ResultBuffer {
 	int32_t  result      = 0;
 	uint32_t errorOffset = 0;
-};
-
-struct HostFile {
-	std::filesystem::path path;
-	uint64_t              size;
 };
 
 struct ResolvedPathInfo {
@@ -54,10 +57,11 @@ struct ResolvedPathInfo {
 
 static std::mutex                                        g_mutex;
 static uint32_t                                          g_next_submission_id = 1;
+static uint32_t                                          g_next_file_id       = 1;
 static std::unordered_map<uint32_t, bool>                g_submissions;
 static std::condition_variable                           g_submission_cv;
-// Resolved files by ID - 1; IDs are never released.
-static std::vector<HostFile>                             g_files;
+static std::unordered_map<uint32_t, std::filesystem::path>         g_files;
+static std::unordered_map<uint32_t, uint64_t>            g_file_sizes;
 static std::unordered_map<std::string, ResolvedPathInfo> g_resolved_paths;
 
 static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) {
@@ -115,20 +119,64 @@ static int ReadGuestCString(uint64_t addr, char* out, size_t out_size) {
 
 static bool TryGetHostPath(uint32_t file_id, std::filesystem::path* out) {
 	std::scoped_lock lock(g_mutex);
-	if (file_id == 0 || file_id > g_files.size()) {
+	const auto       it = g_files.find(file_id);
+	if (it == g_files.end()) {
 		return false;
 	}
-	*out = g_files[file_id - 1].path;
+	*out = it->second;
 	return true;
 }
 
 static bool TryGetHostFileSize(uint32_t file_id, uint64_t* out) {
 	std::scoped_lock lock(g_mutex);
-	if (file_id == 0 || file_id > g_files.size()) {
+	const auto       it = g_file_sizes.find(file_id);
+	if (it == g_file_sizes.end()) {
 		return false;
 	}
-	*out = g_files[file_id - 1].size;
+	*out = it->second;
 	return true;
+}
+
+static int GetHostPathStat(const std::filesystem::path& host_path, LibKernel::FileSystem::FileStat* st) {
+	if (st == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	const bool is_dir  = Common::File::IsDirectoryExisting(host_path);
+	const bool is_file = Common::File::IsFileExisting(host_path);
+	if (!is_dir && !is_file) {
+		return LibKernel::KERNEL_ERROR_ENOENT;
+	}
+
+	LibKernel::FileSystem::FileStat stat {};
+	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
+
+	auto at = Common::DateTime::FromSystemUTC();
+	auto wt = at;
+
+	if (is_dir) {
+		stat.st_size    = 0;
+		stat.st_blksize = 512;
+		stat.st_blocks  = 0;
+	} else {
+		stat.st_size    = static_cast<int64_t>(Common::File::Size(host_path));
+		stat.st_blksize = 512;
+		stat.st_blocks  = (stat.st_size + 511) / 512;
+
+		Common::File::GetLastAccessAndWriteTimeUTC(host_path, &at, &wt);
+	}
+
+	stat.st_atim.tv_sec  = static_cast<int64_t>(at.ToUnix());
+	stat.st_atim.tv_nsec = static_cast<int64_t>(
+	    (at.ToUnix() - static_cast<double>(stat.st_atim.tv_sec)) * 1000000000.0);
+	stat.st_mtim.tv_sec  = static_cast<int64_t>(wt.ToUnix());
+	stat.st_mtim.tv_nsec = static_cast<int64_t>(
+	    (wt.ToUnix() - static_cast<double>(stat.st_mtim.tv_sec)) * 1000000000.0);
+	stat.st_ctim     = stat.st_atim;
+	stat.st_birthtim = stat.st_mtim;
+	*st              = stat;
+
+	return OK;
 }
 
 // Mounts can appear after a failed lookup (e.g. additional content), so forget negative results.
@@ -160,13 +208,13 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
 		info.host_path       = real_path;
 
-		if (const auto host = Common::File::GetInfo(real_path); !host) {
-			info.result = LibKernel::KERNEL_ERROR_ENOENT;
-		} else if (host->is_file) {
-			info.file_size = host->size;
-		} else {
+		if (Common::File::IsDirectoryExisting(real_path)) {
 			info.is_dir    = true;
 			info.file_size = 0x10000;
+		} else if (Common::File::IsFileExisting(real_path)) {
+			info.file_size = Common::File::Size(real_path);
+		} else {
+			info.result = LibKernel::KERNEL_ERROR_ENOENT;
 		}
 
 		bool log_missing = false;
@@ -176,8 +224,14 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 			if (!inserted) {
 				info = it->second;
 			} else if (info.result == OK) {
-				g_files.push_back({info.host_path, info.is_dir ? 0 : info.file_size});
-				info.file_id = it->second.file_id = static_cast<uint32_t>(g_files.size());
+				// Allocate once under the cache lock; distinct paths can share a hash.
+				if (g_next_file_id == 0xffffffffu) {
+					info.result = it->second.result = LibKernel::KERNEL_ERROR_ENFILE;
+				} else {
+					info.file_id = it->second.file_id = g_next_file_id++;
+					g_files.emplace(info.file_id, info.host_path);
+					g_file_sizes.emplace(info.file_id, info.is_dir ? 0 : info.file_size);
+				}
 			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
@@ -355,7 +409,7 @@ static int KernelSyscallResult(int result) {
 	return -1;
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIds(const char* const* path_list, uint32_t count, uint32_t* ids,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ResolveFilepathsToIds(const char* const* path_list, uint32_t count, uint32_t* ids,
                                                uint32_t* error_index) {
 	PRINT_NAME();
 
@@ -363,7 +417,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsToIds(const char* const* path_list, uin
 	                                                         error_index, nullptr, nullptr));
 }
 
-static int KYTY_SYSV_ABI GetFileStat(uint32_t file_id, LibKernel::FileSystem::FileStat* st) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GetFileStat(uint32_t file_id, LibKernel::FileSystem::FileStat* st) {
 	PRINT_NAME();
 
 	if (st == nullptr) {
@@ -379,10 +433,10 @@ static int KYTY_SYSV_ABI GetFileStat(uint32_t file_id, LibKernel::FileSystem::Fi
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	return KernelSyscallResult(LibKernel::FileSystem::StatHostPath(host_path, st));
+	return KernelSyscallResult(AprShared::GetHostPathStat(host_path, st));
 }
 
-static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 	PRINT_NAME();
 
 	if (size == nullptr) {
@@ -392,16 +446,31 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
-	uint64_t cached_size = 0;
-	if (!AprShared::TryGetHostFileSize(file_id, &cached_size)) {
+	std::filesystem::path host_path;
+	if (!AprShared::TryGetHostPath(file_id, &host_path)) {
 		LOGF("\tAPR size failed for unknown file id: 0x%08" PRIx32 "\n", file_id);
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
 	}
-	*size = cached_size;
+
+	uint64_t cached_size = 0;
+	if (AprShared::TryGetHostFileSize(file_id, &cached_size)) {
+		*size = cached_size;
+		return OK;
+	}
+
+	if (Common::File::IsDirectoryExisting(host_path)) {
+		*size = 0;
+		return OK;
+	}
+	if (!Common::File::IsFileExisting(host_path)) {
+		return KernelSyscallResult(LibKernel::KERNEL_ERROR_ENOENT);
+	}
+
+	*size = Common::File::Size(host_path);
 	return OK;
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizes(const char* const* path_list, uint32_t count,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizes(const char* const* path_list, uint32_t count,
                                                            uint32_t* ids, uint64_t* sizes,
                                                            uint32_t* error_index) {
 	PRINT_NAME();
@@ -410,7 +479,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizes(const char* const* pa
 	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, error_index, nullptr, nullptr));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char* prefix, const char* const* path_list,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char* prefix, const char* const* path_list,
                                                          uint32_t count, uint32_t* ids,
                                                          uint32_t* error_index) {
 	PRINT_NAME();
@@ -419,7 +488,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char* prefix, con
 	                                                         error_index, prefix, nullptr));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizes(const char* prefix,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizes(const char* prefix,
                                                                      const char* const* path_list,
                                                                      uint32_t count, uint32_t* ids,
                                                                      uint64_t* sizes,
@@ -430,7 +499,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizes(const char*
 	                                                         error_index, prefix, nullptr));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIdsForEach(const char* const* path_list, uint32_t count,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ResolveFilepathsToIdsForEach(const char* const* path_list, uint32_t count,
                                                       uint32_t* ids, int* results) {
 	PRINT_NAME();
 
@@ -438,7 +507,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsToIdsForEach(const char* const* path_li
 	    AprShared::ResolvePathsCommon(path_list, count, ids, nullptr, nullptr, nullptr, results));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizesForEach(const char* const* path_list,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizesForEach(const char* const* path_list,
                                                                   uint32_t count, uint32_t* ids,
                                                                   uint64_t* sizes, int* results) {
 	PRINT_NAME();
@@ -447,7 +516,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizesForEach(const char* co
 	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, nullptr, nullptr, results));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsForEach(const char* prefix,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsForEach(const char* prefix,
                                                                 const char* const* path_list,
                                                                 uint32_t count, uint32_t* ids,
                                                                 int* results) {
@@ -457,7 +526,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsForEach(const char* pref
 	                                                         nullptr, prefix, results));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizesForEach(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizesForEach(
     const char* prefix, const char* const* path_list, uint32_t count, uint32_t* ids, uint64_t* sizes,
     int* results) {
 	PRINT_NAME();
@@ -466,7 +535,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizesForEach(
 	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, nullptr, prefix, results));
 }
 
-static int KYTY_SYSV_ABI SubmitCommandBufferAndGetResult(void* command_buffer, uint32_t priority,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SubmitCommandBufferAndGetResult(void* command_buffer, uint32_t priority,
                                                          void*     result,
                                                          uint32_t* out_submission_id) {
 	PRINT_NAME();
@@ -475,14 +544,14 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetResult(void* command_buffer, u
 	    out_submission_id));
 }
 
-static int KYTY_SYSV_ABI SubmitCommandBuffer(void* command_buffer, uint32_t priority) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SubmitCommandBuffer(void* command_buffer, uint32_t priority) {
 	PRINT_NAME();
 	return KernelSyscallResult(LibAmpr::Ampr::QueueCommandBuffer(
 	    LibAmpr::Ampr::Engine::Apr, reinterpret_cast<uint64_t>(command_buffer), 0, priority,
 	    nullptr, nullptr));
 }
 
-static int KYTY_SYSV_ABI SubmitCommandBufferAndGetId(void* command_buffer, uint32_t priority,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SubmitCommandBufferAndGetId(void* command_buffer, uint32_t priority,
                                                      uint32_t* out_submission_id) {
 	PRINT_NAME();
 	if (out_submission_id == nullptr) {
@@ -493,7 +562,7 @@ static int KYTY_SYSV_ABI SubmitCommandBufferAndGetId(void* command_buffer, uint3
 	    nullptr, out_submission_id));
 }
 
-static int KYTY_SYSV_ABI WaitCommandBuffer(uint32_t submission_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI WaitCommandBuffer(uint32_t submission_id) {
 	PRINT_NAME();
 	return KernelSyscallResult(
 	    AprShared::CompleteSubmission(submission_id) ? OK : LibKernel::KERNEL_ERROR_ESRCH);
@@ -1041,14 +1110,14 @@ static bool ValidateAmmMapArgs(uint64_t va, uint64_t size) {
 	       (size & (AMM_PAGE_SIZE - 1u)) == 0 && va + size >= va;
 }
 
-static int KYTY_SYSV_ABI AmmCommandBufferConstructor(void* command_buffer) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmCommandBufferConstructor(void* command_buffer) {
 	PRINT_NAME();
 
 	(void)command_buffer;
 	return OK;
 }
 
-static int KYTY_SYSV_ABI AmmCommandBufferDestructor(void* command_buffer) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmCommandBufferDestructor(void* command_buffer) {
 	PRINT_NAME();
 
 	(void)command_buffer;
@@ -1394,7 +1463,7 @@ static int ReadHostFileToGuest(const std::filesystem::path& host_path, uint64_t 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI CommandBufferConstructor(void* command_buffer) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferConstructor(void* command_buffer) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -1406,7 +1475,7 @@ static int KYTY_SYSV_ABI CommandBufferConstructor(void* command_buffer) {
 	           : LibKernel::KERNEL_ERROR_EFAULT;
 }
 
-static int KYTY_SYSV_ABI AprCommandBufferConstructor(void* command_buffer, void* reserved_state0,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AprCommandBufferConstructor(void* command_buffer, void* reserved_state0,
                                                      void* reserved_state1) {
 	PRINT_NAME();
 
@@ -1421,14 +1490,14 @@ static int KYTY_SYSV_ABI AprCommandBufferConstructor(void* command_buffer, void*
 	           : LibKernel::KERNEL_ERROR_EFAULT;
 }
 
-static int KYTY_SYSV_ABI AprCommandBufferDestructor(void* command_buffer) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AprCommandBufferDestructor(void* command_buffer) {
 	PRINT_NAME();
 
 	(void)command_buffer;
 	return OK;
 }
 
-static int KYTY_SYSV_ABI CommandBufferDestructor(void* command_buffer) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferDestructor(void* command_buffer) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -1441,7 +1510,7 @@ static int KYTY_SYSV_ABI CommandBufferDestructor(void* command_buffer) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI CommandBufferSetBuffer(void* command_buffer, void* buffer, uint32_t size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferSetBuffer(void* command_buffer, void* buffer, uint32_t size) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -1472,7 +1541,7 @@ static int KYTY_SYSV_ABI CommandBufferSetBuffer(void* command_buffer, void* buff
 	return OK;
 }
 
-static int KYTY_SYSV_ABI CommandBufferReset(void* command_buffer) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferReset(void* command_buffer) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -1496,7 +1565,7 @@ static int KYTY_SYSV_ABI CommandBufferReset(void* command_buffer) {
 	return OK;
 }
 
-static void* KYTY_SYSV_ABI CommandBufferClearBuffer(void* command_buffer) {
+static void* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferClearBuffer(void* command_buffer) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -1524,7 +1593,7 @@ static void* KYTY_SYSV_ABI CommandBufferClearBuffer(void* command_buffer) {
 	return reinterpret_cast<void*>(buffer);
 }
 
-static int KYTY_SYSV_ABI AprCommandBufferReadFile(void*    command_buffer, uint64_t, uint64_t,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AprCommandBufferReadFile(void*    command_buffer, uint64_t, uint64_t,
                                                   uint32_t file_id, void* destination,
                                                   uint64_t size, uint64_t file_offset) {
 	PRINT_NAME();
@@ -1550,7 +1619,7 @@ static uint64_t MarkerCommandSize(const char* msg, bool with_color) {
 	return AlignUp4((with_color ? 8u : 4u) + msg_size);
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeReadFile(uint64_t, uint64_t destination,
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeReadFile(uint64_t, uint64_t destination,
                                                          uint64_t size, uint64_t file_offset) {
 	PRINT_NAME();
 
@@ -1559,7 +1628,7 @@ static uint64_t KYTY_SYSV_ABI MeasureCommandSizeReadFile(uint64_t, uint64_t dest
 	           : KernelErrorU64(LibKernel::KERNEL_ERROR_EINVAL);
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteKernelEventQueue(uint64_t, uint64_t, uint64_t,
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeWriteKernelEventQueue(uint64_t, uint64_t, uint64_t,
                                                                       uint64_t, uint64_t,
                                                                       uint64_t) {
 	PRINT_NAME();
@@ -1567,14 +1636,14 @@ static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteKernelEventQueue(uint64_t, 
 	return KERNEL_EVENT_RECORD_SIZE;
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeFixed32(uint64_t, uint64_t, uint64_t, uint64_t,
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeFixed32(uint64_t, uint64_t, uint64_t, uint64_t,
                                                         uint64_t, uint64_t) {
 	PRINT_NAME();
 
 	return 0x20;
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteAddress(volatile uint64_t*, uint64_t value) {
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeWriteAddress(volatile uint64_t*, uint64_t value) {
 	PRINT_NAME();
 
 	return WriteAddressRecordSize(value);
@@ -1601,34 +1670,34 @@ MeasureCommandSizeWriteAddressFromCounterPairOnCompletion(volatile uint64_t*, ui
 	return 0x20;
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeWriteCounterOnCompletion(uint8_t, uint8_t, uint64_t,
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeWriteCounterOnCompletion(uint8_t, uint8_t, uint64_t,
                                                                          uint8_t) {
 	PRINT_NAME();
 
 	return 0x20;
 }
 
-static int64_t KYTY_SYSV_ABI MeasureAmmCommandSizeMap(uint64_t, uint64_t, int32_t, int32_t) {
+static int64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureAmmCommandSizeMap(uint64_t, uint64_t, int32_t, int32_t) {
 	PRINT_NAME();
 
 	return AMM_MAP_RECORD_SIZE;
 }
 
-static int64_t KYTY_SYSV_ABI MeasureAmmCommandSizeMapWithGpuMaskId(uint64_t, uint64_t, int32_t,
+static int64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureAmmCommandSizeMapWithGpuMaskId(uint64_t, uint64_t, int32_t,
                                                                    int32_t, uint8_t) {
 	PRINT_NAME();
 
 	return AMM_MAP_RECORD_SIZE;
 }
 
-static int64_t KYTY_SYSV_ABI MeasureAmmCommandSizeMapDirect(uint64_t, uint64_t, uint64_t, int32_t,
+static int64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureAmmCommandSizeMapDirect(uint64_t, uint64_t, uint64_t, int32_t,
                                                             int32_t) {
 	PRINT_NAME();
 
 	return AMM_MAP_DIRECT_RECORD_SIZE;
 }
 
-static int64_t KYTY_SYSV_ABI MeasureAmmCommandSizeMapDirectWithGpuMaskId(uint64_t, uint64_t,
+static int64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureAmmCommandSizeMapDirectWithGpuMaskId(uint64_t, uint64_t,
                                                                          uint64_t, int32_t, int32_t,
                                                                          uint8_t) {
 	PRINT_NAME();
@@ -1636,13 +1705,13 @@ static int64_t KYTY_SYSV_ABI MeasureAmmCommandSizeMapDirectWithGpuMaskId(uint64_
 	return AMM_MAP_DIRECT_RECORD_SIZE;
 }
 
-static int64_t KYTY_SYSV_ABI MeasureAmmCommandSizeUnmap(uint64_t, uint64_t) {
+static int64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureAmmCommandSizeUnmap(uint64_t, uint64_t) {
 	PRINT_NAME();
 
 	return AMM_UNMAP_RECORD_SIZE;
 }
 
-static int64_t KYTY_SYSV_ABI MeasureAprCommandSizeMapBegin(uint64_t va, uint64_t size, int32_t,
+static int64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureAprCommandSizeMapBegin(uint64_t va, uint64_t size, int32_t,
                                                            int32_t) {
 	PRINT_NAME();
 
@@ -1650,7 +1719,7 @@ static int64_t KYTY_SYSV_ABI MeasureAprCommandSizeMapBegin(uint64_t va, uint64_t
 	                                    : LibKernel::KERNEL_ERROR_EINVAL;
 }
 
-static int64_t KYTY_SYSV_ABI MeasureAprCommandSizeMapDirectBegin(uint64_t va, uint64_t dmem_offset,
+static int64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureAprCommandSizeMapDirectBegin(uint64_t va, uint64_t dmem_offset,
                                                                  uint64_t size, int32_t, int32_t) {
 	PRINT_NAME();
 
@@ -1659,20 +1728,20 @@ static int64_t KYTY_SYSV_ABI MeasureAprCommandSizeMapDirectBegin(uint64_t va, ui
 	           : LibKernel::KERNEL_ERROR_EINVAL;
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeNop(uint32_t num_u32) {
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeNop(uint32_t num_u32) {
 	PRINT_NAME();
 
 	return num_u32 == 0 ? sizeof(uint32_t)
 	                    : AlignUp4(static_cast<uint64_t>(num_u32) * sizeof(uint32_t));
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeNopWithData(uint32_t num_u32, const uint32_t*) {
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeNopWithData(uint32_t num_u32, const uint32_t*) {
 	PRINT_NAME();
 
 	return AlignUp4((static_cast<uint64_t>(num_u32) + 1u) * sizeof(uint32_t));
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeReadFileGather(uint64_t size,
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeReadFileGather(uint64_t size,
                                                                uint64_t file_offset) {
 	PRINT_NAME();
 
@@ -1681,7 +1750,7 @@ static uint64_t KYTY_SYSV_ABI MeasureCommandSizeReadFileGather(uint64_t size,
 	           : KernelErrorU64(LibKernel::KERNEL_ERROR_EINVAL);
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeReadFileScatter(uint64_t destination,
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeReadFileScatter(uint64_t destination,
                                                                 uint64_t size) {
 	PRINT_NAME();
 
@@ -1689,7 +1758,7 @@ static uint64_t KYTY_SYSV_ABI MeasureCommandSizeReadFileScatter(uint64_t destina
 	                                              : KernelErrorU64(LibKernel::KERNEL_ERROR_EINVAL);
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeReadFileGatherScatter(uint64_t destination,
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeReadFileGatherScatter(uint64_t destination,
                                                                       uint64_t size,
                                                                       uint64_t file_offset) {
 	PRINT_NAME();
@@ -1699,25 +1768,25 @@ static uint64_t KYTY_SYSV_ABI MeasureCommandSizeReadFileGatherScatter(uint64_t d
 	           : KernelErrorU64(LibKernel::KERNEL_ERROR_EINVAL);
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeMarkerWithColor(const char* msg, uint32_t) {
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeMarkerWithColor(const char* msg, uint32_t) {
 	PRINT_NAME();
 
 	return MarkerCommandSize(msg, true);
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizeMarker(const char* msg) {
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizeMarker(const char* msg) {
 	PRINT_NAME();
 
 	return MarkerCommandSize(msg, false);
 }
 
-static uint64_t KYTY_SYSV_ABI MeasureCommandSizePopMarker() {
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MeasureCommandSizePopMarker() {
 	PRINT_NAME();
 
 	return sizeof(uint32_t);
 }
 
-static uint64_t KYTY_SYSV_ABI CommandBufferGetSize(void* command_buffer) {
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferGetSize(void* command_buffer) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -1730,7 +1799,7 @@ static uint64_t KYTY_SYSV_ABI CommandBufferGetSize(void* command_buffer) {
 	return size;
 }
 
-static uint64_t KYTY_SYSV_ABI CommandBufferGetCurrentOffset(void* command_buffer) {
+static uint64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferGetCurrentOffset(void* command_buffer) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -1743,7 +1812,7 @@ static uint64_t KYTY_SYSV_ABI CommandBufferGetCurrentOffset(void* command_buffer
 	return offset;
 }
 
-static int KYTY_SYSV_ABI CommandBufferGetType(void* command_buffer) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferGetType(void* command_buffer) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -1756,7 +1825,7 @@ static int KYTY_SYSV_ABI CommandBufferGetType(void* command_buffer) {
 	return static_cast<int>(type);
 }
 
-static void* KYTY_SYSV_ABI CommandBufferGetBufferBaseAddress(void* command_buffer) {
+static void* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferGetBufferBaseAddress(void* command_buffer) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -1769,7 +1838,7 @@ static void* KYTY_SYSV_ABI CommandBufferGetBufferBaseAddress(void* command_buffe
 	return reinterpret_cast<void*>(buffer);
 }
 
-static uint32_t KYTY_SYSV_ABI CommandBufferGetNumCommands(void* command_buffer) {
+static uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferGetNumCommands(void* command_buffer) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -1792,7 +1861,7 @@ static int AppendNoOpCommand(void* command_buffer, uint64_t size) {
 	           : LibKernel::KERNEL_ERROR_EFAULT;
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteKernelEventQueue(void* command_buffer, uint64_t eq,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteKernelEventQueue(void* command_buffer, uint64_t eq,
                                                             uint64_t id, uint64_t data, uint64_t,
                                                             uint64_t) {
 	PRINT_NAME();
@@ -1807,7 +1876,7 @@ static int KYTY_SYSV_ABI CommandBufferWriteKernelEventQueue(void* command_buffer
 	           : LibKernel::KERNEL_ERROR_EFAULT;
 }
 
-static int KYTY_SYSV_ABI CommandBufferNop(void* command_buffer, uint32_t num_u32) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferNop(void* command_buffer, uint32_t num_u32) {
 	PRINT_NAME();
 
 	if (num_u32 == 0 || num_u32 > 16) {
@@ -1816,7 +1885,7 @@ static int KYTY_SYSV_ABI CommandBufferNop(void* command_buffer, uint32_t num_u32
 	return AppendNoOpCommand(command_buffer, static_cast<uint64_t>(num_u32) * sizeof(uint32_t));
 }
 
-static int KYTY_SYSV_ABI CommandBufferNopWithData(void* command_buffer, uint32_t num_u32,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferNopWithData(void* command_buffer, uint32_t num_u32,
                                                   const uint32_t*) {
 	PRINT_NAME();
 
@@ -1827,53 +1896,53 @@ static int KYTY_SYSV_ABI CommandBufferNopWithData(void* command_buffer, uint32_t
 	                         (static_cast<uint64_t>(num_u32) + 1u) * sizeof(uint32_t));
 }
 
-static int KYTY_SYSV_ABI CommandBufferConstructNop(void*    command_buffer, uint32_t, const void*,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferConstructNop(void*    command_buffer, uint32_t, const void*,
                                                    uint32_t bytes, const uint32_t*) {
 	PRINT_NAME();
 
 	return AppendNoOpCommand(command_buffer, sizeof(uint32_t) + bytes);
 }
 
-static int KYTY_SYSV_ABI CommandBufferConstructMarker(void*       command_buffer, uint32_t,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferConstructMarker(void*       command_buffer, uint32_t,
                                                       const char* msg, const uint32_t* color) {
 	PRINT_NAME();
 
 	return AppendNoOpCommand(command_buffer, MarkerCommandSize(msg, color != nullptr));
 }
 
-static int KYTY_SYSV_ABI CommandBufferSetMarker(void* command_buffer, const char* msg) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferSetMarker(void* command_buffer, const char* msg) {
 	PRINT_NAME();
 
 	return AppendNoOpCommand(command_buffer, MarkerCommandSize(msg, false));
 }
 
-static int KYTY_SYSV_ABI CommandBufferSetMarkerWithColor(void* command_buffer, const char* msg,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferSetMarkerWithColor(void* command_buffer, const char* msg,
                                                          uint32_t) {
 	PRINT_NAME();
 
 	return AppendNoOpCommand(command_buffer, MarkerCommandSize(msg, true));
 }
 
-static int KYTY_SYSV_ABI CommandBufferPushMarker(void* command_buffer, const char* msg) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferPushMarker(void* command_buffer, const char* msg) {
 	PRINT_NAME();
 
 	return AppendNoOpCommand(command_buffer, MarkerCommandSize(msg, false));
 }
 
-static int KYTY_SYSV_ABI CommandBufferPushMarkerWithColor(void* command_buffer, const char* msg,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferPushMarkerWithColor(void* command_buffer, const char* msg,
                                                           uint32_t) {
 	PRINT_NAME();
 
 	return AppendNoOpCommand(command_buffer, MarkerCommandSize(msg, true));
 }
 
-static int KYTY_SYSV_ABI CommandBufferPopMarker(void* command_buffer) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferPopMarker(void* command_buffer) {
 	PRINT_NAME();
 
 	return AppendNoOpCommand(command_buffer, sizeof(uint32_t));
 }
 
-static int KYTY_SYSV_ABI CommandBufferWaitOnAddress(void*              command_buffer,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWaitOnAddress(void*              command_buffer,
                                                     volatile uint64_t* address, uint64_t value,
                                                     uint8_t compare, uint8_t) {
 	PRINT_NAME();
@@ -1889,7 +1958,7 @@ static int KYTY_SYSV_ABI CommandBufferWaitOnAddress(void*              command_b
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI CommandBufferWaitOnCounter(void* command_buffer, uint8_t index,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWaitOnCounter(void* command_buffer, uint8_t index,
                                                     uint8_t access, uint64_t value, uint8_t compare,
                                                     uint8_t mask_op, uint64_t, uint8_t flush) {
 	PRINT_NAME();
@@ -1919,14 +1988,14 @@ static int AppendWriteAddressCommand(void* command_buffer, volatile uint64_t* ad
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteAddress(void* command_buffer, volatile uint64_t* address,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteAddress(void* command_buffer, volatile uint64_t* address,
                                                    uint64_t value, uint32_t) {
 	PRINT_NAME();
 
 	return AppendWriteAddressCommand(command_buffer, address, value, WriteAddressRecordSize(value));
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*              command_buffer,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*              command_buffer,
                                                                volatile uint64_t* address,
                                                                uint64_t           value) {
 	PRINT_NAME();
@@ -1934,7 +2003,7 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*            
 	return AppendWriteAddressCommand(command_buffer, address, value, WriteAddressRecordSize(value));
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t index,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t index,
                                                    uint8_t access, uint64_t value,
                                                    uint8_t operation, uint32_t mode) {
 	PRINT_NAME();
@@ -1951,14 +2020,14 @@ static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteCounterOnCompletion(void* command_buffer, uint8_t,
                                                                uint8_t, uint64_t, uint8_t) {
 	PRINT_NAME();
 
 	return AppendNoOpCommand(command_buffer, 0x20);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*              command_buffer,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*              command_buffer,
                                                                   volatile uint64_t* address,
                                                                   uint32_t) {
 	PRINT_NAME();
@@ -1966,14 +2035,14 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounter(void*         
 	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounterOnCompletion(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteAddressFromTimeCounterOnCompletion(
     void* command_buffer, volatile uint64_t* address) {
 	PRINT_NAME();
 
 	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounter(void*              command_buffer,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteAddressFromCounter(void*              command_buffer,
                                                               volatile uint64_t* address, uint8_t,
                                                               uint32_t) {
 	PRINT_NAME();
@@ -1981,14 +2050,14 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounter(void*             
 	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterOnCompletion(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterOnCompletion(
     void* command_buffer, volatile uint64_t* address, uint8_t) {
 	PRINT_NAME();
 
 	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPair(void*              command_buffer,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPair(void*              command_buffer,
                                                                   volatile uint64_t* address,
                                                                   uint8_t, uint32_t) {
 	PRINT_NAME();
@@ -1996,14 +2065,14 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPair(void*         
 	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
-static int KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPairOnCompletion(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CommandBufferWriteAddressFromCounterPairOnCompletion(
     void* command_buffer, volatile uint64_t* address, uint8_t) {
 	PRINT_NAME();
 
 	return AppendWriteAddressCommand(command_buffer, address, uint64_t {0}, 0x20);
 }
 
-static int KYTY_SYSV_ABI AprCommandBufferReadFileGather(void*    command_buffer, uint64_t, uint64_t,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AprCommandBufferReadFileGather(void*    command_buffer, uint64_t, uint64_t,
                                                         uint64_t size, uint64_t file_offset) {
 	PRINT_NAME();
 
@@ -2029,7 +2098,7 @@ static int KYTY_SYSV_ABI AprCommandBufferReadFileGather(void*    command_buffer,
 	           : LibKernel::KERNEL_ERROR_EFAULT;
 }
 
-static int KYTY_SYSV_ABI AprCommandBufferReadFileScatter(void* command_buffer, uint64_t, uint64_t,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AprCommandBufferReadFileScatter(void* command_buffer, uint64_t, uint64_t,
                                                          void* destination, uint64_t size) {
 	PRINT_NAME();
 
@@ -2054,7 +2123,7 @@ static int KYTY_SYSV_ABI AprCommandBufferReadFileScatter(void* command_buffer, u
 	           : LibKernel::KERNEL_ERROR_EFAULT;
 }
 
-static int KYTY_SYSV_ABI AprCommandBufferReadFileGatherScatter(void* command_buffer, uint64_t,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AprCommandBufferReadFileGatherScatter(void* command_buffer, uint64_t,
                                                                uint64_t, void* destination,
                                                                uint64_t size,
                                                                uint64_t file_offset) {
@@ -2082,7 +2151,7 @@ static int KYTY_SYSV_ABI AprCommandBufferReadFileGatherScatter(void* command_buf
 	           : LibKernel::KERNEL_ERROR_EFAULT;
 }
 
-static int KYTY_SYSV_ABI AprCommandBufferResetGatherScatterState(void* command_buffer, uint64_t,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AprCommandBufferResetGatherScatterState(void* command_buffer, uint64_t,
                                                                  uint64_t) {
 	PRINT_NAME();
 
@@ -2107,7 +2176,7 @@ static int KYTY_SYSV_ABI AprCommandBufferResetGatherScatterState(void* command_b
 	return OK;
 }
 
-static int KYTY_SYSV_ABI AprCommandBufferMapBegin(void* command_buffer, uint64_t va, uint64_t size,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AprCommandBufferMapBegin(void* command_buffer, uint64_t va, uint64_t size,
                                                   int32_t, int32_t) {
 	PRINT_NAME();
 
@@ -2124,7 +2193,7 @@ static int KYTY_SYSV_ABI AprCommandBufferMapBegin(void* command_buffer, uint64_t
 	return OK;
 }
 
-static int KYTY_SYSV_ABI AprCommandBufferMapDirectBegin(void* command_buffer, uint64_t va,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AprCommandBufferMapDirectBegin(void* command_buffer, uint64_t va,
                                                         uint64_t dmem_offset, uint64_t size,
                                                         int32_t, int32_t) {
 	PRINT_NAME();
@@ -2143,7 +2212,7 @@ static int KYTY_SYSV_ABI AprCommandBufferMapDirectBegin(void* command_buffer, ui
 	return OK;
 }
 
-static int KYTY_SYSV_ABI AprCommandBufferMapEnd(void* command_buffer) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AprCommandBufferMapEnd(void* command_buffer) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr) {
@@ -2167,7 +2236,7 @@ static int KYTY_SYSV_ABI AprCommandBufferMapEnd(void* command_buffer) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI AmmCommandBufferMap(void* command_buffer, uint64_t va, uint64_t size,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmCommandBufferMap(void* command_buffer, uint64_t va, uint64_t size,
                                              int32_t type, int32_t prot) {
 	PRINT_NAME();
 
@@ -2188,7 +2257,7 @@ static int KYTY_SYSV_ABI AmmCommandBufferMap(void* command_buffer, uint64_t va, 
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI AmmCommandBufferMapWithGpuMaskId(void* command_buffer, uint64_t va,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmCommandBufferMapWithGpuMaskId(void* command_buffer, uint64_t va,
                                                           uint64_t size, int32_t type, int32_t prot,
                                                           uint8_t gpu_mask_id) {
 	PRINT_NAME();
@@ -2211,7 +2280,7 @@ static int KYTY_SYSV_ABI AmmCommandBufferMapWithGpuMaskId(void* command_buffer, 
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI AmmCommandBufferMapDirect(void* command_buffer, uint64_t va,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmCommandBufferMapDirect(void* command_buffer, uint64_t va,
                                                    uint64_t dmem_offset, uint64_t size,
                                                    int32_t type, int32_t prot) {
 	PRINT_NAME();
@@ -2235,7 +2304,7 @@ static int KYTY_SYSV_ABI AmmCommandBufferMapDirect(void* command_buffer, uint64_
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI AmmCommandBufferMapDirectWithGpuMaskId(void* command_buffer, uint64_t va,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmCommandBufferMapDirectWithGpuMaskId(void* command_buffer, uint64_t va,
                                                                 uint64_t dmem_offset, uint64_t size,
                                                                 int32_t type, int32_t prot,
                                                                 uint8_t gpu_mask_id) {
@@ -2261,7 +2330,7 @@ static int KYTY_SYSV_ABI AmmCommandBufferMapDirectWithGpuMaskId(void* command_bu
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI AmmCommandBufferUnmap(void* command_buffer, uint64_t va, uint64_t size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmCommandBufferUnmap(void* command_buffer, uint64_t va, uint64_t size) {
 	PRINT_NAME();
 
 	if (command_buffer == nullptr || !ValidateAmmMapArgs(va, size)) {
@@ -2279,7 +2348,7 @@ static int KYTY_SYSV_ABI AmmCommandBufferUnmap(void* command_buffer, uint64_t va
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
-static int KYTY_SYSV_ABI AmmGiveDirectMemory(int64_t search_start, int64_t search_end,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmGiveDirectMemory(int64_t search_start, int64_t search_end,
                                              uint64_t size, uint64_t align, int32_t usage,
                                              int64_t* dmem_offset) {
 	PRINT_NAME();
@@ -2295,7 +2364,7 @@ static int KYTY_SYSV_ABI AmmGiveDirectMemory(int64_t search_start, int64_t searc
 	                                               usage == AMM_USAGE_AUTO);
 }
 
-static void KYTY_SYSV_ABI AmmGetVirtualAddressRanges(uint64_t* va_start, uint64_t* va_end,
+static void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmGetVirtualAddressRanges(uint64_t* va_start, uint64_t* va_end,
                                                      uint64_t* multimap_va_start,
                                                      uint64_t* multimap_va_end) {
 	PRINT_NAME();
@@ -2315,7 +2384,7 @@ static void KYTY_SYSV_ABI AmmGetVirtualAddressRanges(uint64_t* va_start, uint64_
 	}
 }
 
-static int KYTY_SYSV_ABI AmmGetUsageStatsData(AmmUsageStatsData* stats) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmGetUsageStatsData(AmmUsageStatsData* stats) {
 	PRINT_NAME();
 
 	if (stats == nullptr || stats->size_in_bytes > sizeof(AmmUsageStatsData)) {
@@ -2332,20 +2401,20 @@ static int KYTY_SYSV_ABI AmmGetUsageStatsData(AmmUsageStatsData* stats) {
 	           : LibKernel::KERNEL_ERROR_EFAULT;
 }
 
-static int KYTY_SYSV_ABI AmmSetPageTablePoolOccupancyNotificationThreshold(uint32_t) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmSetPageTablePoolOccupancyNotificationThreshold(uint32_t) {
 	PRINT_NAME();
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI AmmSubmitCommandBuffer(void* command_buffer_base, uint32_t bytes,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmSubmitCommandBuffer(void* command_buffer_base, uint32_t bytes,
                                                 uint32_t priority) {
 	PRINT_NAME();
 	return QueueCommandBuffer(Engine::Amm, reinterpret_cast<uint64_t>(command_buffer_base), bytes,
 	                          priority, nullptr, nullptr);
 }
 
-static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetId(void* command_buffer_base, uint32_t bytes,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetId(void* command_buffer_base, uint32_t bytes,
                                                         uint32_t  priority,
                                                         uint32_t* out_submission_id) {
 	PRINT_NAME();
@@ -2356,7 +2425,7 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetId(void* command_buffer_bas
 	                          priority, nullptr, out_submission_id);
 }
 
-static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetResult(void*    command_buffer_base,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetResult(void*    command_buffer_base,
                                                             uint32_t bytes, uint32_t priority,
                                                             void*     result,
                                                             uint32_t* out_submission_id) {
@@ -2365,7 +2434,7 @@ static int KYTY_SYSV_ABI AmmSubmitCommandBufferAndGetResult(void*    command_buf
 	                          priority, result, out_submission_id);
 }
 
-static int KYTY_SYSV_ABI AmmWaitCommandBufferCompletion(uint32_t submission_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AmmWaitCommandBufferCompletion(uint32_t submission_id) {
 	PRINT_NAME();
 	return AprShared::CompleteSubmission(submission_id) ? OK : LibKernel::KERNEL_ERROR_ESRCH;
 }

@@ -477,13 +477,13 @@ static void audioout2_close_audio_handle(int audio_handle) {
 	}
 }
 
-int KYTY_SYSV_ABI AudioOut2Initialize() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2Initialize() {
 	PRINT_NAME();
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2ContextResetParam(AudioOut2ContextParam* params) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2ContextResetParam(AudioOut2ContextParam* params) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
@@ -502,7 +502,7 @@ static bool audioout2_valid_context_capacity(const AudioOut2ContextParam& params
 	       params.guarantee_object_ports <= params.max_object_ports;
 }
 
-int KYTY_SYSV_ABI AudioOut2ContextQueryMemory(const AudioOut2ContextParam* params,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2ContextQueryMemory(const AudioOut2ContextParam* params,
                                               size_t*                      memory_size) {
 	PRINT_NAME();
 
@@ -520,7 +520,7 @@ int KYTY_SYSV_ABI AudioOut2ContextQueryMemory(const AudioOut2ContextParam* param
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, void* buffer,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, void* buffer,
                                          size_t buffer_size, AudioOut2ContextHandle* ctx) {
 	PRINT_NAME();
 
@@ -570,7 +570,8 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 
 	return OK;
 }
-int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	PRINT_NAME();
 	LOGF("\t ctx = 0x%016" PRIx64 "\n", ctx);
 
@@ -603,7 +604,7 @@ int KYTY_SYSV_ABI AudioOut2ContextDestroy(AudioOut2ContextHandle ctx) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
                                                 const AudioOut2Attribute* attributes,
                                                 uint32_t                  num) {
 	PRINT_NAME();
@@ -612,7 +613,7 @@ int KYTY_SYSV_ABI AudioOut2ContextSetAttributes(AudioOut2ContextHandle    ctx,
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 	g_audioout2_state_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
 		audioout2_update_context_locked(state);
@@ -625,7 +626,7 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
 	uint32_t sleep_micros = audioout2_grain_micros(512);
 
 	for (;;) {
@@ -661,29 +662,33 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 	}
 }
 
-int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint32_t* queue_level,
                                                 uint32_t* available_queues) {
-	if (queue_level == nullptr && available_queues == nullptr) {
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
-	}
-	Common::LockGuard lock(g_audioout2_state_mutex);
-	auto*             state = audioout2_find_context_locked(ctx);
-	if (state == nullptr) {
-		return AUDIO_OUT2_ERROR_INVALID_PARAM;
-	}
-	audioout2_update_context_locked(state);
 	if (queue_level != nullptr) {
-		*queue_level = state->queued;
+		*queue_level = 0;
 	}
 	if (available_queues != nullptr) {
-		*available_queues = state->queue_depth - state->queued;
+		*available_queues = 4;
 	}
-	return state->queued < state->queue_depth ? OK : AUDIO_OUT2_ERROR_NOT_READY;
+
+	g_audioout2_state_mutex.Lock();
+	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
+		audioout2_update_context_locked(state);
+		if (queue_level != nullptr) {
+			*queue_level = state->queued;
+		}
+		if (available_queues != nullptr) {
+			*available_queues =
+			    (state->queued < state->queue_depth ? state->queue_depth - state->queued : 0);
+		}
+	}
+	g_audioout2_state_mutex.Unlock();
+
+	return OK;
 }
 
-// PPSA28180 calls this with rsp off the 16-byte alignment; the host device open needs it.
-[[gnu::force_align_arg_pointer]] int KYTY_SYSV_ABI AudioOut2PortCreate(
-    AudioOut2ContextHandle ctx, const AudioOut2PortParam* params, AudioOut2PortHandle* port) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut2PortParam* params,
+                                      AudioOut2PortHandle* port) {
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 	EXIT_NOT_IMPLEMENTED(port == nullptr);
 
@@ -773,7 +778,7 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 	PRINT_NAME();
 	LOGF("\t port = 0x%016" PRIx64 "\n", port);
 
@@ -796,7 +801,7 @@ int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
                                              const AudioOut2Attribute* attributes, uint32_t num) {
 	if (num != 0 && attributes == nullptr) {
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
@@ -878,7 +883,8 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 	}
 	return OK;
 }
-int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortState* state) {
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortState* state) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
@@ -902,14 +908,14 @@ int KYTY_SYSV_ABI AudioOut2PortGetState(AudioOut2PortHandle port, AudioOut2PortS
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2GetSystemState(AudioOut2SystemState* state) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2GetSystemState(AudioOut2SystemState* state) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(state == nullptr);
 	std::memset(state, 0, sizeof(AudioOut2SystemState));
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2UserCreate(uint32_t user_id, AudioOut2UserHandle* handle) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2UserCreate(uint32_t user_id, AudioOut2UserHandle* handle) {
 	PRINT_NAME();
 	if (handle == nullptr) {
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
@@ -922,7 +928,7 @@ int KYTY_SYSV_ABI AudioOut2UserCreate(uint32_t user_id, AudioOut2UserHandle* han
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle) {
 	PRINT_NAME();
 	LOGF("\t handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(handle));
 	Common::LockGuard lock(g_audioout2_state_mutex);
@@ -940,7 +946,7 @@ int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle,
                                                       uint32_t*           context_attributes,
                                                       uint32_t*           port_attributes) {
 	if (context_attributes == nullptr || port_attributes == nullptr) {
@@ -958,7 +964,7 @@ int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle
 	return OK;
 }
 
-size_t KYTY_SYSV_ABI AudioOut2GetSpeakerArrayMemorySize(uint32_t num_speakers, uint8_t is_3d,
+size_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2GetSpeakerArrayMemorySize(uint32_t num_speakers, uint8_t is_3d,
                                                         uint8_t is_ambisonics) {
 	PRINT_NAME();
 
@@ -975,7 +981,7 @@ size_t KYTY_SYSV_ABI AudioOut2GetSpeakerArrayMemorySize(uint32_t num_speakers, u
 	return size;
 }
 
-int KYTY_SYSV_ABI AudioOut2SpeakerArrayCreate(AudioOut2SpeakerArrayHandle* handle,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2SpeakerArrayCreate(AudioOut2SpeakerArrayHandle* handle,
                                               const void* vbap_params, const void* ambi_params) {
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(handle == nullptr);
@@ -1004,7 +1010,7 @@ int KYTY_SYSV_ABI AudioOut2SpeakerArrayCreate(AudioOut2SpeakerArrayHandle* handl
 	return (*handle != nullptr ? OK : AUDIO_OUT2_ERROR_PORT_FULL);
 }
 
-int KYTY_SYSV_ABI AudioOut2SpeakerArrayDestroy(AudioOut2SpeakerArrayHandle handle) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2SpeakerArrayDestroy(AudioOut2SpeakerArrayHandle handle) {
 	PRINT_NAME();
 	LOGF("\t handle = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(handle));
 
@@ -1020,7 +1026,7 @@ int KYTY_SYSV_ABI AudioOut2SpeakerArrayDestroy(AudioOut2SpeakerArrayHandle handl
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayCoefficients(
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2GetSpeakerArrayCoefficients(
     AudioOut2SpeakerArrayHandle handle, AudioOut2Position pos, float spread, float* coefficients,
     uint32_t num_coefficients, uint8_t height_aware, float downmix_spread_radius) {
 	PRINT_NAME();
@@ -1045,7 +1051,7 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayCoefficients(
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2SpeakerArrayHandle handle,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2SpeakerArrayHandle handle,
                                                                  uint32_t ambisonics_channel,
                                                                  float*   coefficients,
                                                                  uint32_t num_coefficients) {
@@ -1066,7 +1072,7 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2Speake
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
 	info->type             = 0;
@@ -1078,13 +1084,13 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t f
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2SetSystemDebugState(const AudioOut2SystemDebugStateParam* param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2SetSystemDebugState(const AudioOut2SystemDebugStateParam* param) {
 	PRINT_NAME();
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2Set3DLatency(uint32_t user_id, uint32_t output, uint32_t latency_us) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2Set3DLatency(uint32_t user_id, uint32_t output, uint32_t latency_us) {
 	// Not sure
 
 	PRINT_NAME();
@@ -1116,13 +1122,13 @@ int KYTY_SYSV_ABI AudioOut2Set3DLatency(uint32_t user_id, uint32_t output, uint3
 	return (free_state != nullptr ? OK : AUDIO_OUT2_ERROR_PORT_FULL);
 }
 
-int KYTY_SYSV_ABI AudioOut2MasteringInit(uint32_t flags) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2MasteringInit(uint32_t flags) {
 	PRINT_NAME();
 	LOGF("\t flags = 0x%08" PRIx32 "\n", flags);
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2MasteringSetParam(const AudioOut2MasteringParamsHeader* param,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2MasteringSetParam(const AudioOut2MasteringParamsHeader* param,
                                              uint32_t output, uint32_t flags) {
 	PRINT_NAME();
 	LOGF("\t param = 0x%016" PRIx64 ", output = %" PRIu32 ", flags = 0x%08" PRIx32 "\n",
@@ -1130,7 +1136,7 @@ int KYTY_SYSV_ABI AudioOut2MasteringSetParam(const AudioOut2MasteringParamsHeade
 	return OK;
 }
 
-int KYTY_SYSV_ABI AudioOut2MasteringGetState(AudioOut2MasteringStatesHeader* state, uint32_t output,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2MasteringGetState(AudioOut2MasteringStatesHeader* state, uint32_t output,
                                              AudioOut2UserHandle user) {
 	PRINT_NAME();
 	LOGF("\t state = 0x%016" PRIx64 ", output = %" PRIu32 ", user = 0x%016" PRIx64 "\n",
@@ -1172,7 +1178,7 @@ int KYTY_SYSV_ABI AudioOut2MasteringGetState(AudioOut2MasteringStatesHeader* sta
 	}
 }
 
-int KYTY_SYSV_ABI AudioOut2MasteringTerm() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioOut2MasteringTerm() {
 	PRINT_NAME();
 	return OK;
 }

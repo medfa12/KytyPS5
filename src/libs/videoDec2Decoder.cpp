@@ -33,6 +33,7 @@ struct PacketMetadata {
 	uint64_t pts           = TIMESTAMP_INVALID;
 	uint64_t dts           = TIMESTAMP_INVALID;
 	uint64_t attached_data = 0;
+	FrameBuffer buffer;
 };
 
 struct StoredPicture {
@@ -133,6 +134,10 @@ public:
 
 	[[nodiscard]] Result Finalize() {
 		std::scoped_lock lock(m_mutex);
+		return FinalizeInput();
+	}
+
+	[[nodiscard]] Result FinalizeInput() {
 		if (m_finalized) return Result::Ok;
 		const auto drained = DrainFrames();
 		if (drained != Result::Ok) return drained;
@@ -148,21 +153,37 @@ public:
 		std::scoped_lock lock(m_mutex);
 		*output = {};
 		uint32_t produced = 0;
-		auto result = SubmitInput(input, &produced);
+		bool accepted = false;
+		const auto* submitted_buffer = m_config.retain_input_buffer ? &frame_buffer : nullptr;
+		auto result = SubmitInput(input, &produced, submitted_buffer, &accepted);
 		if (result == Result::InputFull) {
 			// The combined API supplies an output buffer together with each AU.
 			result = ReceiveOutput(frame_buffer, output);
 			if (result != Result::Ok) return result;
-			return SubmitInput(input, &produced);
+			result = SubmitInput(input, &produced, submitted_buffer, &accepted);
+			if (m_config.retain_input_buffer) output->buffer_accepted = accepted;
+			return result;
 		}
-		if (result != Result::Ok) return result;
+		if (result != Result::Ok) {
+			output->buffer_accepted = accepted;
+			return result;
+		}
 		result = ReceiveOutput(frame_buffer, output);
+		if (m_config.retain_input_buffer) output->buffer_accepted = accepted;
 		return result == Result::NoFrame ? Result::Ok : result;
 	}
 
 	[[nodiscard]] Result FlushOutput(const FrameBuffer& frame_buffer, Output* output) {
 		std::scoped_lock lock(m_mutex);
+		*output = {};
+		if (m_config.retain_input_buffer) {
+			const auto finalized = FinalizeInput();
+			if (finalized != Result::Ok && finalized != Result::InputFull) return finalized;
+		}
 		const auto result = ReceiveOutput(frame_buffer, output);
+		// Flush returns previously submitted private storage, not ownership of
+		// the scratch descriptor supplied with this call.
+		if (m_config.retain_input_buffer) output->buffer_accepted = false;
 		return result == Result::NoFrame ? Result::Ok : result;
 	}
 
@@ -204,7 +225,8 @@ private:
 		return Result::Ok;
 	}
 
-	[[nodiscard]] Result SubmitInput(const Input& input, uint32_t* produced) {
+	[[nodiscard]] Result SubmitInput(const Input& input, uint32_t* produced,
+	                                 const FrameBuffer* buffer = nullptr, bool* accepted = nullptr) {
 		*produced = 0;
 		if (m_finalized) return Result::ApiFail;
 		const auto drained = DrainFrames();
@@ -226,9 +248,16 @@ private:
 			av_packet_free(&packet);
 			return Result::ApiFail;
 		}
-		const PacketMetadata metadata {input.pts, input.dts, input.attached_data};
+		const PacketMetadata metadata {input.pts, input.dts, input.attached_data,
+		                               buffer != nullptr ? *buffer : FrameBuffer {}};
 		std::memcpy(packet->opaque_ref->data, &metadata, sizeof(metadata));
 		result = avcodec_send_packet(m_codec, packet);
+		// Acceptance means actual backend retention of this AU's storage token,
+		// not merely a successful send. COPY_OPAQUE carries it to its own frame,
+		// including B-frame reorder; never substitute the next call's buffer.
+		if (accepted != nullptr && buffer != nullptr && result >= 0) {
+			*accepted = av_buffer_get_ref_count(packet->opaque_ref) > 1;
+		}
 		av_packet_free(&packet);
 		if (result == AVERROR(EAGAIN)) return Result::InputFull; // The AU was not accepted.
 		if (result < 0) {
@@ -245,7 +274,16 @@ private:
 		if (drained != Result::Ok) return drained;
 		if (m_frames.empty()) return Result::NoFrame;
 		auto& pending = m_frames.front();
-		const auto result = CopyFrame(pending.frame, pending.picture, frame_buffer, output);
+		auto destination = frame_buffer;
+		if (m_config.retain_input_buffer) {
+			if (pending.frame->opaque_ref == nullptr ||
+			    pending.frame->opaque_ref->size < sizeof(PacketMetadata)) return Result::ApiFail;
+			PacketMetadata metadata {};
+			std::memcpy(&metadata, pending.frame->opaque_ref->data, sizeof(metadata));
+			destination = metadata.buffer;
+			if (destination.data == nullptr || destination.size == 0) return Result::ApiFail;
+		}
+		const auto result = CopyFrame(pending.frame, pending.picture, destination, output);
 		if (result != Result::Ok) return result;
 		output->last_frame = m_finalized && m_eof && m_frames.size() == 1u;
 		av_frame_free(&pending.frame);
@@ -465,23 +503,6 @@ AvcPictureInfo MakeAvcPictureInfo(const PictureInfo& decoded, size_t size) {
 	picture.transfer_characteristics = decoded.color_trc;
 	picture.matrix_coefficients      = decoded.color_space;
 	return picture;
-}
-
-Vp9PictureInfo MakeVp9PictureInfo(const PictureInfo& decoded) {
-	// CopyFrame always writes 8-bit NV12.
-	return {.this_size      = sizeof(Vp9PictureInfo),
-	        .is_valid       = true,
-	        .pts_data       = decoded.pts,
-	        .dts_data       = decoded.dts,
-	        .attached_data  = decoded.attached_data,
-	        .profile        = decoded.profile,
-	        .key_frame_flag = decoded.key_frame,
-	        .bit_depth      = 8,
-	        .color_range    = decoded.color_range == 2,
-	        .frame_width    = decoded.width,
-	        .frame_height   = decoded.height,
-	        .render_width   = decoded.width,
-	        .render_height  = decoded.height};
 }
 
 bool GetPictureInfo(void* frame_buffer, PictureInfo* picture_info) {

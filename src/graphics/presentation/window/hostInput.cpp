@@ -6,6 +6,9 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
+#include "libs/libShellFocus.h"
+#include "loader/runtimeChildClient.h"
+#include "graphics/presentation/window/runtimeWindowBridge.h"
 
 #include <algorithm>
 #include <array>
@@ -31,9 +34,6 @@ struct ControlInfo {
 	Controller::Setting setting {};
 	bool                gyro          = false;
 	bool                touchpad_mode = false;
-	// Direction of a touch pad swipe along x and y.
-	float swipe_x = 0.0f;
-	float swipe_y = 0.0f;
 };
 
 static constexpr std::array CONTROL_INFO = {
@@ -70,10 +70,6 @@ static constexpr std::array CONTROL_INFO = {
                  .setting = Controller::Setting::TriggerEffectIntensity},
     ControlInfo {.name = "GyroToggle", .gyro = true},
     ControlInfo {.name = "TouchPadMode", .touchpad_mode = true},
-    ControlInfo {.name = "TouchPadSwipeUp", .swipe_y = -1.0f},
-    ControlInfo {.name = "TouchPadSwipeDown", .swipe_y = 1.0f},
-    ControlInfo {.name = "TouchPadSwipeLeft", .swipe_x = -1.0f},
-    ControlInfo {.name = "TouchPadSwipeRight", .swipe_x = 1.0f},
 };
 
 constexpr std::size_t INVALID_CONTROL = CONTROL_INFO.size();
@@ -153,6 +149,17 @@ MouseJoystickState g_mouse;
 SDL_Window*        g_mouse_window   = nullptr;
 uint64_t           g_cursor_hide_at = 0;
 
+struct MouseTouchPadState {
+	bool     enabled        = false;
+	bool     cursor_visible = true;
+	bool     drawing        = false;
+	bool     position_valid = false;
+	float    x              = 0.5f;
+	float    y              = 0.5f;
+	uint64_t revision       = 0;
+	uint64_t gesture        = 0;
+};
+
 struct GamepadTouchPadState {
 	bool     enabled   = false;
 	bool     drawing   = false;
@@ -169,17 +176,10 @@ constexpr int   GAMEPAD_TOUCHPAD_POLL_MS = 8;
 constexpr int   GAMEPAD_TOUCHPAD_DEADZONE = 18;
 constexpr float GAMEPAD_TOUCHPAD_SPEED    = 0.8f;
 
-HostInputTouchPadVisualState                 g_mouse_touchpad;
-GamepadTouchPadState                         g_gamepad_touchpad;
-std::mutex                                   g_touchpad_mutex;
+MouseTouchPadState   g_mouse_touchpad;
+GamepadTouchPadState g_gamepad_touchpad;
+std::mutex           g_touchpad_mutex;
 std::unordered_map<int, std::array<bool, 2>> g_pad_trigger_pressed;
-
-constexpr float TOUCHPAD_SWIPE_MS      = 200.0f;
-constexpr int   TOUCHPAD_SWIPE_POLL_MS = 8;
-
-// The control of the touch pad swipe in progress and its start time.
-std::size_t g_swipe_control  = INVALID_CONTROL;
-uint64_t    g_swipe_start_ms = 0;
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -325,8 +325,7 @@ private:
 			EXIT("Invalid input mapping: %s\n", original.c_str());
 		}
 		const auto& info = CONTROL_INFO[control];
-		if ((info.button == 0 && !info.gyro && info.axis != Controller::Axis::AxisMax) ||
-		    info.swipe_x != 0.0f || info.swipe_y != 0.0f) {
+		if (info.button == 0 && !info.gyro && info.axis != Controller::Axis::AxisMax) {
 			EXIT("Invalid input mapping: %s\n", original.c_str());
 		}
 		m_custom_pad = true;
@@ -362,13 +361,15 @@ const InputMap& GetInputMap() {
 	return map;
 }
 
-void SetButton(uint32_t button, bool down, int id = Controller::HOST_INPUT_CONTROLLER_ID) {
+void SetButton(uint32_t button, bool down) {
 	if (button == Controller::PAD_BUTTON_L2) {
-		Controller::SetAxis(id, Controller::Axis::TriggerLeft, down ? 255 : 0);
+		Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::TriggerLeft,
+		                    down ? 255 : 0);
 	} else if (button == Controller::PAD_BUTTON_R2) {
-		Controller::SetAxis(id, Controller::Axis::TriggerRight, down ? 255 : 0);
+		Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, Controller::Axis::TriggerRight,
+		                    down ? 255 : 0);
 	} else if (button != 0) {
-		Controller::SetButton(id, button, down);
+		Controller::SetButton(Controller::HOST_INPUT_CONTROLLER_ID, button, down);
 	}
 }
 
@@ -378,24 +379,6 @@ void SetTouchPad(float x, bool down) {
 
 void SetSwipeTouchPad(bool down, float x, float y) {
 	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 1, down, x, y);
-}
-
-// Moves the swipe finger across 60% of the pad without clicking it, then lifts it.
-int PollTouchPadSwipe(uint64_t now_ms) {
-	if (g_swipe_control == INVALID_CONTROL) {
-		return -1;
-	}
-	const auto& info     = CONTROL_INFO[g_swipe_control];
-	const float progress = static_cast<float>(now_ms - g_swipe_start_ms) / TOUCHPAD_SWIPE_MS;
-	const float offset   = 0.6f * progress - 0.3f;
-	const bool  down     = progress <= 1.0f;
-	Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 1, down,
-	                        0.5f + info.swipe_x * offset, 0.5f + info.swipe_y * offset, false);
-	if (down) {
-		return TOUCHPAD_SWIPE_POLL_MS;
-	}
-	g_swipe_control = INVALID_CONTROL;
-	return -1;
 }
 
 void RecordMouseTouchPadPosition(float x, float y) {
@@ -427,25 +410,40 @@ bool TouchPadModeActive() {
 	return g_mouse_touchpad.enabled || g_gamepad_touchpad.enabled;
 }
 
-struct AxisKeys {
-	bool negative = false;
-	bool positive = false;
+uint32_t DefaultKeyboardButton(int key_code) {
+	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
+		case SDLK_UP: return Controller::PAD_BUTTON_UP;
+		case SDLK_LEFT: return Controller::PAD_BUTTON_LEFT;
+		case SDLK_DOWN: return Controller::PAD_BUTTON_DOWN;
+		case SDLK_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+		case SDLK_J: return Controller::PAD_BUTTON_CROSS;
+		case SDLK_I: return Controller::PAD_BUTTON_TRIANGLE;
+		case SDLK_K: return Controller::PAD_BUTTON_SQUARE;
+		case SDLK_L: return Controller::PAD_BUTTON_CIRCLE;
+		case SDLK_Q: return Controller::PAD_BUTTON_L1;
+		case SDLK_E: return Controller::PAD_BUTTON_R1;
+		case SDLK_Z: return Controller::PAD_BUTTON_L2;
+		case SDLK_C: return Controller::PAD_BUTTON_R2;
+		case SDLK_LSHIFT: return Controller::PAD_BUTTON_L3;
+		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
+		case SDLK_RETURN:
+		case SDLK_RETURN2: return Controller::PAD_BUTTON_OPTIONS;
+		default: return 0;
+	}
+}
+
+struct StickKeys {
+	bool left  = false;
+	bool right = false;
+	bool up    = false;
+	bool down  = false;
 };
 
-// Held stick keys of the LeftX, LeftY, RightX and RightY axes.
-std::array<AxisKeys, 4> g_axis_keys;
-
-void SetStickKey(Controller::Axis axis, bool positive, bool down) {
-	auto& keys = g_axis_keys[static_cast<std::size_t>(axis)];
-	if (positive) {
-		keys.positive = down;
-	} else {
-		keys.negative = down;
-	}
+void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
 	int value = 128;
-	if (keys.negative && !keys.positive) {
+	if (negative && !positive) {
 		value = 0;
-	} else if (keys.positive && !keys.negative) {
+	} else if (positive && !negative) {
 		value = 255;
 	}
 	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
@@ -483,26 +481,31 @@ void SetControl(std::size_t control, bool down) {
 		}
 		return;
 	}
-	if (info.swipe_x != 0.0f || info.swipe_y != 0.0f) {
-		if (down) {
-			// A new swipe starts a new touch.
-			if (g_swipe_control != INVALID_CONTROL) {
-				Controller::SetTouchPad(Controller::HOST_INPUT_CONTROLLER_ID, 1, false, 0.5f, 0.5f,
-				                        false);
-			}
-			g_swipe_control  = control;
-			g_swipe_start_ms = SDL_GetTicks();
-		}
-		return;
-	}
 	if (info.axis == Controller::Axis::AxisMax) {
 		CycleSettingOnPress(info.setting, down);
 		return;
 	}
-	SetStickKey(info.axis, info.positive, down);
+
+	struct AxisKeys {
+		bool negative = false;
+		bool positive = false;
+	};
+	static std::array<AxisKeys, 4> axes;
+
+	const auto axis = static_cast<std::size_t>(info.axis);
+	EXIT_IF(axis >= axes.size());
+	if (info.positive) {
+		axes[axis].positive = down;
+	} else {
+		axes[axis].negative = down;
+	}
+	SetStickAxis(info.axis, axes[axis].negative, axes[axis].positive);
 }
 
 void DefaultKeyboardInput(int key_code, bool down) {
+	static StickKeys left;
+	static StickKeys right;
+
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
 		case SDLK_F6:
@@ -514,31 +517,39 @@ void DefaultKeyboardInput(int key_code, bool down) {
 		case SDLK_1: CycleSettingOnPress(Controller::Setting::SpeakerVolume, down); return;
 		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
 		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
-		case SDLK_A: SetStickKey(Controller::Axis::LeftX, false, down); return;
-		case SDLK_D: SetStickKey(Controller::Axis::LeftX, true, down); return;
-		case SDLK_W: SetStickKey(Controller::Axis::LeftY, false, down); return;
-		case SDLK_S: SetStickKey(Controller::Axis::LeftY, true, down); return;
-		case SDLK_F: SetStickKey(Controller::Axis::RightX, false, down); return;
-		case SDLK_H: SetStickKey(Controller::Axis::RightX, true, down); return;
-		case SDLK_T: SetStickKey(Controller::Axis::RightY, false, down); return;
-		case SDLK_G: SetStickKey(Controller::Axis::RightY, true, down); return;
-		case SDLK_UP: SetButton(Controller::PAD_BUTTON_UP, down); return;
-		case SDLK_LEFT: SetButton(Controller::PAD_BUTTON_LEFT, down); return;
-		case SDLK_DOWN: SetButton(Controller::PAD_BUTTON_DOWN, down); return;
-		case SDLK_RIGHT: SetButton(Controller::PAD_BUTTON_RIGHT, down); return;
-		case SDLK_J: SetButton(Controller::PAD_BUTTON_CROSS, down); return;
-		case SDLK_I: SetButton(Controller::PAD_BUTTON_TRIANGLE, down); return;
-		case SDLK_K: SetButton(Controller::PAD_BUTTON_SQUARE, down); return;
-		case SDLK_L: SetButton(Controller::PAD_BUTTON_CIRCLE, down); return;
-		case SDLK_Q: SetButton(Controller::PAD_BUTTON_L1, down); return;
-		case SDLK_E: SetButton(Controller::PAD_BUTTON_R1, down); return;
-		case SDLK_Z: SetButton(Controller::PAD_BUTTON_L2, down); return;
-		case SDLK_C: SetButton(Controller::PAD_BUTTON_R2, down); return;
-		case SDLK_LSHIFT: SetButton(Controller::PAD_BUTTON_L3, down); return;
-		case SDLK_LCTRL: SetButton(Controller::PAD_BUTTON_R3, down); return;
-		case SDLK_RETURN:
-		case SDLK_RETURN2: SetButton(Controller::PAD_BUTTON_OPTIONS, down); return;
-		default: return;
+		case SDLK_A:
+			left.left = down;
+			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
+			return;
+		case SDLK_D:
+			left.right = down;
+			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
+			return;
+		case SDLK_W:
+			left.up = down;
+			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
+			return;
+		case SDLK_S:
+			left.down = down;
+			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
+			return;
+		case SDLK_F:
+			right.left = down;
+			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
+			return;
+		case SDLK_H:
+			right.right = down;
+			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
+			return;
+		case SDLK_T:
+			right.up = down;
+			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
+			return;
+		case SDLK_G:
+			right.down = down;
+			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
+			return;
+		default: SetButton(DefaultKeyboardButton(key_code), down); return;
 	}
 }
 
@@ -633,12 +644,16 @@ void ApplyPadControl(int id, std::size_t control, std::size_t source, bool down)
 		return;
 	} else if (info.button == Controller::PAD_BUTTON_TOUCH_PAD) {
 		// Real touchpads report their own finger position; other inputs emulate a click.
-		if (PAD_SOURCES[source].button != SDL_GAMEPAD_BUTTON_TOUCHPAD) {
-			Controller::SetTouchPad(id, 0, down, info.touch_x, 0.5f);
+		if (source != PAD_SOURCES.size() && PAD_SOURCES[source].button != SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+			Controller::SetTouchPad(id, 0, down, info.touch_x != 0.0f ? info.touch_x : 0.5f, 0.5f);
 		}
 		Controller::SetButton(id, Controller::PAD_BUTTON_TOUCH_PAD, down);
+	} else if (info.button == Controller::PAD_BUTTON_L2) {
+		Controller::SetAxis(id, Controller::Axis::TriggerLeft, down ? 255 : 0);
+	} else if (info.button == Controller::PAD_BUTTON_R2) {
+		Controller::SetAxis(id, Controller::Axis::TriggerRight, down ? 255 : 0);
 	} else if (info.button != 0) {
-		SetButton(info.button, down, id);
+		Controller::SetButton(id, info.button, down);
 	} else if (info.axis == Controller::Axis::AxisMax) {
 		CycleSettingOnPress(info.setting, down);
 	}
@@ -697,6 +712,14 @@ int PollGamepadTouchPad(uint64_t now_ms) {
 } // namespace
 
 void HostInputPadButton(int id, int button, bool down) {
+	if (Loader::IsRuntimeChild()) { return; }
+	if (button == SDL_GAMEPAD_BUTTON_GUIDE) {
+		Controller::SetButton(id, Controller::PAD_BUTTON_PS, down);
+		if (down && (!RuntimeWindowBridgeActive() || RuntimeWindowTreeForeground())) {
+			Libs::ShellFocus::ShellFocusHost::PulsePsButton(0);
+		}
+		return;
+	}
 	const auto  source = InputMap::SourceFromButton(button);
 	const auto& map    = GetInputMap();
 	ApplyPadControl(id, map.PadControl(source), source, down);
@@ -760,6 +783,18 @@ void HostInputShutdown() {
 }
 
 void HostInputKey(int key_code, bool down) {
+	// Home (or P, for keyboards without a Home key, e.g. AZERTY laptops) =
+	// PS button (system-intercepted, not part of the pad map).
+	const SDL_Keycode normalized = NormalizeKey(static_cast<SDL_Keycode>(key_code));
+	if (normalized == SDLK_HOME || normalized == SDLK_P) {
+		if (Loader::IsRuntimeChild()) { if (down) { Loader::NotifyRuntimeChildPs(); } return; }
+		SetButton(Controller::PAD_BUTTON_PS, down);
+		if (down) {
+			Libs::ShellFocus::ShellFocusHost::PulsePsButton(0);
+			LOGF("PS button pressed (keyboard)\n");
+		}
+		return;
+	}
 	const auto& map = GetInputMap();
 	if (map.Custom()) {
 		SetControl(map.FindKey(key_code), down);
@@ -830,6 +865,7 @@ void HostInputSetTouchPadMode(bool enabled) {
 	{
 		std::scoped_lock lock(g_touchpad_mutex);
 		g_mouse_touchpad.enabled        = enabled;
+		g_mouse_touchpad.cursor_visible = true;
 		g_mouse_touchpad.drawing        = false;
 		g_mouse_touchpad.position_valid = false;
 		g_mouse_touchpad.gesture++;
@@ -963,15 +999,27 @@ void HostInputDisconnectGamepadTouchPad(int id) {
 }
 
 HostInputTouchPadVisualState GetHostInputTouchPadVisualState() {
-	std::scoped_lock lock(g_touchpad_mutex);
-	auto             state = g_mouse_touchpad;
+	std::scoped_lock             lock(g_touchpad_mutex);
+	HostInputTouchPadVisualState state {};
 	if (g_gamepad_touchpad.enabled) {
 		state.enabled        = true;
+		state.cursor_visible = true;
 		state.drawing        = g_gamepad_touchpad.drawing;
 		state.x              = g_gamepad_touchpad.x;
 		state.y              = g_gamepad_touchpad.y;
+		state.revision       = g_mouse_touchpad.revision;
+		state.gesture        = g_mouse_touchpad.gesture;
 		state.position_valid = true;
+		return state;
 	}
+	state.enabled        = g_mouse_touchpad.enabled;
+	state.cursor_visible = g_mouse_touchpad.cursor_visible;
+	state.drawing        = g_mouse_touchpad.drawing;
+	state.x              = g_mouse_touchpad.x;
+	state.y              = g_mouse_touchpad.y;
+	state.revision       = g_mouse_touchpad.revision;
+	state.gesture        = g_mouse_touchpad.gesture;
+	state.position_valid = g_mouse_touchpad.position_valid;
 	return state;
 }
 
@@ -1012,9 +1060,6 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	}
 	if (const int touch_timeout = PollGamepadTouchPad(SDL_GetTicks()); touch_timeout >= 0) {
 		timeout = timeout < 0 ? touch_timeout : std::min(timeout, touch_timeout);
-	}
-	if (const int swipe_timeout = PollTouchPadSwipe(SDL_GetTicks()); swipe_timeout >= 0) {
-		timeout = timeout < 0 ? swipe_timeout : std::min(timeout, swipe_timeout);
 	}
 	timeout              = timeout < 0 ? max_wait_ms : std::min(timeout, max_wait_ms);
 	const bool has_event = SDL_WaitEventTimeout(event, timeout);

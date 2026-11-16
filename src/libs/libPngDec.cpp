@@ -164,7 +164,7 @@ static bool PngHasSourceAlpha(const PngHeaderInfo& header) {
 	       (header.image_flag & PNG_DEC_IMAGE_FLAG_TRNS_CHUNK_EXIST) != 0;
 }
 
-static int32_t KYTY_SYSV_ABI PngDecQueryMemorySize(const PngDecCreateParam* param) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PngDecQueryMemorySize(const PngDecCreateParam* param) {
 	PRINT_NAME();
 
 	if (param == nullptr) {
@@ -186,7 +186,7 @@ static int32_t KYTY_SYSV_ABI PngDecQueryMemorySize(const PngDecCreateParam* para
 	return sizeof(PngDecContext);
 }
 
-static int32_t KYTY_SYSV_ABI PngDecCreate(const PngDecCreateParam* param, void* memory_address,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PngDecCreate(const PngDecCreateParam* param, void* memory_address,
                                           uint32_t memory_size, void** handle) {
 	PRINT_NAME();
 
@@ -220,7 +220,7 @@ static int32_t KYTY_SYSV_ABI PngDecCreate(const PngDecCreateParam* param, void* 
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI PngDecDecode(void* handle, const PngDecDecodeParam* param,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PngDecDecode(void* handle, const PngDecDecodeParam* param,
                                           PngDecImageInfo* image_info) {
 	PRINT_NAME();
 
@@ -318,7 +318,7 @@ static int32_t KYTY_SYSV_ABI PngDecDecode(void* handle, const PngDecDecodeParam*
 	            : static_cast<int32_t>((header.width << 16u) | header.height));
 }
 
-static int32_t KYTY_SYSV_ABI PngDecDelete(void* handle) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PngDecDelete(void* handle) {
 	PRINT_NAME();
 
 	if (handle == nullptr) {
@@ -334,7 +334,7 @@ static int32_t KYTY_SYSV_ABI PngDecDelete(void* handle) {
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI PngDecParseHeader(const PngDecParseParam* param,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PngDecParseHeader(const PngDecParseParam* param,
                                                PngDecImageInfo*        image_info) {
 	PRINT_NAME();
 

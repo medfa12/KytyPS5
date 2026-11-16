@@ -36,14 +36,46 @@ public:
 	virtual std::optional<Entry>        Find(std::string_view member)              = 0;
 	virtual std::vector<File::DirEntry> List(std::string_view member)              = 0;
 	virtual uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) = 0;
+	virtual bool GetIdentity(FileIdentity& identity, std::error_code& error) const = 0;
 };
 
 namespace {
 
+class ArchiveInput final: public ZArchiveReader::Input {
+public:
+	explicit ArchiveInput(const std::filesystem::path& path): m_file(path, File::Mode::Read) {
+		// Snapshot identity from the very handle supplying all archive bytes.
+		// Keep a real query failure for stat without disabling existing reads.
+		m_file.GetIdentity(m_identity, m_identity_error);
+	}
+	bool IsOpen() const { return !m_file.IsInvalid(); }
+	uint64_t Size() override { return m_file.Size(); }
+	bool ReadAt(uint64_t offset, void* buffer, uint32_t size) override {
+		if (!m_file.Seek(offset)) { return false; }
+		uint32_t bytes = 0;
+		m_file.Read(buffer, size, &bytes);
+		return bytes == size;
+	}
+	bool GetIdentity(FileIdentity& identity, std::error_code& error) const {
+		if (m_identity_error) { error = m_identity_error; return false; }
+		identity = m_identity;
+		error.clear();
+		return true;
+	}
+private:
+	File m_file;
+	FileIdentity m_identity;
+	std::error_code m_identity_error;
+};
+
 class ZArchiveReaderBackend final: public ArchiveReader {
 public:
-	explicit ZArchiveReaderBackend(std::unique_ptr<ZArchiveReader> reader)
-	    : m_reader(std::move(reader)) {}
+	ZArchiveReaderBackend(std::unique_ptr<ZArchiveReader> reader, std::shared_ptr<ArchiveInput> input)
+	    : m_reader(std::move(reader)), m_input(std::move(input)) {}
+
+	bool GetIdentity(FileIdentity& identity, std::error_code& error) const override {
+		return m_input->GetIdentity(identity, error);
+	}
 
 	std::optional<Entry> Find(std::string_view member) override {
 		const auto node = m_reader->LookUp(member);
@@ -80,11 +112,14 @@ public:
 
 private:
 	std::unique_ptr<ZArchiveReader> m_reader;
+	std::shared_ptr<ArchiveInput> m_input;
 };
 
 std::shared_ptr<ArchiveReader> OpenZArchive(const std::filesystem::path& path) {
-	auto reader = std::unique_ptr<ZArchiveReader>(ZArchiveReader::OpenFromFile(path));
-	return reader ? std::make_shared<ZArchiveReaderBackend>(std::move(reader)) : nullptr;
+	auto input = std::make_shared<ArchiveInput>(path);
+	if (!input->IsOpen()) { return nullptr; }
+	auto reader = std::unique_ptr<ZArchiveReader>(ZArchiveReader::OpenFromInput(input));
+	return reader ? std::make_shared<ZArchiveReaderBackend>(std::move(reader), std::move(input)) : nullptr;
 }
 
 struct ArchiveFormat {
@@ -251,6 +286,14 @@ struct ArchiveFile::Private {
 ArchiveFile::ArchiveFile(std::unique_ptr<Private> p): m_p(std::move(p)) {}
 ArchiveFile::~ArchiveFile() = default;
 
+bool ArchiveFile::GetIdentity(FileIdentity& identity, std::error_code& error) const {
+	FileIdentity result;
+	if (!m_p->reader->GetIdentity(result, error)) { return false; }
+	result.member = std::to_string(m_p->entry.id);
+	identity = std::move(result);
+	return true;
+}
+
 uint64_t ArchiveFile::Size() const {
 	return m_p->entry.size;
 }
@@ -272,7 +315,7 @@ void ArchiveFile::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 	constexpr uint32_t                chunk_size = 1u << 20u;
 	thread_local std::vector<uint8_t> chunk;
 	uint32_t                          read = 0;
-	if (data != nullptr && size != 0 && m_p->position < Size()) {
+	if (m_p->entry.is_file && data != nullptr && size != 0 && m_p->position < Size()) {
 		const auto requested =
 		    static_cast<uint32_t>(std::min<uint64_t>(size, Size() - m_p->position));
 		if (chunk.size() < std::min(chunk_size, requested)) {
@@ -378,14 +421,14 @@ std::vector<File::DirEntry> GetArchiveDirEntries(const std::filesystem::path& pa
 	return {};
 }
 
-std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path) {
+std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path, bool metadata_only) {
 	auto parsed = ParsePath(path);
 	if (!parsed) {
 		return {};
 	}
 	auto       reader = OpenArchive(parsed->archive);
 	const auto entry  = reader ? reader->Find(parsed->member) : std::nullopt;
-	if (!entry || !entry->is_file) {
+	if (!entry || (!metadata_only && !entry->is_file)) {
 		return {};
 	}
 	auto p     = std::make_unique<ArchiveFile::Private>();

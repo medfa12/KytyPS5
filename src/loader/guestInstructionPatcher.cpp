@@ -24,6 +24,13 @@
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
 
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+
 using namespace Xbyak::util;
 
 namespace Loader {

@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "libs/dualSenseBluetooth.h"
+#include "loader/runtimeChildClient.h"
 
 #include <SDL3/SDL.h>
 #include <algorithm>
@@ -296,6 +297,7 @@ uint64_t QueueUsbAudio(Stream* stream, uint32_t frames) {
 } // namespace
 
 Stream* Open(uint32_t freq, bool speaker) {
+	if (Loader::IsRuntimeChild()) { return nullptr; }
 	if (freq == 0 || !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
 		return nullptr;
 	}
@@ -414,6 +416,7 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 }
 
 bool SetVibration(int controller, uint8_t large_motor, uint8_t small_motor, uint32_t duration_ms) {
+	if (Loader::IsRuntimeChild()) { return false; }
 	if (SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(controller)) != SDL_GAMEPAD_TYPE_PS5) {
 		return false;
 	}

@@ -4,12 +4,16 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/threads.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
+#include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <mutex>
+#include <unordered_map>
 
 namespace Libs {
 
@@ -28,7 +32,10 @@ static constexpr uint32_t PLAYGO_DEFAULT_CHUNKS_NUM     = 1000;
 static constexpr uint64_t PLAYGO_LANGUAGE_MASK_ALL      = 0xffffffffffffffffull;
 static constexpr uint64_t PLAYGO_SCENARIO_MASK_ALL      = 0x1full;
 
-static uint32_t g_chunks_num = 0;
+// Runtime mains and their private modules share a cache. The null owner keeps
+// the legacy session-wide cache, including Initialize's PlayGoHack fallback.
+static std::mutex s_chunks_mutex;
+static std::unordered_map<const Loader::Program*, uint32_t> s_chunks_num;
 
 struct PlayGoInitParams {
 	const void* buf_addr;
@@ -53,12 +60,27 @@ union PlayGoOptionalChunk {
 	uint64_t scenarios;
 };
 
-static bool ensure_chunks_loaded() {
-	return g_chunks_num != 0 || Loader::SystemContentGetChunksNum(&g_chunks_num);
+static bool ensure_chunks_loaded(uint32_t* out_chunks = nullptr, bool initialize_hack = false) {
+	const auto* program = Loader::RuntimeLinker::GetCurrentProgram();
+	const auto* owner = program != nullptr ? program->application_owner : nullptr;
+	Common::HostLockCriticalGuard critical;
+	std::lock_guard lock(s_chunks_mutex);
+	auto& chunks = s_chunks_num[owner];
+	bool loaded = chunks != 0 || Loader::SystemContentGetChunksNum(&chunks);
+	if (!loaded && initialize_hack) {
+		chunks = PLAYGO_DEFAULT_CHUNKS_NUM;
+		loaded = true;
+		LOGF("\t playgo_hack chunks = %" PRIu32 "\n", chunks);
+	}
+	if (out_chunks != nullptr) {
+		*out_chunks = chunks;
+	}
+	return loaded;
 }
 
 static bool is_valid_chunk(uint16_t chunk_id) {
-	return ensure_chunks_loaded() && chunk_id < g_chunks_num;
+	uint32_t chunks = 0;
+	return ensure_chunks_loaded(&chunks) && chunk_id < chunks;
 }
 
 static bool is_valid_locus(int8_t locus) {
@@ -83,7 +105,7 @@ static void set_optional_chunk(int32_t type, PlayGoOptionalChunk* option) {
 	                                                         : PLAYGO_SCENARIO_MASK_ALL);
 }
 
-int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	PRINT_NAME();
 
 	if (init == nullptr || init->buf_addr == nullptr) {
@@ -98,21 +120,20 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	     "\t reserved = %" PRId32 "\n",
 	     reinterpret_cast<uint64_t>(init->buf_addr), init->buf_size, init->reserved);
 
-	if (Config::PlayGoHackEnabled() && !ensure_chunks_loaded()) {
-		g_chunks_num = PLAYGO_DEFAULT_CHUNKS_NUM;
-		LOGF("\t playgo_hack chunks = %" PRIu32 "\n", g_chunks_num);
+	if (Config::PlayGoHackEnabled()) {
+		ensure_chunks_loaded(nullptr, true);
 	}
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoTerminate() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoTerminate() {
 	PRINT_NAME();
 
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoOpen(int* out_handle, const void* param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoOpen(int* out_handle, const void* param) {
 	PRINT_NAME();
 
 	if (out_handle == nullptr) {
@@ -130,7 +151,7 @@ int KYTY_SYSV_ABI PlayGoOpen(int* out_handle, const void* param) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoClose(int handle) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoClose(int handle) {
 	PRINT_NAME();
 
 	if (auto ret = validate_handle(handle); ret != OK) {
@@ -140,7 +161,7 @@ int KYTY_SYSV_ABI PlayGoClose(int handle) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
                                  int8_t* out_loci) {
 	PRINT_NAME();
 
@@ -170,7 +191,7 @@ int KYTY_SYSV_ABI PlayGoGetLocus(int handle, const uint16_t* chunk_ids, uint32_t
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoGetInstallSpeed(int handle, int32_t* out_speed) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoGetInstallSpeed(int handle, int32_t* out_speed) {
 	PRINT_NAME();
 
 	LOGF("\t handle = %d\n", handle);
@@ -187,7 +208,7 @@ int KYTY_SYSV_ABI PlayGoGetInstallSpeed(int handle, int32_t* out_speed) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoSetInstallSpeed(int handle, int32_t speed) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoSetInstallSpeed(int handle, int32_t speed) {
 	PRINT_NAME();
 
 	LOGF("\t handle = %d\n"
@@ -204,7 +225,7 @@ int KYTY_SYSV_ABI PlayGoSetInstallSpeed(int handle, int32_t speed) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
                                    uint32_t number_of_entries, uint32_t* out_entries) {
 	PRINT_NAME();
 
@@ -224,15 +245,16 @@ int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
 	if (out_chunk_id_list != nullptr && number_of_entries == 0) {
 		return PLAYGO_ERROR_BAD_SIZE;
 	}
-	ensure_chunks_loaded();
+	uint32_t chunks = 0;
+	ensure_chunks_loaded(&chunks);
 
 	// A null output buffer asks for the total chunk count.
 	if (out_chunk_id_list == nullptr) {
-		*out_entries = g_chunks_num;
+		*out_entries = chunks;
 		return OK;
 	}
 
-	const uint32_t entries = std::min(number_of_entries, g_chunks_num);
+	const uint32_t entries = std::min(number_of_entries, chunks);
 	for (uint32_t i = 0; i < entries; i++) {
 		out_chunk_id_list[i] = static_cast<uint16_t>(i);
 	}
@@ -241,7 +263,7 @@ int KYTY_SYSV_ABI PlayGoGetChunkId(int handle, uint16_t* out_chunk_id_list,
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoGetToDoList(int handle, PlayGoToDo* out_todo_list,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoGetToDoList(int handle, PlayGoToDo* out_todo_list,
                                     uint32_t number_of_entries, uint32_t* out_entries) {
 	PRINT_NAME();
 
@@ -266,7 +288,7 @@ int KYTY_SYSV_ABI PlayGoGetToDoList(int handle, PlayGoToDo* out_todo_list,
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoSetToDoList(int handle, const PlayGoToDo* todo_list,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoSetToDoList(int handle, const PlayGoToDo* todo_list,
                                     uint32_t number_of_entries) {
 	PRINT_NAME();
 
@@ -296,7 +318,7 @@ int KYTY_SYSV_ABI PlayGoSetToDoList(int handle, const PlayGoToDo* todo_list,
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoPrefetch(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoPrefetch(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
                                  int8_t minimum_locus) {
 	PRINT_NAME();
 
@@ -327,7 +349,7 @@ int KYTY_SYSV_ABI PlayGoPrefetch(int handle, const uint16_t* chunk_ids, uint32_t
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoGetEta(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoGetEta(int handle, const uint16_t* chunk_ids, uint32_t number_of_entries,
                                int64_t* out_eta) {
 	PRINT_NAME();
 
@@ -350,7 +372,7 @@ int KYTY_SYSV_ABI PlayGoGetEta(int handle, const uint16_t* chunk_ids, uint32_t n
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoGetLanguageMask(int handle, uint64_t* out_language_mask) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoGetLanguageMask(int handle, uint64_t* out_language_mask) {
 	PRINT_NAME();
 
 	if (auto ret = validate_handle(handle); ret != OK) {
@@ -365,7 +387,7 @@ int KYTY_SYSV_ABI PlayGoGetLanguageMask(int handle, uint64_t* out_language_mask)
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoGetProgress(int handle, const uint16_t* chunk_ids,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoGetProgress(int handle, const uint16_t* chunk_ids,
                                     uint32_t number_of_entries, PlayGoProgress* out_progress) {
 	PRINT_NAME();
 
@@ -390,7 +412,7 @@ int KYTY_SYSV_ABI PlayGoGetProgress(int handle, const uint16_t* chunk_ids,
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoGetOptionalChunk(int handle, int32_t type, PlayGoOptionalChunk* option) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoGetOptionalChunk(int handle, int32_t type, PlayGoOptionalChunk* option) {
 	PRINT_NAME();
 
 	if (auto ret = validate_handle(handle); ret != OK) {
@@ -408,7 +430,7 @@ int KYTY_SYSV_ABI PlayGoGetOptionalChunk(int handle, int32_t type, PlayGoOptiona
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoPrefetchOptionalChunk(int handle, int32_t type,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoPrefetchOptionalChunk(int handle, int32_t type,
                                               const PlayGoOptionalChunk* option) {
 	PRINT_NAME();
 
@@ -425,14 +447,14 @@ int KYTY_SYSV_ABI PlayGoPrefetchOptionalChunk(int handle, int32_t type,
 	return OK;
 }
 
-int KYTY_SYSV_ABI PlayGoGetInstallChunkId(int handle, uint16_t* out_chunk_id_list,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoGetInstallChunkId(int handle, uint16_t* out_chunk_id_list,
                                           uint32_t number_of_entries, uint32_t* out_entries) {
 	PRINT_NAME();
 
 	return PlayGoGetChunkId(handle, out_chunk_id_list, number_of_entries, out_entries);
 }
 
-int KYTY_SYSV_ABI PlayGoGetSupportedOptionalChunk(int handle, int32_t type,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PlayGoGetSupportedOptionalChunk(int handle, int32_t type,
                                                   PlayGoOptionalChunk* option) {
 	PRINT_NAME();
 

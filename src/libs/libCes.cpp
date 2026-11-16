@@ -11,6 +11,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -20,7 +23,7 @@ namespace LibCes {
 
 LIB_VERSION("Ces", 1, "Ces", 1, 1);
 
-static const uint8_t* KYTY_SYSV_ABI CesRefersUcsProfileCp1252() {
+static const uint8_t* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CesRefersUcsProfileCp1252() {
 	PRINT_NAME();
 
 	static const uint8_t profile = 0;
@@ -140,7 +143,7 @@ static uint32_t CesEncodeUtf8(uint32_t code, uint8_t* utf8, uint32_t utf8max) {
 	return len;
 }
 
-static int KYTY_SYSV_ABI CesUtf8ToSbc(const uint8_t* utf8, uint32_t utf8max, uint32_t* utf8_len,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CesUtf8ToSbc(const uint8_t* utf8, uint32_t utf8max, uint32_t* utf8_len,
                                       const uint8_t* profile, uint8_t* sbc) {
 	PRINT_NAME();
 
@@ -158,7 +161,7 @@ static int KYTY_SYSV_ABI CesUtf8ToSbc(const uint8_t* utf8, uint32_t utf8max, uin
 	return 0;
 }
 
-static int KYTY_SYSV_ABI CesSbcToUtf8(const uint8_t* profile, uint8_t sbc, uint8_t* utf8,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CesSbcToUtf8(const uint8_t* profile, uint8_t sbc, uint8_t* utf8,
                                       uint32_t utf8max, uint32_t* utf8_len) {
 	PRINT_NAME();
 
@@ -199,7 +202,7 @@ static constexpr int  CES_ERROR_UNASSIGNED_CODE    = static_cast<int>(0x805c0020
 static constexpr int  CES_ERROR_INVALID_DST_BUFFER = static_cast<int>(0x805c0030u);
 static constexpr int  CES_ERROR_DST_BUFFER_END     = static_cast<int>(0x805c0031u);
 
-static CesProfile* KYTY_SYSV_ABI CesUcsProfileInitSJis1997Cp932(CesProfile* sheet) {
+static CesProfile* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CesUcsProfileInitSJis1997Cp932(CesProfile* sheet) {
 	PRINT_NAME();
 	if (sheet != nullptr) {
 		*sheet          = {};
@@ -208,7 +211,7 @@ static CesProfile* KYTY_SYSV_ABI CesUcsProfileInitSJis1997Cp932(CesProfile* shee
 	return sheet;
 }
 
-static int KYTY_SYSV_ABI CesMbcsUcsContextInit(CesContext* context, const CesProfile* profile) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CesMbcsUcsContextInit(CesContext* context, const CesProfile* profile) {
 	PRINT_NAME();
 
 	if (context == nullptr || profile == nullptr) {
@@ -354,7 +357,7 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 	return result;
 }
 
-static int KYTY_SYSV_ABI CesMbcsStrGetUtf8Len(CesContext* context, const uint8_t* source,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CesMbcsStrGetUtf8Len(CesContext* context, const uint8_t* source,
                                               uint32_t source_max, uint32_t* source_len,
                                               uint32_t* destination_len) {
 	PRINT_NAME();
@@ -362,7 +365,7 @@ static int KYTY_SYSV_ABI CesMbcsStrGetUtf8Len(CesContext* context, const uint8_t
 	                         true);
 }
 
-static int KYTY_SYSV_ABI CesMbcsStrToUtf8Str(CesContext* context, const uint8_t* source,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CesMbcsStrToUtf8Str(CesContext* context, const uint8_t* source,
                                              uint32_t source_max, uint32_t* source_len,
                                              uint8_t* destination, uint32_t destination_max,
                                              uint32_t* destination_len) {

@@ -4,18 +4,49 @@
 // #error "KYTY_PLATFORM != KYTY_PLATFORM_LINUX"
 #else
 
+#include "common/assert.h"
+#include "common/file.h"
 #include "common/platform/sysFileIO.h"
+#include "common/platform/sysTimer.h"
+#include "common/stringUtils.h"
 
 #include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <dirent.h>
+#include <fcntl.h>
 #include <filesystem>
+#include <limits>
 #include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
+#include <utime.h>
+#include <utility>
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+enum sys_file_type_t {
+	SYS_FILE_ERROR,       // NOLINT(readability-identifier-naming)
+	SYS_FILE_METADATA,    // Owns a raw descriptor, never a stdio stream.
+	SYS_FILE_MEMORY_STAT, // NOLINT(readability-identifier-naming)
+	SYS_FILE_FILE,        // NOLINT(readability-identifier-naming)
+	SYS_FILE_MEMORY_DYN   // NOLINT(readability-identifier-naming)
+};
+
+// NOLINTNEXTLINE(readability-identifier-naming)
+struct sys_file_mem_buf_t {
+	uint8_t* base;
+	uint8_t* ptr;
+	uint32_t size;
+};
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct sys_file_t {
-	FILE* f;
+	sys_file_type_t type;
+	union {
+		int                 metadata_fd;
+		FILE*               f;
+		sys_file_mem_buf_t* buf;
+	};
 };
 
 // Darwin uses BSD timestamp member names.
@@ -31,87 +62,340 @@ static std::filesystem::path get_internal_name(const std::filesystem::path& name
 	return name.empty() || name.is_absolute() ? name : (std::filesystem::path(".") / name);
 }
 
+// Pass access-pattern hints to the host.
+static void apply_cache_hint(FILE* f, sys_file_cache_type_t cache_type) {
+	if (f == nullptr) {
+		return;
+	}
+
+#if !defined(__APPLE__)
+	int advice = POSIX_FADV_NORMAL;
+	switch (cache_type) {
+		case SYS_FILE_CACHE_RANDOM_ACCESS: advice = POSIX_FADV_RANDOM; break;
+		case SYS_FILE_CACHE_SEQUENTIAL_SCAN: advice = POSIX_FADV_SEQUENTIAL; break;
+		case SYS_FILE_CACHE_AUTO:
+		default: return;
+	}
+	::posix_fadvise(fileno(f), 0, 0, advice);
+#else
+	if (cache_type == SYS_FILE_CACHE_SEQUENTIAL_SCAN) {
+		::fcntl(fileno(f), F_RDAHEAD, 1);
+	} else if (cache_type == SYS_FILE_CACHE_RANDOM_ACCESS) {
+		::fcntl(fileno(f), F_RDAHEAD, 0);
+	}
+#endif
+}
+
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
-	size_t r = fread(data, 1, size, f.f);
-	if (bytes_read != nullptr) {
-		*bytes_read = r;
+	if (f.type == SYS_FILE_FILE) {
+		size_t w = fread(data, 1, size, f.f);
+		if (bytes_read != nullptr) {
+			*bytes_read = w;
+		}
+	} else if (f.type == SYS_FILE_MEMORY_STAT) {
+		uint32_t s = size;
+		if (f.buf->size != 0) {
+			uint32_t l = f.buf->size - (f.buf->ptr - f.buf->base);
+			if (s > l) {
+				s = l;
+			}
+		}
+		memcpy(data, f.buf->ptr, s);
+		f.buf->ptr += s;
+		if (bytes_read != nullptr) {
+			*bytes_read = s;
+		}
+	} else if (f.type == SYS_FILE_MEMORY_DYN) {
+		uint32_t s = size;
+		if (f.buf->size != 0) {
+			uint32_t l = f.buf->size - (f.buf->ptr - f.buf->base);
+			if (s > l) {
+				s = l;
+			}
+		} else {
+			s = 0;
+		}
+		memcpy(data, f.buf->ptr, s);
+		f.buf->ptr += s;
+		if (bytes_read != nullptr) {
+			*bytes_read = s;
+		}
 	}
 }
 
 void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_written) {
-	size_t w = fwrite(data, 1, size, f.f);
-	if (bytes_written != nullptr) {
-		*bytes_written = w;
+	if (f.type == SYS_FILE_FILE) {
+		size_t w = fwrite(data, 1, size, f.f);
+		if (bytes_written != nullptr) {
+			*bytes_written = w;
+		}
+	} else if (f.type == SYS_FILE_MEMORY_STAT) {
+		uint32_t s = size;
+		if (f.buf->size != 0) {
+			uint32_t l = f.buf->size - (f.buf->ptr - f.buf->base);
+			if (s > l) {
+				s = l;
+			}
+		}
+		memcpy(f.buf->ptr, data, s);
+		f.buf->ptr += s;
+		if (bytes_written != nullptr) {
+			*bytes_written = s;
+		}
+	} else if (f.type == SYS_FILE_MEMORY_DYN) {
+		uint32_t pos = f.buf->ptr - f.buf->base;
+		if (f.buf->size < pos + size) {
+			f.buf->base = static_cast<uint8_t*>(std::realloc(f.buf->base, pos + size));
+			f.buf->ptr  = f.buf->base + pos;
+			f.buf->size = pos + size;
+		}
+		memcpy(f.buf->ptr, data, size);
+		f.buf->ptr += size;
+		if (bytes_written != nullptr) {
+			*bytes_written = size;
+		}
 	}
 }
 
-static sys_file_t* OpenHostFile(const std::filesystem::path& file_name, const char* mode) {
-	FILE* f = fopen(get_internal_name(file_name).c_str(), mode);
-	if (f == nullptr) {
-		return nullptr;
+static sys_file_t* OpenHostFile(const std::filesystem::path& file_name, const char* mode,
+                               sys_file_cache_type_t cache_type) {
+	auto* ret = new sys_file_t;
+	ret->f = fopen(get_internal_name(file_name).c_str(), mode);
+	ret->type = ret->f == nullptr ? SYS_FILE_ERROR : SYS_FILE_FILE;
+	if (ret->f != nullptr) {
+		// Independent handles must observe writes and truncation immediately.
+		setvbuf(ret->f, nullptr, _IONBF, 0);
+		apply_cache_hint(ret->f, cache_type);
 	}
-	// Independent handles must observe writes and truncation immediately.
-	setvbuf(f, nullptr, _IONBF, 0);
-	return new sys_file_t {f};
+	return ret;
 }
 
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
-	auto* ret = OpenHostFile(file_name, "w+");
-	if (ret == nullptr) {
+	auto* ret = OpenHostFile(file_name, "w+", SYS_FILE_CACHE_AUTO);
+	if (ret->f == nullptr) {
 		printf("can't create file: %s\n", file_name.c_str());
 	}
 	return ret;
 }
 
-sys_file_t* SysFileOpenR(const std::filesystem::path& file_name) {
-	return OpenHostFile(file_name, "r");
+sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
+	return OpenHostFile(file_name, "r", cache_type);
 }
 
-sys_file_t* SysFileOpenW(const std::filesystem::path& file_name) {
-	return OpenHostFile(file_name, "r+");
+sys_file_t* SysFileOpenMetadata(const std::filesystem::path& name, std::error_code& error) {
+	auto* ret = new sys_file_t;
+#if defined(__linux__)
+	constexpr int flags = O_PATH | O_CLOEXEC;
+#elif defined(__APPLE__)
+	constexpr int flags = O_EVTONLY | O_CLOEXEC;
+#else
+	constexpr int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
+#endif
+	ret->metadata_fd = ::open(name.c_str(), flags);
+	if (ret->metadata_fd < 0) {
+		error = std::error_code(errno, std::generic_category());
+		delete ret;
+		return nullptr;
+	}
+	ret->type = SYS_FILE_METADATA;
+	error.clear();
+	return ret;
 }
 
-sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name) {
-	return OpenHostFile(file_name, "r+");
+sys_file_t* SysFileOpenDirectory(const std::filesystem::path& name, std::error_code& error) {
+	auto* ret = new sys_file_t;
+	// O_PATH metadata handles cannot be fsynced. Keep an actual directory fd.
+	ret->metadata_fd = ::open(name.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (ret->metadata_fd < 0) {
+		error = std::error_code(errno, std::generic_category());
+		delete ret;
+		return nullptr;
+	}
+	ret->type = SYS_FILE_METADATA;
+	error.clear();
+	return ret;
+}
+
+bool SysFileGetTimestamps(sys_file_t& f, Common::FileTimestamp (&times)[2], std::error_code& error) {
+	int fd = -1;
+	if (f.type == SYS_FILE_METADATA) { fd = f.metadata_fd; }
+	else if (f.type == SYS_FILE_FILE && f.f != nullptr) { fd = fileno(f.f); }
+	else {
+		error = std::make_error_code(f.type == SYS_FILE_ERROR ? std::errc::bad_file_descriptor :
+		                                                        std::errc::operation_not_supported);
+		return false;
+	}
+	struct stat info {};
+	if (::fstat(fd, &info) != 0) {
+		error = std::error_code(errno, std::generic_category());
+		return false;
+	}
+	times[0] = {static_cast<int64_t>(info.st_atime), KYTY_STAT_ATIME_NS(info)};
+	times[1] = {static_cast<int64_t>(info.st_mtime), KYTY_STAT_MTIME_NS(info)};
+	error.clear();
+	return true;
+}
+
+bool SysFileSetTimestamps(sys_file_t& f, const Common::FileTimestamp* times, std::error_code& error) {
+	int fd = -1;
+	if (f.type == SYS_FILE_METADATA) { fd = f.metadata_fd; }
+	else if (f.type == SYS_FILE_FILE && f.f != nullptr) { fd = fileno(f.f); }
+	else {
+		error = std::make_error_code(f.type == SYS_FILE_ERROR ? std::errc::bad_file_descriptor :
+		                                                        std::errc::operation_not_supported);
+		return false;
+	}
+	timespec native[2] {};
+	if (times != nullptr) {
+		static_assert(std::numeric_limits<time_t>::is_signed && sizeof(time_t) <= sizeof(int64_t));
+		for (size_t i = 0; i < 2; ++i) {
+			if (times[i].nanoseconds < 0 || times[i].nanoseconds >= 1000000000) {
+				error = std::make_error_code(std::errc::invalid_argument);
+				return false;
+			}
+			if (times[i].seconds < std::numeric_limits<time_t>::min() ||
+			    times[i].seconds > std::numeric_limits<time_t>::max()) {
+				error = std::make_error_code(std::errc::value_too_large);
+				return false;
+			}
+			native[i].tv_sec = static_cast<time_t>(times[i].seconds);
+			native[i].tv_nsec = static_cast<long>(times[i].nanoseconds);
+		}
+	}
+	// Null is host-current-time semantics (including the host's permission rules),
+	// not two separately sampled clocks or an all-zero timestamp pair.
+	if (::futimens(fd, times != nullptr ? native : nullptr) != 0) {
+		error = std::error_code(errno, std::generic_category());
+		return false;
+	}
+	error.clear();
+	return true;
+}
+
+bool SysFileGetIdentity(sys_file_t& f, Common::FileIdentity& identity, std::error_code& error) {
+	int fd = -1;
+	if (f.type == SYS_FILE_METADATA) { fd = f.metadata_fd; }
+	if (f.type == SYS_FILE_FILE && f.f != nullptr) { fd = fileno(f.f); }
+	if (fd < 0) {
+		error = std::make_error_code(std::errc::bad_file_descriptor);
+		return false;
+	}
+	struct stat info {};
+	if (::fstat(fd, &info) != 0) {
+		error = std::error_code(errno, std::generic_category());
+		return false;
+	}
+	Common::FileIdentity result;
+	result.device = static_cast<uint64_t>(info.st_dev);
+	result.inode_low = static_cast<uint64_t>(info.st_ino);
+	identity = std::move(result);
+	error.clear();
+	return true;
+}
+
+sys_file_t* SysFileOpen(uint8_t* buf, uint32_t buf_size) {
+	auto* ret = new sys_file_t;
+
+	ret->type      = SYS_FILE_MEMORY_STAT;
+	ret->buf       = new sys_file_mem_buf_t;
+	ret->buf->base = buf;
+	ret->buf->ptr  = buf;
+	ret->buf->size = buf_size;
+
+	return ret;
+}
+
+sys_file_t* SysFileCreate() {
+	auto* ret = new sys_file_t;
+
+	ret->type      = SYS_FILE_MEMORY_DYN;
+	ret->buf       = new sys_file_mem_buf_t;
+	ret->buf->base = nullptr;
+	ret->buf->ptr  = nullptr;
+	ret->buf->size = 0;
+
+	return ret;
+}
+
+sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
+	return OpenHostFile(file_name, "r+", cache_type);
+}
+
+sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
+                          sys_file_cache_type_t        cache_type) {
+	return OpenHostFile(file_name, "r+", cache_type);
 }
 
 void SysFileClose(sys_file_t* f) {
-	fclose(f->f);
+	[[maybe_unused]] int result = 0;
+
+	if (f->type == SYS_FILE_METADATA) {
+		result = ::close(f->metadata_fd);
+	} else if (f->type == SYS_FILE_FILE && f->f != nullptr) {
+		result = fclose(f->f);
+	} else if (f->type == SYS_FILE_MEMORY_STAT) {
+		delete f->buf;
+	} else if (f->type == SYS_FILE_MEMORY_DYN) {
+		std::free(f->buf->base);
+		delete f->buf;
+	}
+
+	// f.type = SYS_FILE_ERROR;
 	delete f;
 }
 
 uint64_t SysFileSize(sys_file_t& f) {
-	// Preserve sizes above 4 GiB.
-	const off_t pos = ftello(f.f);
-	if (pos < 0) {
-		return 0;
+	[[maybe_unused]] int result = 0;
+
+	if (f.type == SYS_FILE_FILE) {
+		// Preserve sizes above 4 GiB.
+		const off_t pos = ftello(f.f);
+		if (pos < 0) {
+			return 0;
+		}
+		if (fseeko(f.f, 0, SEEK_END) != 0) {
+			return 0;
+		}
+		const off_t size = ftello(f.f);
+		result           = fseeko(f.f, pos, SEEK_SET);
+		return (size < 0 ? 0 : static_cast<uint64_t>(size));
 	}
-	if (fseeko(f.f, 0, SEEK_END) != 0) {
-		return 0;
+
+	if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
+		return f.buf->size;
 	}
-	const off_t size = ftello(f.f);
-	fseeko(f.f, pos, SEEK_SET);
-	return (size < 0 ? 0 : static_cast<uint64_t>(size));
+
+	return 0;
 }
 
 bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
-	const auto  path = get_internal_name(name);
+	const auto path = get_internal_name(name);
 	struct stat info {};
 	if (stat(path.c_str(), &info) != 0) {
 		return false;
 	}
 	*is_file = !S_ISDIR(info.st_mode);
-	*size    = *is_file ? static_cast<uint64_t>(info.st_size) : 0;
+	*size = *is_file ? static_cast<uint64_t>(info.st_size) : 0;
 	return true;
 }
 
+uint64_t SysFileSize(const std::filesystem::path& file_name) {
+	bool is_file;
+	uint64_t size = 0;
+	SysFileGetInfo(file_name, &is_file, &size);
+	return size;
+}
+
 bool SysFileTruncate(sys_file_t& f, uint64_t size) {
-	// Flush before resizing and restore the caller's position.
-	const auto position = ftell(f.f);
-	fflush(f.f);
-	const bool ok = (ftruncate(fileno(f.f), static_cast<off_t>(size)) == 0);
-	if (position >= 0) {
-		fseek(f.f, position, SEEK_SET);
+	bool ok = false;
+	if (f.type == SYS_FILE_FILE) {
+		// Flush before resizing and restore the caller's position.
+		const auto position = ftell(f.f);
+		fflush(f.f);
+		ok = (ftruncate(fileno(f.f), static_cast<off_t>(size)) == 0);
+		if (position >= 0) {
+			fseek(f.f, position, SEEK_SET);
+		}
 	}
 	return ok;
 }
@@ -121,11 +405,45 @@ bool SysFileUnlink(sys_file_t& /*f*/, const std::filesystem::path& name) {
 }
 
 bool SysFileSeek(sys_file_t& f, uint64_t offset) {
-	return fseek(f.f, static_cast<int64_t>(offset), SEEK_SET) == 0;
+	bool ok = true;
+	if (f.type == SYS_FILE_FILE) {
+		ok = (fseek(f.f, static_cast<int64_t>(offset), SEEK_SET) == 0);
+		//		LARGE_INTEGER s;
+		//		s.QuadPart = offset;
+		//		SetFilePointerEx(f.handle, s, 0, FILE_BEGIN);
+		// printf("seek: %u\n", offset);
+	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
+		f.buf->ptr = f.buf->base + offset;
+	}
+	return ok;
 }
 
 uint64_t SysFileTell(sys_file_t& f) {
-	return ftell(f.f);
+	if (f.type == SYS_FILE_FILE) {
+		return ftell(f.f);
+	}
+
+	if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
+		return f.buf->ptr - f.buf->base;
+	}
+
+	return 0;
+}
+
+bool SysFileIsError(sys_file_t& f) {
+	return f.type == SYS_FILE_ERROR || (f.type == SYS_FILE_FILE && f.f == nullptr);
+}
+
+bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
+	bool is_file;
+	uint64_t size;
+	return SysFileGetInfo(path, &is_file, &size) && !is_file;
+}
+
+bool SysFileIsFileExisting(const std::filesystem::path& name) {
+	bool is_file;
+	uint64_t size;
+	return SysFileGetInfo(name, &is_file, &size) && is_file;
 }
 
 bool SysFileCreateDirectory(const std::filesystem::path& path) {
@@ -151,6 +469,13 @@ bool SysFileCreateDirectory(const std::filesystem::path& path) {
 	return true;
 }
 
+bool SysFileDeleteDirectory(const std::filesystem::path& path) {
+	auto real_name     = get_internal_name(path);
+	auto real_name_str = real_name.string();
+
+	return 0 == remove(real_name_str.c_str());
+}
+
 bool SysFileDeleteFile(const std::filesystem::path& name) {
 	auto real_name     = get_internal_name(name);
 	auto real_name_str = real_name.string();
@@ -159,7 +484,33 @@ bool SysFileDeleteFile(const std::filesystem::path& name) {
 }
 
 bool SysFileFlush(sys_file_t& f) {
-	return fflush(f.f) == 0 && fsync(fileno(f.f)) == 0;
+	if (f.type == SYS_FILE_METADATA && f.metadata_fd >= 0) {
+		return fsync(f.metadata_fd) == 0;
+	}
+	if (f.type == SYS_FILE_FILE && f.f != nullptr) {
+		return fflush(f.f) == 0 && fsync(fileno(f.f)) == 0;
+	}
+
+	return false;
+}
+
+SysFileTimeStruct SysFileGetLastAccessTimeUtc(const std::filesystem::path& name) {
+	SysFileTimeStruct r {};
+
+	auto real_name     = get_internal_name(name);
+	auto real_name_str = real_name.string();
+
+	struct stat s {};
+
+	if (0 != stat(real_name_str.c_str(), &s)) {
+		r.is_invalid = true;
+	} else {
+		r.is_invalid = false;
+		r.time       = s.st_atime;
+		r.nanos      = KYTY_STAT_ATIME_NS(s);
+	}
+
+	return r;
 }
 
 SysFileTimeStruct SysFileGetLastWriteTimeUtc(const std::filesystem::path& name) {
@@ -203,18 +554,131 @@ void SysFileGetLastAccessAndWriteTimeUtc(const std::filesystem::path& name, SysF
 
 void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& f, SysFileTimeStruct& a,
                                          SysFileTimeStruct& w) {
+	if (f.type == SYS_FILE_FILE) {
+		struct stat s {};
+
+		const bool ok = (0 == fstat(fileno(f.f), &s));
+
+		a.is_invalid = w.is_invalid = !ok;
+
+		if (ok) {
+			a.time  = s.st_atime;
+			a.nanos = KYTY_STAT_ATIME_NS(s);
+			w.time  = s.st_mtime;
+			w.nanos = KYTY_STAT_MTIME_NS(s);
+		}
+	} else if (f.type == SYS_FILE_MEMORY_STAT || f.type == SYS_FILE_MEMORY_DYN) {
+		// Memory-backed files use the current time.
+		SysTimeStruct t {};
+		SysGetSystemTimeUtc(t);
+		SysSystemToFileTimeUtc(t, a);
+		SysSystemToFileTimeUtc(t, w);
+	} else {
+		a.is_invalid = w.is_invalid = true;
+	}
+}
+
+bool SysFileSetLastAccessTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& access) {
+	if (access.is_invalid) {
+		return false;
+	}
+
+	auto real_name     = get_internal_name(name);
+	auto real_name_str = real_name.string();
+
 	struct stat s {};
 
-	const bool ok = (0 == fstat(fileno(f.f), &s));
-
-	a.is_invalid = w.is_invalid = !ok;
-
-	if (ok) {
-		a.time  = s.st_atime;
-		a.nanos = KYTY_STAT_ATIME_NS(s);
-		w.time  = s.st_mtime;
-		w.nanos = KYTY_STAT_MTIME_NS(s);
+	if (0 != stat(real_name_str.c_str(), &s)) {
+		return false;
 	}
+
+	utimbuf times {};
+	times.actime  = access.time;
+	times.modtime = s.st_mtime;
+
+	return !(0 != utime(real_name_str.c_str(), &times));
+
+	//	if (0 != stat(n.data(), &s))
+	//	{
+	//		return false;
+	//	}
+	//
+	//	times.actime += times.actime - s.st_atime;
+	//	times.modtime += times.modtime - s.st_mtime;
+	//
+	//	if (0 != utime(n.data(), &times))
+	//	{
+	//		return false;
+	//	}
+}
+
+bool SysFileSetLastWriteTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& write) {
+	if (write.is_invalid) {
+		return false;
+	}
+
+	auto real_name     = get_internal_name(name);
+	auto real_name_str = real_name.string();
+
+	struct stat s {};
+
+	if (0 != stat(real_name_str.c_str(), &s)) {
+		return false;
+	}
+
+	utimbuf times {};
+	times.actime  = s.st_atime;
+	times.modtime = write.time;
+
+	return !(0 != utime(real_name_str.c_str(), &times));
+
+	//	if (0 != stat(n.data(), &s))
+	//	{
+	//		return false;
+	//	}
+	//
+	//	times.actime += times.actime - s.st_atime;
+	//	times.modtime += times.modtime - s.st_mtime;
+	//
+	//	if (0 != utime(n.data(), &times))
+	//	{
+	//		return false;
+	//	}
+}
+
+bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
+                                         SysFileTimeStruct& access, SysFileTimeStruct& write) {
+	if (access.is_invalid || write.is_invalid) {
+		return false;
+	}
+
+	auto real_name     = get_internal_name(name);
+	auto real_name_str = real_name.string();
+
+	struct stat s {};
+
+	if (0 != stat(real_name_str.c_str(), &s)) {
+		return false;
+	}
+
+	utimbuf times {};
+	times.actime  = access.time;
+	times.modtime = write.time;
+
+	return !(0 != utime(real_name_str.c_str(), &times));
+
+	//	if (0 != stat(n.data(), &s))
+	//	{
+	//		return false;
+	//	}
+	//
+	//	times.actime += times.actime - s.st_atime;
+	//	times.modtime += times.modtime - s.st_mtime;
+	//
+	//	if (0 != utime(n.data(), &times))
+	//	{
+	//		return false;
+	//	}
 }
 
 // Keep "." and ".." to match FindFirstFileW.
@@ -245,6 +709,13 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 	closedir(dir);
 }
 
+bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	std::error_code error;
+	return std::filesystem::copy_file(get_internal_name(src), get_internal_name(dst),
+	                                  std::filesystem::copy_options::overwrite_existing, error) &&
+	       !error;
+}
+
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
 	auto real_src = get_internal_name(src);
 	auto real_dst = get_internal_name(dst);
@@ -256,6 +727,19 @@ bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::
 	}
 
 	return 0 == rename(real_src.string().c_str(), real_dst.string().c_str());
+}
+
+void SysFileRemoveReadonly(const std::filesystem::path& name) {
+	auto real_name     = get_internal_name(name);
+	auto real_name_str = real_name.string();
+
+	struct stat s {};
+
+	if (0 != stat(real_name_str.c_str(), &s)) {
+		return;
+	}
+
+	chmod(real_name_str.c_str(), s.st_mode | S_IWUSR);
 }
 
 #endif

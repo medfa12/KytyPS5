@@ -3,6 +3,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory(cpuinfo)
 
 include(FetchContent)
+include("${CMAKE_CURRENT_SOURCE_DIR}/sqlite.cmake")
 
 # The Bluetooth DualSense transports speaker audio as fixed-size Opus packets.
 set(kyty_build_testing_saved "${BUILD_TESTING}")
@@ -38,6 +39,8 @@ if(NOT KYTY_CLANG_CL)
 	target_compile_options(openxr_loader PRIVATE -fexceptions)
 endif()
 install(FILES "${openxr_SOURCE_DIR}/LICENSE" DESTINATION "licenses/openxr")
+install(FILES "${openxr_SOURCE_DIR}/src/external/jsoncpp/LICENSE"
+	DESTINATION "licenses/openxr/jsoncpp")
 
 # Noto Sans v2.015 (SIL Open Font License 1.1) is libFont's fallback font.
 set(KYTY_NOTO_SANS_REPOSITORY "https://raw.githubusercontent.com/notofonts/notofonts.github.io")
@@ -84,6 +87,10 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(xbyak zydis)
+install(FILES "${xbyak_SOURCE_DIR}/COPYRIGHT" DESTINATION "licenses/xbyak")
+install(FILES "${zydis_SOURCE_DIR}/LICENSE" DESTINATION "licenses/zydis")
+install(FILES "${zydis_SOURCE_DIR}/dependencies/zycore/LICENSE"
+	DESTINATION "licenses/zydis/zycore")
 target_compile_definitions(xbyak INTERFACE XBYAK_NO_EXCEPTION)
 
 # ZArchive provides random-access reads for compressed game dumps. Build only
@@ -107,11 +114,16 @@ FetchContent_Declare(
 	GIT_REPOSITORY https://github.com/Exzap/ZArchive.git
 	GIT_TAG d2c717730092c7bf8cbb033b12fd4001b7c4d932
 	GIT_SHALLOW FALSE
-	PATCH_COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace
-		"${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
+	PATCH_COMMAND "${CMAKE_COMMAND}" "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+		"-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
+		"-DSOURCE_DIR=<SOURCE_DIR>" -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ApplyGitPatch.cmake"
 	SOURCE_SUBDIR kyty-library-only
 )
 FetchContent_MakeAvailable(zstd zarchive_source)
+FetchContent_GetProperties(zstd SOURCE_DIR zstd_SOURCE_DIR)
+install(FILES "${zstd_SOURCE_DIR}/LICENSE" "${zstd_SOURCE_DIR}/COPYING"
+	DESTINATION "licenses/zstd")
+install(FILES "${zarchive_source_SOURCE_DIR}/LICENSE" DESTINATION "licenses/zarchive")
 
 # Keep the fetched libraries' install rules out of the package.
 foreach(kyty_dir "${opus_SOURCE_DIR}" "${openxr_SOURCE_DIR}" "${xbyak_SOURCE_DIR}" "${zydis_SOURCE_DIR}"
@@ -253,3 +265,10 @@ endif()
 if (CLANG AND MSVC)
 add_subdirectory(winpthread)
 endif()
+
+# ps5-vsh: Hermes VM pin (facebook/hermes v0.11.0, RN-0.70.6 bytecode line).
+# No-op unless -DKYTY_USE_HERMES=ON. The link helper is called from the
+# top-level CMakeLists after add_executable(kyty_emulator) (this file is
+# processed before that target exists); see hermes-pin.cmake.
+include("${CMAKE_CURRENT_SOURCE_DIR}/hermes-pin.cmake")
+kyty_pin_hermes()

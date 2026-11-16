@@ -97,9 +97,6 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::MeshAllocate:
 		case ValueOpcode::StoreCompletion:
 		case ValueOpcode::DataCacheInvalidate:
-		case ValueOpcode::RayQueryInitialize:
-		case ValueOpcode::RayQueryProceed:
-		case ValueOpcode::RayQueryConfirm:
 		case ValueOpcode::Barrier: return true;
 		default: return false;
 	}

@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -31,6 +32,7 @@ enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };
 struct ImageMetadataInfo {
 	GuestRange          range;
 	ImageMetadataKind   kind                 = ImageMetadataKind::None;
+	uint32_t            control              = 0;
 	uint64_t            clear_word           = 0;
 	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed   = false;
@@ -52,16 +54,21 @@ struct ImageSubresourceRange {
 	auto     operator<=>(const ImageSubresourceRange&) const = default;
 };
 
-// Transfer layout of detiled or guest-linear texels; tiled colors pack it mip-major.
-struct ImageLinearLayout {
-	struct Mip {
-		uint64_t offset = 0;
-		uint64_t size   = 0; // Per transfer slice.
-		uint32_t pitch  = 0; // Addressable elements.
-	};
-	std::array<Mip, 16> mips {};
-	// Nonzero for guest-linear and depth-plane transfers.
-	uint64_t slice_stride = 0;
+struct ImageMipInfo {
+	// Guest mip chains run backwards within each layer or volume block-slice.
+	// Tail levels share an offset and use tail_x/tail_y within that block.
+	uint64_t offset                                 = 0;
+	uint64_t size                                   = 0;
+	// Padded dimensions in storage elements (compressed blocks for BC formats).
+	uint32_t pitch                                  = 0;
+	uint32_t height                                 = 0;
+	uint64_t linear_offset                          = 0;
+	uint64_t linear_size                            = 0; // Per transfer slice.
+	uint32_t linear_pitch                           = 0; // Storage elements.
+	uint32_t tail_x                                 = 0;
+	uint32_t tail_y                                 = 0;
+	uint32_t surface_z                              = 0;
+	auto     operator<=>(const ImageMipInfo&) const = default;
 };
 
 struct ImageInfo {
@@ -79,15 +86,15 @@ struct ImageInfo {
 	uint32_t                     samples         = 1;
 	Prospero::TileMode           tile_mode       = Prospero::TileMode::kLinear;
 	bool                         bgra16          = false;
-	// Records of levels [0, resources.levels); an array image's level sizes span every layer.
-	std::array<TileMipLayout, 16> mip_layout {};
-	TileTextureBlockLayout        tiling;
-	uint64_t                      tiled_slice_stride = 0;
-	uint32_t                      first_tail_level   = 16;
+	std::array<ImageMipInfo, 16> mip_layout {};
+	TileTextureBlockLayout       tiling;
+	uint64_t                     tiled_slice_stride = 0;
+	// Nonzero for guest-linear and depth-plane transfers; tiled colors are mip-major.
+	uint64_t linear_slice_stride = 0;
+	uint32_t first_tail_level    = 16;
 
 	void                                           UpdateSize();
 	[[nodiscard]] uint32_t                         DataAlignment() const;
-	[[nodiscard]] ImageLinearLayout                LinearLayout() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;
 	[[nodiscard]] std::vector<vk::BufferImageCopy> BufferCopies(uint64_t buffer_offset = 0,
@@ -153,7 +160,14 @@ struct ImageViewInfo {
 	vk::ComponentMapping mapping     = {};
 	vk::ImageUsageFlags  usage       = vk::ImageUsageFlagBits::eSampled;
 
-	[[nodiscard]] bool operator==(const ImageViewInfo&) const noexcept = default;
+	[[nodiscard]] bool operator==(const ImageViewInfo& rhs) const noexcept {
+		return format == rhs.format && type == rhs.type && aspect == rhs.aspect &&
+		       base_level == rhs.base_level && level_count == rhs.level_count &&
+		       min_lod == rhs.min_lod && base_layer == rhs.base_layer &&
+		       layer_count == rhs.layer_count && mapping.r == rhs.mapping.r &&
+		       mapping.g == rhs.mapping.g && mapping.b == rhs.mapping.b &&
+		       mapping.a == rhs.mapping.a && usage == rhs.usage;
+	}
 };
 
 struct DepthFormatPolicy {
@@ -212,6 +226,19 @@ FindGuestDepthFormatPolicy(Prospero::BufferFormat guest_format) noexcept {
 	return has_stencil ? policy.stencil_attachment_formats.front() : policy.depth_attachment_format;
 }
 
+[[nodiscard]] inline constexpr vk::Format
+DepthAttachmentFormat(Prospero::DepthFormat   depth_format,
+                      Prospero::StencilFormat stencil_format) noexcept {
+	bool has_stencil = false;
+	switch (stencil_format) {
+		case Prospero::StencilFormat::kInvalid: break;
+		case Prospero::StencilFormat::k8UInt: has_stencil = true; break;
+		default: return vk::Format::eUndefined;
+	}
+	const auto* policy = FindDepthFormatPolicy(depth_format);
+	return policy == nullptr ? vk::Format::eUndefined : DepthAttachmentFormat(*policy, has_stencil);
+}
+
 [[nodiscard]] inline constexpr vk::ImageUsageFlags DepthTargetImageUsage() noexcept {
 	return vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled |
 	       vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
@@ -239,6 +266,14 @@ inline bool ImageInfo::IsDepth() const noexcept {
 		case vk::Format::eD32Sfloat: return 4;
 		default: return 0;
 	}
+}
+
+[[nodiscard]] inline constexpr uint32_t EncodeD16AsD24(uint16_t value) noexcept {
+	return static_cast<uint32_t>((static_cast<uint64_t>(value) * 0x00ffffffu + 0x7fffu) / 0xffffu);
+}
+
+[[nodiscard]] inline uint32_t EncodeD16AsD32(uint16_t value) noexcept {
+	return std::bit_cast<uint32_t>(static_cast<float>(value) / 65535.0f);
 }
 
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const ImageInfo& info) {
@@ -308,7 +343,7 @@ inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT210
 	}
 }
 
-inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES {{
+inline constexpr std::array<VideoOutFormatPolicy, 10> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
@@ -316,10 +351,6 @@ inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES 
     {0x8100000022000000ull,
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0x8100000000000000ull,
-     {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
-    {0x8100000622000000ull,
-     {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
-    {0x8100000600000000ull,
      {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ,
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
@@ -536,6 +567,23 @@ inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES 
 
 [[nodiscard]] inline bool ImageRangeOverlaps(GuestRange left, GuestRange right) {
 	return ImageRangeOverlaps(left.address, left.size, right.address, right.size);
+}
+
+[[nodiscard]] inline bool ImagePageRangesOverlap(uint64_t left, uint64_t left_size, uint64_t right,
+                                                 uint64_t right_size) {
+	if (left_size == 0 || right_size == 0 || left > UINT64_MAX - left_size ||
+	    right > UINT64_MAX - right_size) {
+		EXIT("invalid image page-overlap range\n");
+	}
+	const auto left_first  = left / TRACKER_PAGE_SIZE;
+	const auto left_last   = (left + left_size - 1) / TRACKER_PAGE_SIZE;
+	const auto right_first = right / TRACKER_PAGE_SIZE;
+	const auto right_last  = (right + right_size - 1) / TRACKER_PAGE_SIZE;
+	return left_first <= right_last && right_first <= left_last;
+}
+
+[[nodiscard]] inline bool ImagePageRangesOverlap(GuestRange left, GuestRange right) {
+	return ImagePageRangesOverlap(left.address, left.size, right.address, right.size);
 }
 
 } // namespace Libs::Graphics

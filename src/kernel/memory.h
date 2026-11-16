@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/virtualMemory.h"
+#include <memory>
+#include <string>
 
 namespace Libs::Graphics {
 class RenderContext;
@@ -13,8 +15,40 @@ enum class PageFaultAccess;
 namespace Libs::LibKernel::Memory {
 
 void Initialize();
+// Boot-only fallback for co-hosted system sessions without a param.json budget.
+void SetFlexibleMemorySize(uint64_t size);
 void Shutdown();
 
+// Host NP backing pins. Only a complete, kernel-managed flexible mapping with
+// CPU RW coverage is eligible. Tokens never unmap or call callbacks on release.
+// expected_generation=0 discovers the identity; otherwise address reuse fails.
+std::shared_ptr<void> AcquireFlexibleMappingLease(uint64_t address, uint64_t size,
+                                                uint64_t expected_generation, uint64_t* generation);
+// Explicit reclamation; excludes only this token from conflict checking. Caller
+// must have drained every allocation user of it. Failure retains the pin.
+int UnmapFlexibleMappingLease(const std::shared_ptr<void>& lease, uint64_t address, uint64_t size);
+// Reclaim surviving spans of this generation, including after partial failure.
+// Holes/replacement generations are skipped; no surviving original is success.
+// Does not require RW protection or touch a replacement mapping generation.
+int UnmapFlexibleMappingGeneration(uint64_t address, uint64_t size, uint64_t generation);
+
+// Descriptor references and address-space page views independently retain this
+// object. Neither the object nor its extents retain a descriptor or mapping.
+class AnonymousShm;
+std::shared_ptr<AnonymousShm> CreateAnonymousShm();
+uint64_t AnonymousShmSize(const std::shared_ptr<AnonymousShm>& object);
+int ResizeAnonymousShm(const std::shared_ptr<AnonymousShm>& object, int64_t size);
+int64_t TransferAnonymousShm(const std::shared_ptr<AnonymousShm>& object, void* buffer,
+                             size_t count, int64_t offset, bool write);
+int MapAnonymousShm(const std::shared_ptr<AnonymousShm>& object, void* hint, size_t length,
+                    int protection, int flags, int64_t offset, void** result);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+enum class ShmFailure { None, Prepare, Section, Split, Map, Unmap, Protect, ProtectRestore };
+void TestFailShmAfter(ShmFailure operation, uint32_t successes);
+struct ShmCounts { uint64_t objects, extents, views, quarantined, free_bytes; };
+ShmCounts TestShmCounts();
+void TestSetMemoryInvalidationObserver(void (*callback)(uint64_t, uint64_t));
+#endif
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
 // waits on the GPU; call it only while the memory subsystem is initialized.
 struct DebugStats {
@@ -51,20 +85,25 @@ struct VirtualQueryInfo {
 	uint64_t  offset;
 	int32_t   protection;
 	int32_t   memory_type;
-	uint32_t  is_flexible  : 1;
-	uint32_t  is_direct    : 1;
-	uint32_t  is_stack     : 1;
-	uint32_t  is_pooled    : 1;
-	uint32_t  is_committed : 1;
-	uint32_t  is_gpu_prt   : 1;
-	uint32_t  amm_usage    : 1;
-	uint32_t  reserved     : 1;
+	// The guest ABI packs these eight flags into one byte. Windows' unsigned
+	// bitfield allocation unit would otherwise move name from 0x21 to 0x24.
+	uint8_t   is_flexible  : 1;
+	uint8_t   is_direct    : 1;
+	uint8_t   is_stack     : 1;
+	uint8_t   is_pooled    : 1;
+	uint8_t   is_committed : 1;
+	uint8_t   is_gpu_prt   : 1;
+	uint8_t   amm_usage    : 1;
+	uint8_t   reserved     : 1;
 	char      name[KERNEL_MAXIMUM_NAME_LENGTH];
 	uint8_t   gpu_mask_id;
 	uint8_t   reserved2;
 };
 
 static_assert(sizeof(VirtualQueryInfo) == 72, "VirtualQueryInfo struct size is incorrect");
+static_assert(offsetof(VirtualQueryInfo, name) == 0x21, "VirtualQueryInfo name offset is incorrect");
+static_assert(offsetof(VirtualQueryInfo, gpu_mask_id) == 0x41, "VirtualQueryInfo GPU mask offset is incorrect");
+static_assert(offsetof(VirtualQueryInfo, reserved2) == 0x42, "VirtualQueryInfo reserved offset is incorrect");
 
 struct KernelBatchMapEntry {
 	void*         start;
@@ -141,6 +180,8 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
+// Guest shared-owner APIs deny CPU executable mappings/protection with EACCES;
+// trusted Allocate{Program,Runtime}Memory / ProtectGuestMemory remain separate.
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
 int KYTY_SYSV_ABI KernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags);
@@ -171,6 +212,8 @@ int KYTY_SYSV_ABI KernelSetPrtAperture(int index, void* addr, size_t len);
 int KYTY_SYSV_ABI KernelGetPrtAperture(int index, void** addr, size_t* len);
 int KYTY_SYSV_ABI KernelIsAddressSanitizerEnabled();
 int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** end, int* prot);
+int KYTY_SYSV_ABI KernelMlock(const void* addr, size_t len);
+int KYTY_SYSV_ABI KernelMunlock(const void* addr, size_t len);
 int KYTY_SYSV_ABI KernelDirectMemoryQuery(int64_t offset, int flags, void* info, size_t info_size);
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size);
@@ -197,6 +240,12 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name);
+// Allocate Code at exactly address, without searching. Returns address or 0.
+// Address must be nonzero and 16 KiB aligned; size is rounded to 16 KiB.
+// Uses the existing host-writable program allocation policy for patching, not
+// final W^X protections or a ready-to-execute image.
+uint64_t AllocateProgramMemoryAt(uint64_t address, uint64_t size,
+                                 Common::VirtualMemory::Mode mode, const char* name);
 // Loaded modules' segments use flexible memory without taking its backing.
 void ChargeFlexibleMemory(uint64_t size);
 void ReleaseFlexibleMemory(uint64_t size);
@@ -204,6 +253,8 @@ void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMe
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,
                                bool fixed = false);
+// VA-only reservation (no backing commit); see memory.cpp.
+uint64_t ReserveGuestRuntimeMemory(uint64_t size, const char* name);
 uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size,
                                   Common::VirtualMemory::Mode mode, const char* name);
 bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
@@ -213,9 +264,16 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+// Requires initialized memory and no installed renderer. Uses real guest APIs.
+bool     TestRuntimeExecutableMemoryPolicy(std::string* failure);
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
+void     TestFailNextPhysicalMemoryUnmap();
+void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
+void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
+void     TestFailNextFixedReserveRangeRegistration();
+void     TestFailNextVirtualRangeReplacement();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();

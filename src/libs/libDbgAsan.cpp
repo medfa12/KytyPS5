@@ -116,7 +116,7 @@ static void FreeShadow(uintptr_t min_addr, uintptr_t max_addr) {
 		if (it != g_ctx->shadows.end()) {
 			const auto bytes = ShadowCoverage(page, min_addr, max_addr);
 			if (bytes >= it->covered_bytes) {
-				if (!Common::VirtualMemory::Free(page, page_size)) {
+				if (!Common::VirtualMemory::Free(page)) {
 					EXIT("can't free shadow memory\n");
 				}
 
@@ -144,14 +144,15 @@ void TestRegisterMemoryCallbacks() {
 }
 #endif
 
-static void KYTY_SYSV_ABI asan_init() {
+static void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI asan_init() {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(g_ctx != nullptr);
 
 	g_ctx = new AsanContext;
 
-	const auto s = SysStackUsage();
+	sys_dbg_stack_info_t s {};
+	SysStackUsage(s);
 
 	// Cover the full stack reservation.
 	AllocShadow(s.reserved_addr, reinterpret_cast<uintptr_t>(&s));
@@ -159,11 +160,11 @@ static void KYTY_SYSV_ABI asan_init() {
 	LibKernel::Memory::RegisterCallbacks(KernelAlloc, KernelFree);
 }
 
-static void KYTY_SYSV_ABI asan_version_mismatch_check_v8() {
+static void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI asan_version_mismatch_check_v8() {
 	PRINT_NAME();
 }
 
-static void KYTY_SYSV_ABI asan_register_elf_globals(uintptr_t* flag, Global* start, Global* stop) {
+static void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI asan_register_elf_globals(uintptr_t* flag, Global* start, Global* stop) {
 	PRINT_NAME();
 
 	LOGF("\t flag  = %016" PRIx64 "\n"
@@ -215,21 +216,21 @@ static void KYTY_SYSV_ABI asan_register_elf_globals(uintptr_t* flag, Global* sta
 	*flag = 0;
 }
 
-static void KYTY_SYSV_ABI asan_before_dynamic_init(const char* module_name) {
+static void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI asan_before_dynamic_init(const char* module_name) {
 	PRINT_NAME();
 
 	LOGF("\t name = %s\n", module_name);
 }
 
-static void KYTY_SYSV_ABI asan_after_dynamic_init() {
+static void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI asan_after_dynamic_init() {
 	PRINT_NAME();
 }
 
-static void* KYTY_SYSV_ABI asan_memcpy(void* dst, const void* src, size_t size) {
+static void* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI asan_memcpy(void* dst, const void* src, size_t size) {
 	return std::memcpy(dst, src, size);
 }
 
-static void* KYTY_SYSV_ABI asan_memset(void* dst, int ch, size_t size) {
+static void* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI asan_memset(void* dst, int ch, size_t size) {
 	return std::memset(dst, ch, size);
 }
 

@@ -19,7 +19,9 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics)
 }
 
 MasterSemaphore::~MasterSemaphore() {
-	m_graphics.device.destroySemaphore(m_semaphore, nullptr);
+	if (m_semaphore != nullptr) {
+		m_graphics.device.destroySemaphore(m_semaphore, nullptr);
+	}
 }
 
 void MasterSemaphore::Refresh() {

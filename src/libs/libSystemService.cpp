@@ -4,18 +4,28 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "common/threads.h"
 #include "emulator.h"
 #include "graphics/presentation/systemOverlay.h"
-#include "graphics/presentation/window.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
+#include "libs/libLncUtil.h"
+#include "libs/libSystemService.h"
 #include "libs/libs.h"
-#include "libs/systemService.h"
+#include "loader/runtimeGuestExecution.h"
+#include "loader/runtimeChildClient.h"
+#include "loader/runtimeLinker.h"
 #include "loader/symbolDatabase.h"
 
 #include <cstring>
+#include <string>
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h>
+#endif
 #include <deque>
 #include <mutex>
+#include <unordered_map>
+#include <utility>
 
 namespace Libs {
 
@@ -63,25 +73,99 @@ constexpr int                  PARAM_ID_LANG_PS5            = 400; // PPSA01325
 [[maybe_unused]] constexpr int PARAM_ENTER_BUTTON_ASSIGN_CIRCLE = 0;
 [[maybe_unused]] constexpr int PARAM_ENTER_BUTTON_ASSIGN_CROSS  = 1;
 
-struct SystemServiceStatus {
-	int32_t event_num                  = 0;
-	bool    is_system_ui_overlaid      = false;
-	bool    is_in_background_execution = false;
-	bool    is_vr_play_area_overlaid   = false;
-	uint8_t reserved[127]              = {};
-};
-
-struct SystemServiceEvent {
-	int32_t event_type;
-	uint8_t data[8192];
-};
-
 static std::mutex          g_event_mutex;
 static std::deque<int32_t> g_events;
 
+namespace {
+constexpr int32_t EntitlementUpdate = 0x10000003;
+struct ApplicationEvents {
+	Loader::GuestCallOwner owner;
+	std::weak_ptr<Loader::RuntimeGuestExecution> execution;
+	std::deque<int32_t> events;
+};
+// Non-reusing execution token, not Program*. Weak snapshots do not pin retired
+// executables. Explicit release removes entries; registration also sweeps expired
+// snapshots if an abandoned host preparation never reached its cleanup hook.
+static std::unordered_map<uint64_t, ApplicationEvents> g_application_events;
+
+template <typename Operation>
+int WithApplicationEvents(const std::shared_ptr<Loader::RuntimeGuestExecution>& execution, Operation&& operation) {
+	if (!execution) { return SYSTEM_SERVICE_ERROR_UNAVAILABLE; }
+	auto lease = execution->TryAcquire(Loader::GuestWorkKind::HostCall);
+	if (!lease) { return SYSTEM_SERVICE_ERROR_UNAVAILABLE; }
+	Common::HostLockCriticalGuard critical;
+	std::lock_guard lock(g_event_mutex);
+	const auto owner = execution->Owner();
+	const auto it = g_application_events.find(owner.token);
+	if (it == g_application_events.end() || it->second.owner.identity != owner.identity ||
+	    it->second.execution.lock() != execution) { return SYSTEM_SERVICE_ERROR_UNAVAILABLE; }
+	int result = SYSTEM_SERVICE_ERROR_UNAVAILABLE;
+	// Only short host-memory changes here, never guest output writes/callbacks.
+	// Stop and event publication/consumption have a single linearization point.
+	try {
+		lease.Publish([&] { result = operation(it->second.events); });
+	} catch (const std::bad_alloc&) {
+		return SYSTEM_SERVICE_ERROR_UNAVAILABLE;
+	}
+	return result;
+}
+
+template <typename Operation>
+int WithCurrentEvents(Operation&& operation) {
+	const auto* program = Loader::RuntimeLinker::GetCurrentProgram();
+	if (program != nullptr && program->application_owner != nullptr) {
+		return WithApplicationEvents(Loader::GetApplicationExecution(program), std::forward<Operation>(operation));
+	}
+	Common::HostLockCriticalGuard critical;
+	std::lock_guard lock(g_event_mutex);
+	return operation(g_events); // Preserve the legacy null/direct/firmware session.
+}
+} // namespace
+
+bool RegisterApplicationEvents(const std::shared_ptr<Loader::RuntimeGuestExecution>& execution) {
+	if (!execution || !execution->Owner().identity || !execution->Owner().token) { return false; }
+	auto lease = execution->TryAcquire(Loader::GuestWorkKind::HostCall);
+	if (!lease) { return false; }
+	Common::HostLockCriticalGuard critical;
+	std::lock_guard lock(g_event_mutex);
+	for (auto it = g_application_events.begin(); it != g_application_events.end();) {
+		if (it->second.execution.expired()) { it = g_application_events.erase(it); } else { ++it; }
+	}
+	const auto owner = execution->Owner();
+	const auto it = g_application_events.find(owner.token);
+	if (it != g_application_events.end()) {
+		return it->second.owner.identity == owner.identity && it->second.execution.lock() == execution &&
+		       lease.Publish([] {});
+	}
+	return lease.Publish([&] { g_application_events.emplace(owner.token, ApplicationEvents {owner, execution, {}}); });
+}
+
+bool ReleaseApplicationEvents(const std::shared_ptr<Loader::RuntimeGuestExecution>& execution) {
+	if (!execution || !execution->StopRequested() || execution->Outstanding() != 0) { return false; }
+	Common::HostLockCriticalGuard critical;
+	std::lock_guard lock(g_event_mutex);
+	const auto owner = execution->Owner();
+	const auto it = g_application_events.find(owner.token);
+	if (it == g_application_events.end()) { return true; }
+	if (it->second.owner.identity != owner.identity || it->second.execution.lock() != execution) { return false; }
+	g_application_events.erase(it);
+	return true;
+}
+
+bool NotifyApplicationEntitlementUpdate(const std::shared_ptr<Loader::RuntimeGuestExecution>& execution) {
+	return WithApplicationEvents(execution, [](auto& events) {
+		events.push_back(EntitlementUpdate);
+		return OK;
+	}) == OK;
+}
+
 void NotifyEntitlementUpdate() {
-	std::scoped_lock lock(g_event_mutex);
-	g_events.push_back(0x10000003); // SCE_SYSTEM_SERVICE_EVENT_ENTITLEMENT_UPDATE
+	// Keep the existing host API; TLS determines the source subscription. An app
+	// update must not enter the shell queue, including after stop or failed setup.
+	(void)WithCurrentEvents([](auto& events) {
+		events.push_back(EntitlementUpdate);
+		return OK;
+	});
 }
 
 struct SystemServiceDisplaySafeAreaInfo {
@@ -95,18 +179,18 @@ struct SystemServiceHdrToneMapLuminance {
 	float min_tone_map_luminance;
 };
 
-static int KYTY_SYSV_ABI SystemServiceHideSplashScreen() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceHideSplashScreen() {
 	PRINT_NAME();
 	Graphics::HideSplashScreen();
 	return OK;
 }
 
-int KYTY_SYSV_ABI SystemServiceLoadExec(const char* path, const char* const argv[]) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceLoadExec(const char* path, const char* const argv[]) {
 	PRINT_NAME();
 	return Emulator::LoadExec(path, argv);
 }
 
-static int KYTY_SYSV_ABI SystemServiceParamGetInt(int param_id, int* value) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceParamGetInt(int param_id, int* value) {
 	PRINT_NAME();
 
 	if (value == nullptr) {
@@ -138,17 +222,18 @@ static int KYTY_SYSV_ABI SystemServiceParamGetInt(int param_id, int* value) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemServiceParamGetString(int param_id, char* buf, size_t buf_size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceParamGetString(int param_id, char* buf, size_t buf_size) {
 	PRINT_NAME();
 
-	if (buf == nullptr || buf_size == 0) {
+	// Native 13.60 +4bd7..+4bf7: only selector 6, minimum capacity 65.
+	if (buf == nullptr || buf_size < MAX_SYSTEM_NAME_LENGTH) {
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
 	const char* value = nullptr;
 	switch (param_id) {
 		case PARAM_ID_SYSTEM_NAME: value = "Kyty"; break;
-		default: EXIT("unknown string param_id: %d\n", param_id);
+		default: return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
 	const auto len = std::strlen(value);
@@ -157,47 +242,54 @@ static int KYTY_SYSV_ABI SystemServiceParamGetString(int param_id, char* buf, si
 	}
 
 	std::memcpy(buf, value, len + 1);
+	buf[MAX_SYSTEM_NAME_LENGTH - 1] = '\0';
 	LOGF(" %d = %s\n", param_id, value);
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemServiceReceiveEvent(SystemServiceEvent* event) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceReceiveEvent(SystemServiceEvent* event) {
 	PRINT_NAME();
 
 	if (event == nullptr) {
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	event->event_type = -1;
+	int32_t event_type = -1;
+	const int result = WithCurrentEvents([&](auto& events) {
+		if (events.empty()) { return SYSTEM_SERVICE_ERROR_NO_EVENT; }
+		event_type = events.front();
+		events.pop_front();
+		return OK;
+	});
+	if (result != OK && result != SYSTEM_SERVICE_ERROR_NO_EVENT) { return result; }
+	event->event_type = event_type;
 	std::memset(event->data, 0, sizeof(event->data));
-
-	std::scoped_lock lock(g_event_mutex);
-	if (g_events.empty()) {
-		return SYSTEM_SERVICE_ERROR_NO_EVENT;
-	}
-	event->event_type = g_events.front();
-	g_events.pop_front();
-	LOGF("\t SystemService event = 0x%08x\n", static_cast<uint32_t>(event->event_type));
-	return OK;
+	if (result == OK) { LOGF("\t SystemService event = 0x%08x\n", static_cast<uint32_t>(event_type)); }
+	return result;
 }
 
-static int KYTY_SYSV_ABI SystemServiceGetStatus(SystemServiceStatus* status) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceGetStatus(SystemServiceStatus* status) {
 	PRINT_NAME();
 
 	if (status == nullptr) {
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	const auto dialog                  = Dialog::SystemDialog::GetVisualState();
-	*status                            = SystemServiceStatus();
-	status->is_system_ui_overlaid      = dialog.active;
-	status->is_in_background_execution = dialog.background;
-	{
-		std::scoped_lock lock(g_event_mutex);
-		status->event_num = static_cast<int32_t>(g_events.size());
-	}
-
+	const auto dialog = Dialog::SystemDialog::GetVisualState();
+	const bool vsh_overlaid =
+	    LncUtil::Lnc::IsSystemUiOverlaid(Loader::RuntimeLinker::GetCurrentProgram());
+	SystemServiceStatus result;
+	result.is_system_ui_overlaid      = dialog.active || vsh_overlaid;
+	// Hiding the embedded child on Home is background execution. Controller
+	// focus alone does not imply an overlay; that needs a real visual producer.
+	result.is_in_background_execution = dialog.background || vsh_overlaid || Loader::RuntimeChildInBackground();
+	const int event_result = WithCurrentEvents([&](auto& events) {
+		result.event_num = static_cast<int32_t>(events.size());
+		return OK;
+	});
+	if (event_result != OK) { return event_result; }
+	*status = result;
 	return OK;
 }
 
@@ -222,13 +314,14 @@ SystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance)
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
-	const auto display = Graphics::WindowGetDisplayLuminance();
-	*luminance         = {display.max_full_frame, display.max, display.min};
+	luminance->max_full_frame_tone_map_luminance = 80.0f;
+	luminance->max_tone_map_luminance            = 1000.0f;
+	luminance->min_tone_map_luminance            = 0.0f;
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemServiceGetNoticeScreenSkipFlag(bool* value) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceGetNoticeScreenSkipFlag(bool* value) {
 	PRINT_NAME();
 
 	if (value == nullptr) {
@@ -240,39 +333,47 @@ static int KYTY_SYSV_ABI SystemServiceGetNoticeScreenSkipFlag(bool* value) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemServiceDisableNoticeScreenSkipFlagAutoSet() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceDisableNoticeScreenSkipFlagAutoSet() {
 	PRINT_NAME();
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemServiceSetNoticeScreenSkipFlag() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceSetNoticeScreenSkipFlag() {
 	PRINT_NAME();
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemServicePowerTick() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServicePowerTick() {
 	PRINT_NAME();
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemServiceDisableMusicPlayer() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceDisableMusicPlayer() {
 	return OK;
 }
 
 // The counterpart of sceSystemServiceDisableMusicPlayer(). A title can disable the system
 // background music player, and this call re-enables it. It's implemented whit a stub and returns 0.
-static int KYTY_SYSV_ABI sceSystemServiceReenableMusicPlayer() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI sceSystemServiceReenableMusicPlayer() {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemServiceReportAbnormalTermination(const void* info) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceReportAbnormalTermination(const void* info) {
 	PRINT_NAME();
 
 	LOGF("\t info = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(info));
 
+	return OK;
+}
+
+// ps5-vsh: NPXS40038 (SceVideoCore4K) probes USB mass storage on startup.
+// There is no USB backend, but reporting success gets the applet past its
+// init gate instead of aborting the title.
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceUsbStorageInit() {
+	PRINT_NAME();
 	return OK;
 }
 
@@ -283,6 +384,102 @@ static void KYTY_SYSV_ABI SystemServiceInitializePlayerDialogParam() {
 static int KYTY_SYSV_ABI SystemServiceLaunchPlayerDialog() {
 	PRINT_NAME();
 
+	return OK;
+}
+
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceUsbStorageTerm() {
+	PRINT_NAME();
+
+	return OK;
+}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// ps5-vsh: bounded guest-string probe (canary discipline: never fault on a
+// stale pointer; same shape as libShellHits.cpp ProbeGuest).
+static bool DeeplinkProbe(uint64_t addr, size_t len) {
+	if (addr == 0 || len == 0) {
+		return false;
+	}
+	const uint64_t end = addr + len;
+	if (end < addr) {
+		return false;
+	}
+	for (uint64_t p = addr; p < end;) {
+		MEMORY_BASIC_INFORMATION mi {};
+		if (VirtualQuery(reinterpret_cast<const void*>(p), &mi, sizeof(mi)) == 0 ||
+		    mi.State != MEM_COMMIT) {
+			return false;
+		}
+		const DWORD prot = mi.Protect & 0xffu;
+		if (!(prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+		      prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
+		      prot == PAGE_EXECUTE_WRITECOPY)) {
+			return false;
+		}
+		const uint64_t region_end =
+		    reinterpret_cast<uint64_t>(mi.BaseAddress) + mi.RegionSize;
+		if (region_end <= p) {
+			return false;
+		}
+		p = region_end;
+	}
+	return true;
+}
+#else
+static bool DeeplinkProbe(uint64_t addr, size_t len) {
+	return addr != 0 && len != 0;
+}
+#endif
+
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemServiceLaunchSystemDeeplink(int user_id, const char* param) {
+	PRINT_NAME();
+
+	// ps5-vsh: Q5icOdSR3v8. Launches a system feature via a JSON param
+	// string (e.g. {"functionName":"gamehelp",...}). No launcher backend
+	// exists yet, so validated calls report success without launching.
+	if (user_id != Config::GetUserId()) {
+		LOGF("\t user_id = %d (want %d) -> INCORRECT_USER_ID\n", user_id,
+		     static_cast<int>(Config::GetUserId()));
+		return SYSTEM_SERVICE_ERROR_INCORRECT_USER_ID;
+	}
+	if (param == nullptr) {
+		return SYSTEM_SERVICE_ERROR_PARAMETER;
+	}
+	// Bounded NUL scan (INVALID_PARAM_LEN when over-long, per reference).
+	static constexpr size_t kMaxParamLen = 16u * 1024u;
+	const uint64_t          base         = reinterpret_cast<uint64_t>(param);
+	size_t                  len          = 0;
+	while (len < kMaxParamLen && DeeplinkProbe(base + len, 1) &&
+	       reinterpret_cast<const char*>(base)[len] != '\0') {
+		len++;
+	}
+	if (len >= kMaxParamLen) {
+		LOGF("\t param over %llu bytes -> INVALID_PARAM_LEN\n",
+		     static_cast<unsigned long long>(kMaxParamLen));
+		return SYSTEM_SERVICE_ERROR_INVALID_PARAM_LEN;
+	}
+	if (!DeeplinkProbe(base, len + 1)) {
+		return SYSTEM_SERVICE_ERROR_PARAMETER;
+	}
+	const std::string json(reinterpret_cast<const char*>(base), len);
+	// Naive functionName pick for the log (no JSON dep in this TU).
+	std::string feature;
+	const char* key = "\"functionName\"";
+	const size_t kp = json.find(key);
+	if (kp != std::string::npos) {
+		const size_t colon = json.find(':', kp + 8);
+		if (colon != std::string::npos) {
+			const size_t q0 = json.find('"', colon + 1);
+			if (q0 != std::string::npos) {
+				const size_t q1 = json.find('"', q0 + 1);
+				if (q1 != std::string::npos) {
+					feature = json.substr(q0 + 1, q1 - q0 - 1);
+				}
+			}
+		}
+	}
+	LOGF("\t user_id = %d feature = \"%s\" json %.200s -> OK (no launcher backend)\n",
+	     user_id, feature.c_str(), json.c_str());
 	return OK;
 }
 
@@ -345,15 +542,15 @@ static bool SystemGestureIsValidHandle(int32_t gesture_handle) {
 	return gesture_handle == SYSTEM_GESTURE_HANDLE;
 }
 
-static int KYTY_SYSV_ABI SystemGestureInitializePrimitiveTouchRecognizer(const void*) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureInitializePrimitiveTouchRecognizer(const void*) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemGestureFinalizePrimitiveTouchRecognizer() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureFinalizePrimitiveTouchRecognizer() {
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI SystemGestureOpen(int32_t input_type, const void*) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureOpen(int32_t input_type, const void*) {
 	if (input_type != SYSTEM_GESTURE_INPUT_TOUCH_PAD) {
 		return SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT;
 	}
@@ -361,20 +558,20 @@ static int32_t KYTY_SYSV_ABI SystemGestureOpen(int32_t input_type, const void*) 
 	return SYSTEM_GESTURE_HANDLE;
 }
 
-static int KYTY_SYSV_ABI SystemGestureClose(int32_t gesture_handle) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureClose(int32_t gesture_handle) {
 	return SystemGestureIsValidHandle(gesture_handle) ? OK : SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
 }
 
-static int KYTY_SYSV_ABI SystemGestureResetPrimitiveTouchRecognizer(int32_t gesture_handle) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureResetPrimitiveTouchRecognizer(int32_t gesture_handle) {
 	return SystemGestureIsValidHandle(gesture_handle) ? OK : SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
 }
 
-static int KYTY_SYSV_ABI SystemGestureUpdatePrimitiveTouchRecognizer(int32_t gesture_handle,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureUpdatePrimitiveTouchRecognizer(int32_t gesture_handle,
                                                                      const void*) {
 	return SystemGestureIsValidHandle(gesture_handle) ? OK : SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
 }
 
-static int KYTY_SYSV_ABI SystemGestureGetPrimitiveTouchEvents(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureGetPrimitiveTouchEvents(
     int32_t gesture_handle, SystemGesturePrimitiveTouchEvent* event_buffer,
     uint32_t capacity_of_buffer, uint32_t* number_of_event) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
@@ -392,11 +589,11 @@ static int KYTY_SYSV_ABI SystemGestureGetPrimitiveTouchEvents(
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemGestureGetPrimitiveTouchEventsCount(int32_t gesture_handle) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureGetPrimitiveTouchEventsCount(int32_t gesture_handle) {
 	return SystemGestureIsValidHandle(gesture_handle) ? 0 : SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
 }
 
-static int KYTY_SYSV_ABI SystemGestureGetPrimitiveTouchEventByIndex(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureGetPrimitiveTouchEventByIndex(
     int32_t gesture_handle, uint32_t, SystemGesturePrimitiveTouchEvent* event) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
 		return SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
@@ -407,7 +604,7 @@ static int KYTY_SYSV_ABI SystemGestureGetPrimitiveTouchEventByIndex(
 	return SYSTEM_GESTURE_ERROR_EVENT_DATA_NOT_FOUND;
 }
 
-static int KYTY_SYSV_ABI SystemGestureGetPrimitiveTouchEventByPrimitiveID(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureGetPrimitiveTouchEventByPrimitiveID(
     int32_t gesture_handle, uint16_t, SystemGesturePrimitiveTouchEvent* event) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
 		return SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
@@ -433,7 +630,7 @@ SystemGestureCreateTouchRecognizer(int32_t gesture_handle, SystemGestureTouchRec
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemGestureAppendTouchRecognizer(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureAppendTouchRecognizer(
     int32_t gesture_handle, SystemGestureTouchRecognizer* recognizer) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
 		return SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
@@ -441,7 +638,7 @@ static int KYTY_SYSV_ABI SystemGestureAppendTouchRecognizer(
 	return (recognizer != nullptr ? OK : SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
 }
 
-static int KYTY_SYSV_ABI SystemGestureRemoveTouchRecognizer(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureRemoveTouchRecognizer(
     int32_t gesture_handle, SystemGestureTouchRecognizer* recognizer) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
 		return SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
@@ -449,7 +646,7 @@ static int KYTY_SYSV_ABI SystemGestureRemoveTouchRecognizer(
 	return (recognizer != nullptr ? OK : SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
 }
 
-static int KYTY_SYSV_ABI SystemGestureResetTouchRecognizer(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureResetTouchRecognizer(
     int32_t gesture_handle, SystemGestureTouchRecognizer* recognizer) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
 		return SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
@@ -460,7 +657,7 @@ static int KYTY_SYSV_ABI SystemGestureResetTouchRecognizer(
 	return (recognizer != nullptr ? OK : SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
 }
 
-static int KYTY_SYSV_ABI SystemGestureGetTouchRecognizerInformation(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureGetTouchRecognizerInformation(
     int32_t gesture_handle, const SystemGestureTouchRecognizer* recognizer,
     SystemGestureTouchRecognizerInformation* information) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
@@ -475,7 +672,7 @@ static int KYTY_SYSV_ABI SystemGestureGetTouchRecognizerInformation(
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemGestureUpdateTouchRecognizer(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureUpdateTouchRecognizer(
     int32_t gesture_handle, SystemGestureTouchRecognizer* recognizer) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
 		return SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
@@ -483,11 +680,11 @@ static int KYTY_SYSV_ABI SystemGestureUpdateTouchRecognizer(
 	return (recognizer != nullptr ? OK : SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
 }
 
-static int KYTY_SYSV_ABI SystemGestureUpdateAllTouchRecognizer(int32_t gesture_handle) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureUpdateAllTouchRecognizer(int32_t gesture_handle) {
 	return SystemGestureIsValidHandle(gesture_handle) ? OK : SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
 }
 
-static int KYTY_SYSV_ABI SystemGestureUpdateTouchRecognizerRectangle(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureUpdateTouchRecognizerRectangle(
     int32_t gesture_handle, SystemGestureTouchRecognizer* recognizer,
     const SystemGestureRectangle* rectangle) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
@@ -499,7 +696,7 @@ static int KYTY_SYSV_ABI SystemGestureUpdateTouchRecognizerRectangle(
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemGestureGetTouchEvents(int32_t gesture_handle,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureGetTouchEvents(int32_t gesture_handle,
                                                      const SystemGestureTouchRecognizer* recognizer,
                                                      SystemGestureTouchEvent* event_buffer,
                                                      uint32_t                 capacity_of_buffer,
@@ -519,7 +716,7 @@ static int KYTY_SYSV_ABI SystemGestureGetTouchEvents(int32_t gesture_handle,
 	return OK;
 }
 
-static int KYTY_SYSV_ABI SystemGestureGetTouchEventsCount(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureGetTouchEventsCount(
     int32_t gesture_handle, const SystemGestureTouchRecognizer* recognizer) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
 		return SYSTEM_GESTURE_ERROR_INVALID_HANDLE;
@@ -527,7 +724,7 @@ static int KYTY_SYSV_ABI SystemGestureGetTouchEventsCount(
 	return (recognizer != nullptr ? 0 : SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
 }
 
-static int KYTY_SYSV_ABI SystemGestureGetTouchEventByIndex(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureGetTouchEventByIndex(
     int32_t gesture_handle, const SystemGestureTouchRecognizer* recognizer, uint32_t,
     SystemGestureTouchEvent* event) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
@@ -542,7 +739,7 @@ static int KYTY_SYSV_ABI SystemGestureGetTouchEventByIndex(
 	return SYSTEM_GESTURE_ERROR_EVENT_DATA_NOT_FOUND;
 }
 
-static int KYTY_SYSV_ABI SystemGestureGetTouchEventByEventID(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SystemGestureGetTouchEventByEventID(
     int32_t gesture_handle, const SystemGestureTouchRecognizer* recognizer, uint32_t,
     SystemGestureTouchEvent* event) {
 	if (!SystemGestureIsValidHandle(gesture_handle)) {
@@ -584,6 +781,38 @@ LIB_DEFINE(InitSystemGesture_1) {
 
 } // namespace SystemGesture
 
+namespace SystemServiceYouTubeDeviceAuth {
+LIB_VERSION("SystemServiceYouTubeDeviceAuth", 1, "SystemService", 1, 1);
+
+static int KYTY_SYSV_ABI GetCertificationScope(char* output, size_t size) {
+	// 13.60 +0x3980 / 4.03 +0x39f0: a constant scope getter, separate
+	// from the service-backed certification signing operation.
+	constexpr char scope[] = "1p-cobalt-ps5";
+	if (output == nullptr || size < sizeof(scope)) { return static_cast<int>(0x80a10003u); }
+	std::memcpy(output, scope, sizeof(scope));
+	return 0;
+}
+
+LIB_DEFINE(InitDeviceAuthScope) {
+	LIB_FUNC("KgiwSrROsIQ", GetCertificationScope);
+}
+static int KYTY_SYSV_ABI SignCertificationMessage(const char* algorithm, size_t algorithm_size,
+                                                 const void* message, size_t message_size,
+                                                 void* digest, size_t digest_capacity) {
+	// 13.60 +0x39c0 / 4.03 +0x3a20 validate byte spans, then obtain the
+	// signing service. Its absence maps to INTERNAL before touching output.
+	if (algorithm == nullptr || algorithm_size < 11 || message == nullptr || message_size == 0 ||
+	    message_size > 128 || digest == nullptr || digest_capacity < 32 ||
+	    std::memcmp(algorithm, "HMAC-SHA256", 11) != 0) {
+		return static_cast<int>(0x80a10003u);
+	}
+	return static_cast<int>(0x80a10001u);
+}
+LIB_DEFINE(InitDeviceAuthSigning) {
+	LIB_FUNC("Oxh0CSsTZ78", SignCertificationMessage);
+}
+} // namespace SystemServiceYouTubeDeviceAuth
+
 LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("JoBqSQt1yyA", SystemService::SystemServiceLoadExec);
 	LIB_FUNC("Vo5V8KAwCmk", SystemService::SystemServiceHideSplashScreen);
@@ -600,9 +829,19 @@ LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("x1UB9bwDSOw", SystemService::SystemServiceDisableMusicPlayer);
 	LIB_FUNC("9kPCz7Or+1Y", SystemService::sceSystemServiceReenableMusicPlayer);
 	LIB_FUNC("3s8cHiCBKBE", SystemService::SystemServiceReportAbnormalTermination);
+	// ps5-vsh: NPXS40038 (SceVideoCore4K) probes USB storage on startup.
+	// No USB mass-storage backend exists, but reporting success keeps the
+	// applet past its init gate.
+	LIB_FUNC("vv9n14vQtmo", SystemService::SystemServiceUsbStorageInit);
+	LIB_FUNC("jQcQgA0GJ6k", SystemService::SystemServiceUsbStorageTerm);
+	// ps5-vsh: Q5icOdSR3v8 sceSystemServiceLaunchSystemDeeplink (NID from
+	// NID db, libSceSystemService; validated log-and-succeed, no launcher).
+	LIB_FUNC("Q5icOdSR3v8", SystemService::SystemServiceLaunchSystemDeeplink);
 	LIB_FUNC("m5CYKX20wfg", SystemService::SystemServiceInitializePlayerDialogParam);
 	LIB_FUNC("uaieF+glFPs", SystemService::SystemServiceLaunchPlayerDialog);
 	SystemGesture::InitSystemGesture_1(s);
+	SystemServiceYouTubeDeviceAuth::InitDeviceAuthScope(s);
+	SystemServiceYouTubeDeviceAuth::InitDeviceAuthSigning(s);
 }
 
 } // namespace Libs

@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "loader/authorityMetadata.h"
 
 #include <filesystem>
 #include <memory>
@@ -264,7 +265,12 @@ public:
 	[[nodiscard]] bool IsShared() const;
 	[[nodiscard]] bool IsNextGen() const;
 
-	void LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size);
+	void LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size, uint32_t* bytes_read = nullptr);
+	// Hash the same open backing used by LoadSegment; bounded startup identity check.
+	bool MatchesFileSha256(const uint8_t (&expected)[32], uint64_t max_size);
+	bool SnapshotPlainFile(uint64_t exact_size, std::vector<uint8_t>* out);
+	// Bind cached parsing and all subsequent segment reads to one verified image.
+	bool FreezePlainFile(const uint8_t (&expected)[32], uint64_t exact_size);
 
 	uint64_t GetEntry();
 
@@ -280,6 +286,7 @@ public:
 	[[nodiscard]] const Elf64_Ehdr* GetEhdr() const { return m_ehdr.get(); }
 	[[nodiscard]] const Elf64_Phdr* GetPhdr() const { return m_phdr.get(); }
 	[[nodiscard]] const Elf64_Shdr* GetShdr() const { return m_shdr.get(); }
+	[[nodiscard]] const std::optional<AuthorityMetadata>& GetAuthorityMetadata() const { return m_authority_metadata; }
 	[[nodiscard]] char*             GetStrTable() const { return m_str_table.get(); }
 
 	template <class T>
@@ -292,6 +299,7 @@ private:
 	void Clear();
 
 	std::unique_ptr<Common::File>  m_f;
+	std::vector<uint8_t> m_frozen_image;
 	std::unique_ptr<SelfHeader>    m_self;
 	std::unique_ptr<SelfSegment[]> m_self_segments;
 	std::unique_ptr<Elf64_Ehdr>    m_ehdr;
@@ -301,6 +309,7 @@ private:
 	std::unique_ptr<uint8_t[]>     m_dynamic_data;
 	std::unique_ptr<char[]>        m_str_table;
 	uint32_t                       m_str_table_size = 0;
+	std::optional<AuthorityMetadata> m_authority_metadata;
 	// uint64_t    m_base_vaddr   = 0;
 };
 

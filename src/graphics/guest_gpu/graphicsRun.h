@@ -33,7 +33,7 @@ public:
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
-	void Submit(std::span<const uint32_t> commands);
+	void Submit(std::span<const uint32_t> commands, int interrupt_event_id = 0);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
 	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
@@ -51,15 +51,17 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Commands, FlipPreparation, SuspendPoint };
+	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint };
 
 	struct Submission {
-		SubmissionType            type     = SubmissionType::Commands;
+		SubmissionType            type     = SubmissionType::Graphics;
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;
+		bool                      started         = false;
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
+		int                       interrupt_event_id = 0;
 	};
 
 	void              Enqueue(Submission submission);
@@ -89,7 +91,8 @@ private:
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
-	std::atomic_int m_done_num = 0;
+	uint64_t        m_submit_id = 0;
+	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;

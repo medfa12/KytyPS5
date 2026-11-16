@@ -3,16 +3,18 @@
 #include "libs/controller.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "libs/libMbusDevice.h"
 #include "libs/padData.h"
 #include "loader/symbolDatabase.h"
 
+#include <SDL3/SDL.h>
 #include <cstring>
 
 namespace Libs {
 
 LIB_VERSION("Pad", 1, "Pad", 1, 1);
 
-static int KYTY_SYSV_ABI PadSetVibrationMode(int handle, int mode) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadSetVibrationMode(int handle, int mode) {
 	PRINT_NAME();
 
 	LOGF("\t handle      = %d\n"
@@ -22,7 +24,7 @@ static int KYTY_SYSV_ABI PadSetVibrationMode(int handle, int mode) {
 	return Controller::PadCheckHandle(handle);
 }
 
-static int KYTY_SYSV_ABI PadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(bool enabled) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadSetVibrationTriggerEffectWeakWhileEmbeddedMicInUse(bool enabled) {
 	PRINT_NAME();
 
 	LOGF("\t enabled = %d\n", enabled ? 1 : 0);
@@ -80,7 +82,7 @@ PadDeviceClassGetExtendedInformation(int handle, PadDeviceClassExtendedInformati
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PadDeviceClassParseData(int handle, const Controller::PadData* data,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadDeviceClassParseData(int handle, const Controller::PadData* data,
                                                  PadDeviceClassData* class_data) {
 	PRINT_NAME();
 
@@ -113,7 +115,7 @@ static int KYTY_SYSV_ABI PadDeviceClassParseData(int handle, const Controller::P
 	return OK;
 }
 
-static int KYTY_SYSV_ABI PadSetTiltCorrectionState(int handle, bool enabled) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadSetTiltCorrectionState(int handle, bool enabled) {
 	PRINT_NAME();
 
 	LOGF("\t handle  = %d\n"
@@ -124,7 +126,20 @@ static int KYTY_SYSV_ABI PadSetTiltCorrectionState(int handle, bool enabled) {
 }
 
 // PPSA02385
-static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* info) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadOpenExtStub(int user_id, int type, int index, const void* param) {
+	PRINT_NAME();
+
+	LOGF("\t user_id = %d\n"
+	     "\t type    = %d\n"
+	     "\t index   = %d\n"
+	     "\t param   = 0x%016" PRIx64 "\n",
+	     user_id, type, index, reinterpret_cast<uint64_t>(param));
+
+	return OK;
+}
+
+// PPSA02385
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* info) {
 	PRINT_NAME();
 
 	LOGF("\t handle = %d\n"
@@ -134,7 +149,7 @@ static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* in
 	return Controller::PadCheckHandle(handle);
 }
 
-static int KYTY_SYSV_ABI PadUnknownN3kSX62fgNo(uint64_t arg0, uint64_t arg1, uint64_t arg2,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadUnknownN3kSX62fgNo(uint64_t arg0, uint64_t arg1, uint64_t arg2,
                                                uint64_t arg3, uint64_t arg4, uint64_t arg5) {
 	PRINT_NAME();
 
@@ -149,12 +164,141 @@ static int KYTY_SYSV_ABI PadUnknownN3kSX62fgNo(uint64_t arg0, uint64_t arg1, uin
 	return OK;
 }
 
+// Device/open/read family verified against 13.60: the keyboard/mouse device
+// uses the MBUS DualSense identity, supported-feature bits and the 112-byte
+// privileged read layout.
+namespace {
+constexpr int kPadInvalidArg    = -2137915391; // 0x80920001
+constexpr int kPadInvalidHandle = -2137915389; // 0x80920003
+
+int GetPhysicalControllerId() {
+	const int id = Controller::GetActiveControllerId();
+	return id == Controller::HOST_INPUT_CONTROLLER_ID ? -1 : id;
+}
+
+int OpenPrimaryDevicePort() {
+	return Controller::OpenSystemDevicePort();
+}
+} // namespace
+
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadDeviceOpen(uint64_t device_id, int type, int index) {
+	const int id = GetPhysicalControllerId();
+	// Bounded call logging: device-id space is guest-enumerated and was
+	// previously invisible (both error paths returned silently).
+	static int open_logs = 0;
+	if (open_logs < 16) {
+		open_logs++;
+		LOGF("\t PadDeviceOpen call: device_id=0x%016" PRIx64 " type=%d index=%d phys=%d\n",
+		     device_id, type, index, id);
+	}
+	if (id < 0) {
+		// This is the same DualSense (MBUS type 22 / native Bond) advertised by
+		// enumeration. Other device-class probes must not open aliases of it.
+		if (device_id != Mbus::kVirtualPadDeviceId) { return kPadInvalidHandle; }
+		if (type != Mbus::kVirtualPadOpenType || index != 0) { return kPadInvalidArg; }
+		static int host_opens = 0;
+		if (host_opens < 8) {
+			host_opens++;
+			LOGF("\t PadDeviceOpen: keyboard/mouse PS5 DualSense (device_id=0x%016" PRIx64
+			     ") -> handle 1\n",
+			     device_id);
+		}
+		return OpenPrimaryDevicePort();
+	}
+	if (device_id != static_cast<uint64_t>(id)) {
+		return kPadInvalidHandle;
+	}
+	if (type != 0 || index != 0) {
+		return kPadInvalidArg;
+	}
+	LOGF("\t PadDeviceOpen: physical controller %d -> handle 1\n", id);
+	return OpenPrimaryDevicePort();
+}
+
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadSetUserNumber(int device_id, int number) {
+	if (device_id < 0 || device_id != GetPhysicalControllerId()) {
+		return kPadInvalidHandle;
+	}
+	if (number < 1 || number > 5) {
+		return kPadInvalidArg;
+	}
+	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(device_id));
+	    pad != nullptr) {
+		if (!SDL_SetGamepadPlayerIndex(pad, number - 1)) {
+			LOGF("\t PadSetUserNumber: SDL player indicator unavailable: %s\n", SDL_GetError());
+		}
+	}
+	LOGF("\t PadSetUserNumber: device=%d number=%d\n", device_id, number);
+	return OK;
+}
+
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadGetCapability(uint64_t device_id, uint32_t* capability) {
+	if (capability == nullptr) {
+		return kPadInvalidArg;
+	}
+	const int id = GetPhysicalControllerId();
+	if (id < 0) {
+		if (device_id != Mbus::kVirtualPadDeviceId) { return kPadInvalidHandle; }
+		// Supported features: motion, vibration, lightbar, player LED, touchpad.
+		// Model identity is MBUS type 22 (DualSense), not this feature bitmask.
+		*capability = 0x1f;
+		return OK;
+	}
+	if (device_id != static_cast<uint64_t>(id)) {
+		return kPadInvalidHandle;
+	}
+	// Motion, vibration, lightbar, player LED and touchpad.
+	*capability = 0x1f;
+	return OK;
+}
+
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadUiReadState(int handle, void* data) {
+	if (data == nullptr) {
+		return kPadInvalidArg;
+	}
+	Controller::PadData state {};
+	const int result = Controller::PadReadSystemState(handle, &state);
+	if (result != OK) {
+		static thread_local unsigned failures = 0;
+		if (failures++ < 8) {
+			LOGF("\t PadUiReadState: handle=%d error=0x%08x\n", handle,
+			     static_cast<uint32_t>(result));
+		}
+		return result;
+	}
+	// The privileged UI ABI is 112 bytes: the common pad prefix through the
+	// timestamp, but connected_count is at byte 77 rather than byte 106.
+	std::memset(data, 0, 112);
+	std::memcpy(data, &state, 88);
+	static_cast<uint8_t*>(data)[77] = state.connected_count;
+	static thread_local uint32_t last_buttons   = UINT32_MAX;
+	static thread_local int      last_connected = -1;
+	if (last_buttons != state.buttons || last_connected != static_cast<int>(state.connected)) {
+		LOGF("\t PadUiReadState: handle=%d connected=%d buttons=0x%08x\n", handle,
+		     static_cast<int>(state.connected), state.buttons);
+		last_buttons   = state.buttons;
+		last_connected = static_cast<int>(state.connected);
+	}
+	return OK;
+}
+
+static int64_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadGetIdleCount(int handle) {
+	(void)handle;
+	return 0;
+}
+
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PadSetProcessPrivilege(int privilege) {
+	PRINT_NAME();
+	LOGF("\t [DmBx8K+jDWw] scePadSetProcessPrivilege privilege=%d\n", privilege);
+	return 0;
+}
+
 LIB_DEFINE(InitPad_1) {
 	PRINT_NAME_ENABLE(true);
 
 	LIB_FUNC("hv1luiJrqQM", Controller::PadInit);
 	LIB_FUNC("xk0AcarP3V4", Controller::PadOpen);
-	LIB_FUNC("WFIiSfXGUq8", Controller::PadOpenExt);
+	LIB_FUNC("WFIiSfXGUq8", PadOpenExtStub);
 	LIB_FUNC("u1GRHp+oWoY", Controller::PadGetHandle);
 	LIB_FUNC("AcslpN1jHR8", PadDeviceClassGetExtendedInformation);
 	LIB_FUNC("IHPqcbc0zCA", PadDeviceClassParseData);
@@ -176,6 +320,12 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("RR4novUEENY", Controller::PadSetLightBar);
 	LIB_FUNC("6ncge5+l5Qs", Controller::PadClose);
 	LIB_FUNC("n3kSX62fgNo", PadUnknownN3kSX62fgNo);
+	LIB_FUNC("d7bXuEBycDI", PadDeviceOpen); // scePadDeviceOpen
+	LIB_FUNC("iOqpYvGEo6A", PadSetUserNumber); // scePadSetUserNumber
+	LIB_FUNC("qtasqbvwgV4", PadGetCapability); // scePadGetCapability
+	LIB_FUNC("FYqcaosYiIo", PadUiReadState); // scePadUiReadState
+	LIB_FUNC("kiA9bZhbnAg", PadGetIdleCount); // scePadGetIdleCount
+	LIB_FUNC("DmBx8K+jDWw", PadSetProcessPrivilege); // scePadSetProcessPrivilege
 	LIB_FUNC("iA-DdobUen8", Controller::PadVrControllerReadState);
 	LIB_FUNC("v8P+9PRqg10", Controller::PadVrControllerSetTriggerEffects);
 }
@@ -201,13 +351,13 @@ struct MouseData {
 	uint8_t  reserved[8];
 };
 
-static int KYTY_SYSV_ABI MouseInit() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MouseInit() {
 	PRINT_NAME();
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI MouseOpen(int user_id, int32_t type, int32_t index, const void* param) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MouseOpen(int user_id, int32_t type, int32_t index, const void* param) {
 	PRINT_NAME();
 
 	LOGF("\t user_id = %d\n"
@@ -223,7 +373,7 @@ static int KYTY_SYSV_ABI MouseOpen(int user_id, int32_t type, int32_t index, con
 	return 1;
 }
 
-static int KYTY_SYSV_ABI MouseClose(int32_t handle) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MouseClose(int32_t handle) {
 	PRINT_NAME();
 
 	LOGF("\t handle = %" PRId32 "\n", handle);
@@ -235,7 +385,7 @@ static int KYTY_SYSV_ABI MouseClose(int32_t handle) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI MouseRead(int32_t handle, MouseData* data, int32_t num) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI MouseRead(int32_t handle, MouseData* data, int32_t num) {
 	PRINT_NAME();
 
 	LOGF("\t handle = %" PRId32 "\n"
@@ -298,13 +448,13 @@ struct KeyboardCharData {
 	uint8_t  reserve[8];
 };
 
-static int KYTY_SYSV_ABI KeyboardInit() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI KeyboardInit() {
 	PRINT_NAME();
 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI KeyboardOpen(int user_id, int32_t type, int32_t index, const void* param) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI KeyboardOpen(int user_id, int32_t type, int32_t index, const void* param) {
 	PRINT_NAME();
 
 	LOGF("\t user_id = %d\n"
@@ -320,7 +470,7 @@ static int KYTY_SYSV_ABI KeyboardOpen(int user_id, int32_t type, int32_t index, 
 	return 1;
 }
 
-static int KYTY_SYSV_ABI KeyboardClose(int32_t handle) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI KeyboardClose(int32_t handle) {
 	PRINT_NAME();
 
 	LOGF("\t handle = %" PRId32 "\n", handle);
@@ -332,7 +482,7 @@ static int KYTY_SYSV_ABI KeyboardClose(int32_t handle) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI KeyboardRead(int32_t handle, KeyboardData* data, int32_t num) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI KeyboardRead(int32_t handle, KeyboardData* data, int32_t num) {
 	PRINT_NAME();
 
 	LOGF("\t handle = %" PRId32 "\n"
@@ -352,7 +502,7 @@ static int KYTY_SYSV_ABI KeyboardRead(int32_t handle, KeyboardData* data, int32_
 	return 0;
 }
 
-static int KYTY_SYSV_ABI KeyboardReadState(int32_t handle, KeyboardData* data) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI KeyboardReadState(int32_t handle, KeyboardData* data) {
 	PRINT_NAME();
 
 	LOGF("\t handle = %" PRId32 "\n"
@@ -371,7 +521,7 @@ static int KYTY_SYSV_ABI KeyboardReadState(int32_t handle, KeyboardData* data) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI KeyboardGetKey2Char(int32_t handle, int32_t arrange, uint32_t led,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI KeyboardGetKey2Char(int32_t handle, int32_t arrange, uint32_t led,
                                              uint32_t modifier_key, uint16_t key_code,
                                              KeyboardCharData* char_data) {
 	PRINT_NAME();

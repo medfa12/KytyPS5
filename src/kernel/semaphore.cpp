@@ -11,356 +11,14 @@
 #include <algorithm>
 #include <atomic>
 #include <limits>
+#include <string>
 #include <unordered_map>
 #include <vector>
-
-namespace Libs::LibKernel {
-void KernelDispatchPendingSignalForCurrentThread();
-} // namespace Libs::LibKernel
-
-namespace Libs::LibKernel::Semaphore {
-
-LIB_NAME("libkernel", "libkernel");
-
-constexpr uint32_t SIGNAL_APC_POLL_MICROS = 10000;
-
-class KernelSemaPrivate {
-public:
-	enum class Result { Ok, TimedOut, Canceled, Deleted, InvalCount };
-
-	KernelSemaPrivate(const std::string& name, bool fifo, int init_count, int max_count)
-	    : m_name(name), m_fifo_order(fifo), m_count(init_count), m_init_count(init_count),
-	      m_max_count(max_count) {};
-	virtual ~KernelSemaPrivate();
-
-	KYTY_CLASS_NO_COPY(KernelSemaPrivate);
-
-	Result Cancel(int set_count, int* num_waiting_threads);
-	Result Signal(int signal_count);
-	Result Wait(int need_count, uint32_t* ptr_micros);
-
-	Result Poll(int need_count) {
-		uint32_t micros = 0;
-		return Wait(need_count, &micros);
-	}
-
-	[[nodiscard]] const std::string& GetName() const { return m_name; }
-
-private:
-	enum class Status { Set, Deleted };
-
-	// Each waiter sleeps on its own condition variable, so a signal wakes only the waiters it
-	// gives counts to.
-	struct WaitingThread {
-		int             priority   = 700;
-		int             need_count = 0;
-		Result          result     = Result::TimedOut;
-		bool            ready      = false;
-		Common::CondVar cond_var;
-	};
-
-	void AddWaiter(WaitingThread* waiter);
-	void RemoveWaiter(WaitingThread* waiter);
-	void WakeWaiters();
-
-	Common::Mutex               m_mutex;
-	std::string                 m_name;
-	Status                      m_status = Status::Set;
-	std::vector<WaitingThread*> m_waiting_threads;
-	bool                        m_fifo_order;
-	int                         m_count;
-	int                         m_init_count;
-	int                         m_max_count;
-};
-
-KernelSemaPrivate::~KernelSemaPrivate() {
-	Common::LockGuard lock(m_mutex);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
-	m_status = Status::Deleted;
-
-	for (auto* waiter: m_waiting_threads) {
-		if (!waiter->ready) {
-			waiter->result = Result::Deleted;
-			waiter->ready  = true;
-			waiter->cond_var.Signal();
-		}
-	}
-
-	while (!m_waiting_threads.empty()) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-}
-
-KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_waiting_threads) {
-	Common::LockGuard lock(m_mutex);
-
-	if (set_count > m_max_count) {
-		return Result::InvalCount;
-	}
-
-	if (m_status == Status::Deleted) {
-		return Result::Deleted;
-	}
-
-	if (num_waiting_threads != nullptr) {
-		*num_waiting_threads = static_cast<int>(
-		    std::count_if(m_waiting_threads.begin(), m_waiting_threads.end(),
-		                  [](const WaitingThread* waiter) { return !waiter->ready; }));
-	}
-
-	m_count = (set_count < 0 ? m_init_count : set_count);
-
-	for (auto* waiter: m_waiting_threads) {
-		if (!waiter->ready) {
-			waiter->result = Result::Canceled;
-			waiter->ready  = true;
-			waiter->cond_var.Signal();
-		}
-	}
-
-	return Result::Ok;
-}
-
-KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
-	Common::LockGuard lock(m_mutex);
-
-	if (m_status == Status::Deleted) {
-		return Result::Deleted;
-	}
-
-	if (m_count + signal_count > m_max_count) {
-		return Result::InvalCount;
-	}
-
-	m_count += signal_count;
-
-	WakeWaiters();
-
-	return Result::Ok;
-}
-
-void KernelSemaPrivate::AddWaiter(WaitingThread* waiter) {
-	if (m_fifo_order) {
-		m_waiting_threads.push_back(waiter);
-		return;
-	}
-
-	auto it = m_waiting_threads.begin();
-	while (it != m_waiting_threads.end() && (*it)->priority <= waiter->priority) {
-		++it;
-	}
-	m_waiting_threads.insert(it, waiter);
-}
-
-void KernelSemaPrivate::RemoveWaiter(WaitingThread* waiter) {
-	auto it = std::find(m_waiting_threads.begin(), m_waiting_threads.end(), waiter);
-	if (it != m_waiting_threads.end()) {
-		m_waiting_threads.erase(it);
-	}
-}
-
-void KernelSemaPrivate::WakeWaiters() {
-	for (auto* waiter: m_waiting_threads) {
-		if (!waiter->ready && waiter->need_count <= m_count) {
-			m_count -= waiter->need_count;
-			waiter->result = Result::Ok;
-			waiter->ready  = true;
-			waiter->cond_var.Signal();
-		}
-	}
-}
-
-KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_micros) {
-	Common::LockGuard lock(m_mutex);
-
-	if (need_count < 1 || need_count > m_max_count) {
-		return Result::InvalCount;
-	}
-
-	if (m_status == Status::Deleted) {
-		return Result::Deleted;
-	}
-
-	uint32_t micros     = 0;
-	bool     infinitely = true;
-	if (ptr_micros != nullptr) {
-		micros     = *ptr_micros;
-		infinitely = false;
-	}
-
-	if (m_count >= need_count) {
-		m_count -= need_count;
-		if (ptr_micros != nullptr) {
-			*ptr_micros = micros;
-		}
-		return Result::Ok;
-	}
-
-	if (!infinitely && micros == 0) {
-		return Result::TimedOut;
-	}
-
-	uint32_t      elapsed = 0;
-	Common::Timer t;
-
-	WaitingThread waiter {};
-	waiter.priority   = (m_fifo_order ? 0 : Libs::LibKernel::PthreadGetCurrentPriorityForKernel());
-	waiter.need_count = need_count;
-	AddWaiter(&waiter);
-
-	while (!waiter.ready) {
-		if ((elapsed >= micros && !infinitely)) {
-			RemoveWaiter(&waiter);
-			*ptr_micros = 0;
-			return Result::TimedOut;
-		}
-
-		waiter.cond_var.WaitFor(&m_mutex, infinitely ? SIGNAL_APC_POLL_MICROS : micros - elapsed);
-
-		m_mutex.Unlock();
-		LibKernel::KernelDispatchPendingSignalForCurrentThread();
-		m_mutex.Lock();
-
-		elapsed = static_cast<uint32_t>(t.GetTimeS() * 1000000.0);
-	}
-
-	RemoveWaiter(&waiter);
-
-	if (ptr_micros != nullptr) {
-		*ptr_micros = (elapsed >= micros ? 0 : micros - elapsed);
-	}
-
-	return waiter.result;
-}
-
-int KYTY_SYSV_ABI KernelCreateSema(KernelSema* sem, const char* name, uint32_t attr, int init,
-                                   int max, void* opt) {
-	PRINT_NAME();
-
-	EXIT_NOT_IMPLEMENTED(sem == nullptr);
-
-	if (name == nullptr || attr > 2 || init < 0 || max <= 0 || init > max) {
-		return KERNEL_ERROR_EINVAL;
-	}
-
-	bool fifo = false;
-
-	switch (attr) {
-		case 0x01: fifo = true; break;
-		case 0x02:
-		default: fifo = false; break;
-	}
-
-	*sem = new KernelSemaPrivate(std::string(name), fifo, init, max);
-
-	return OK;
-}
-
-int KYTY_SYSV_ABI KernelDeleteSema(KernelSema sem) {
-	PRINT_NAME();
-
-	if (sem == nullptr) {
-		return KERNEL_ERROR_ESRCH;
-	}
-
-	delete sem;
-
-	return OK;
-}
-
-int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time) {
-	if (sem == nullptr) {
-		return KERNEL_ERROR_ESRCH;
-	}
-
-	auto result = sem->Wait(need, time);
-
-	int ret = OK;
-
-	switch (result) {
-		case KernelSemaPrivate::Result::Ok: ret = OK; break;
-		case KernelSemaPrivate::Result::InvalCount: ret = KERNEL_ERROR_EINVAL; break;
-		case KernelSemaPrivate::Result::TimedOut: ret = KERNEL_ERROR_ETIMEDOUT; break;
-		case KernelSemaPrivate::Result::Canceled: ret = KERNEL_ERROR_ECANCELED; break;
-		case KernelSemaPrivate::Result::Deleted: ret = KERNEL_ERROR_EACCES; break;
-	}
-
-	return ret;
-}
-
-int KYTY_SYSV_ABI KernelPollSema(KernelSema sem, int need) {
-	PRINT_NAME();
-
-	if (sem == nullptr) {
-		return KERNEL_ERROR_ESRCH;
-	}
-
-	auto result = sem->Poll(need);
-
-	int ret = OK;
-
-	switch (result) {
-		case KernelSemaPrivate::Result::Ok: ret = OK; break;
-		case KernelSemaPrivate::Result::InvalCount: ret = KERNEL_ERROR_EINVAL; break;
-		case KernelSemaPrivate::Result::TimedOut:
-		case KernelSemaPrivate::Result::Canceled:
-		case KernelSemaPrivate::Result::Deleted: ret = KERNEL_ERROR_EBUSY; break;
-	}
-
-	return ret;
-}
-
-int KYTY_SYSV_ABI KernelSignalSema(KernelSema sem, int count) {
-	if (sem == nullptr) {
-		return KERNEL_ERROR_ESRCH;
-	}
-
-	auto result = sem->Signal(count);
-
-	int ret = OK;
-
-	switch (result) {
-		case KernelSemaPrivate::Result::Ok: ret = OK; break;
-		case KernelSemaPrivate::Result::InvalCount:
-		case KernelSemaPrivate::Result::TimedOut:
-		case KernelSemaPrivate::Result::Canceled:
-		case KernelSemaPrivate::Result::Deleted: ret = KERNEL_ERROR_EINVAL; break;
-	}
-
-	return ret;
-}
-
-int KYTY_SYSV_ABI KernelCancelSema(KernelSema sem, int count, int* threads) {
-	PRINT_NAME();
-
-	if (sem == nullptr) {
-		return KERNEL_ERROR_ESRCH;
-	}
-
-	auto result = sem->Cancel(count, threads);
-
-	int ret = OK;
-
-	switch (result) {
-		case KernelSemaPrivate::Result::Ok: ret = OK; break;
-		case KernelSemaPrivate::Result::InvalCount:
-		case KernelSemaPrivate::Result::TimedOut:
-		case KernelSemaPrivate::Result::Canceled:
-		case KernelSemaPrivate::Result::Deleted: ret = KERNEL_ERROR_EINVAL; break;
-	}
-
-	return ret;
-}
-
-} // namespace Libs::LibKernel::Semaphore
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <intrin.h>
+#endif
+
+#include "kernel/semaphoreNative.inc"
 
 namespace Libs::Posix {
 
@@ -395,6 +53,7 @@ public:
 		uint32_t      elapsed    = 0;
 		const bool    timed_wait = (micros != nullptr);
 		Common::Timer timer;
+		timer.Start();
 
 		while (m_count <= 0) {
 			if (timed_wait && elapsed >= *micros) {
@@ -525,7 +184,7 @@ static int SemInitImpl(void* sem, int pshared, unsigned int value, const char* n
 	static std::atomic<uint32_t> log_count {0};
 	const auto                   count = log_count.fetch_add(1);
 	if (count < 32) {
-		LOGF("\t POSIX semaphore init: %s, value = %u, pshared = %d\n",
+		LOGF("\t POSIX semaphore init: sem=%p %s, value = %u, pshared = %d\n", sem,
 		     (name != nullptr ? name : "sem"), value, pshared);
 	}
 
@@ -562,12 +221,59 @@ static int SemDestroyImpl(void* sem) {
 }
 
 static int SemTimedwaitImpl(void* sem, uint32_t* micros) {
+	Libs::NoteHleCall("libkernel", "libkernel", "SemTimedwaitImpl");
+	HLE_SLOW_GUARD("posix-sem");
+	// ps5-vsh: posix-sem waiter census (diagnostic). Central entry for
+// sem_wait/reltimedwait/timedwait + PthreadSem* wrappers. First + every
+// 64th entry logs waiter thread name + guest sem addr + timeout so
+// parked threads (silent host waits) become attributable. Entry-only;
+// no behavior change.
+	static std::atomic<uint64_t> s_psem_wait_probe {0};
+	const uint64_t               psem_probe_n =
+	    s_psem_wait_probe.fetch_add(1, std::memory_order_relaxed);
+	if (psem_probe_n == 0 || (psem_probe_n % 64ull) == 0) {
+		char waiter[64] = "?";
+		if (auto* self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+			if (Libs::LibKernel::PthreadGetname(self, waiter) != OK) {
+				waiter[0] = '?';
+				waiter[1] = '\0';
+			}
+		}
+		if (micros == nullptr) {
+			LOGF("ps5-vsh: posix-sem-wait #%llu thread=%s sem=%p timo=inf\n",
+			     psem_probe_n, waiter, sem);
+		} else {
+			LOGF("ps5-vsh: posix-sem-wait #%llu thread=%s sem=%p timo=%u\n",
+			     psem_probe_n, waiter, sem, *micros);
+		}
+	}
+
+	const auto tid = Common::Thread::GetThreadIdUnique();
+	if (tid == 6) {
+		static std::atomic<uint64_t> s_t6_sem_count {0};
+		const uint64_t n = s_t6_sem_count.fetch_add(1, std::memory_order_relaxed);
+		if (n < 50 || (n % 1000 == 0)) {
+			void* ra = __builtin_return_address(0);
+			LOGF("ps5-vsh: t6 SemTimedwaitImpl ENTER #%llu ra=%p sem=%p timo=%u\n",
+			     (unsigned long long)n, ra, sem, (micros ? *micros : 9999999));
+		}
+	}
+
 	auto* obj = GetSem(sem);
 	if (obj == nullptr) {
+		LOGF("ps5-vsh: posix-sem-wait MISS sem=%p (never init)\n", sem);
 		return POSIX_EINVAL;
 	}
 
-	return obj->Wait(micros);
+	const int result = obj->Wait(micros);
+	if (tid == 6) {
+		static std::atomic<uint64_t> s_t6_sem_exit {0};
+		const uint64_t n = s_t6_sem_exit.fetch_add(1, std::memory_order_relaxed);
+		if (n < 50 || (n % 1000 == 0)) {
+			LOGF("ps5-vsh: t6 SemTimedwaitImpl EXIT #%llu ret=%d\n", (unsigned long long)n, result);
+		}
+	}
+	return result;
 }
 
 static bool AbsTimespecToMicros(const LibKernel::KernelTimespec* abstime, uint32_t* micros) {
@@ -598,28 +304,37 @@ static bool AbsTimespecToMicros(const LibKernel::KernelTimespec* abstime, uint32
 
 } // namespace
 
-int KYTY_SYSV_ABI sem_init(void* sem, int pshared, unsigned int value) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI sem_init(void* sem, int pshared, unsigned int value) {
 	PRINT_NAME();
 
 	const int result = SemInitImpl(sem, pshared, value, nullptr);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
-int KYTY_SYSV_ABI sem_destroy(void* sem) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI sem_destroy(void* sem) {
 	PRINT_NAME();
 
 	const int result = SemDestroyImpl(sem);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
-int KYTY_SYSV_ABI sem_wait(void* sem) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI sem_wait(void* sem) {
 	const int result = SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
-int KYTY_SYSV_ABI sem_trywait(void* sem) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI sem_trywait(void* sem) {
+	if (Common::Thread::GetThreadIdUnique() == 6) {
+		static std::atomic<uint64_t> s_t6_trywait {0};
+		const uint64_t n = s_t6_trywait.fetch_add(1, std::memory_order_relaxed);
+		if (n < 20 || (n % 1000 == 0)) {
+			LOGF("ps5-vsh: t6 sem_trywait #%llu ra=%p sem=%p\n",
+			     (unsigned long long)n, __builtin_return_address(0), sem);
+		}
+	}
 	auto* obj = GetSem(sem);
 	if (obj == nullptr) {
+		LOGF("ps5-vsh: posix-sem-trywait MISS sem=%p\n", sem);
 		return SetErrnoReturn(POSIX_EINVAL);
 	}
 
@@ -627,12 +342,12 @@ int KYTY_SYSV_ABI sem_trywait(void* sem) {
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
-int KYTY_SYSV_ABI sem_reltimedwait_np(void* sem, uint32_t usec) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI sem_reltimedwait_np(void* sem, uint32_t usec) {
 	const int result = SemTimedwaitImpl(sem, &usec);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
-int KYTY_SYSV_ABI sem_timedwait(void* sem, const LibKernel::KernelTimespec* abstime) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI sem_timedwait(void* sem, const LibKernel::KernelTimespec* abstime) {
 	uint32_t micros = 0;
 	if (!AbsTimespecToMicros(abstime, &micros)) {
 		return SetErrnoReturn(POSIX_EINVAL);
@@ -642,9 +357,18 @@ int KYTY_SYSV_ABI sem_timedwait(void* sem, const LibKernel::KernelTimespec* abst
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
-int KYTY_SYSV_ABI sem_post(void* sem) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI sem_post(void* sem) {
+	if (Common::Thread::GetThreadIdUnique() == 6) {
+		static std::atomic<uint64_t> s_t6_post {0};
+		const uint64_t n = s_t6_post.fetch_add(1, std::memory_order_relaxed);
+		if (n < 20 || (n % 1000 == 0)) {
+			LOGF("ps5-vsh: t6 sem_post #%llu ra=%p sem=%p\n",
+			     (unsigned long long)n, __builtin_return_address(0), sem);
+		}
+	}
 	auto* obj = GetSem(sem);
 	if (obj == nullptr) {
+		LOGF("ps5-vsh: posix-sem-post MISS sem=%p\n", sem);
 		return SetErrnoReturn(POSIX_EINVAL);
 	}
 
@@ -652,7 +376,7 @@ int KYTY_SYSV_ABI sem_post(void* sem) {
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
 
-int KYTY_SYSV_ABI sem_getvalue(void* sem, int* value) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI sem_getvalue(void* sem, int* value) {
 	auto* obj = GetSem(sem);
 	if (obj == nullptr || value == nullptr) {
 		return SetErrnoReturn(POSIX_EINVAL);
@@ -667,7 +391,7 @@ int KYTY_SYSV_ABI sem_getvalue(void* sem, int* value) {
 
 namespace Libs::LibKernel::Semaphore {
 
-int KYTY_SYSV_ABI PthreadSemInit(void* sem, int flag, unsigned int value, const char* name) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PthreadSemInit(void* sem, int flag, unsigned int value, const char* name) {
 	PRINT_NAME();
 
 	if (flag != 0) {
@@ -678,19 +402,19 @@ int KYTY_SYSV_ABI PthreadSemInit(void* sem, int flag, unsigned int value, const 
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
 
-int KYTY_SYSV_ABI PthreadSemDestroy(void* sem) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PthreadSemDestroy(void* sem) {
 	PRINT_NAME();
 
 	const int result = Posix::SemDestroyImpl(sem);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
 
-int KYTY_SYSV_ABI PthreadSemWait(void* sem) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PthreadSemWait(void* sem) {
 	const int result = Posix::SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
 
-int KYTY_SYSV_ABI PthreadSemTrywait(void* sem) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PthreadSemTrywait(void* sem) {
 	auto* obj = Posix::GetSem(sem);
 	if (obj == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -700,13 +424,13 @@ int KYTY_SYSV_ABI PthreadSemTrywait(void* sem) {
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
 
-int KYTY_SYSV_ABI PthreadSemTimedwait(void* sem, KernelUseconds usec) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PthreadSemTimedwait(void* sem, KernelUseconds usec) {
 	uint32_t  micros = usec;
 	const int result = Posix::SemTimedwaitImpl(sem, &micros);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
 
-int KYTY_SYSV_ABI PthreadSemPost(void* sem) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PthreadSemPost(void* sem) {
 	auto* obj = Posix::GetSem(sem);
 	if (obj == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -716,7 +440,7 @@ int KYTY_SYSV_ABI PthreadSemPost(void* sem) {
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }
 
-int KYTY_SYSV_ABI PthreadSemGetvalue(void* sem, int* value) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PthreadSemGetvalue(void* sem, int* value) {
 	auto* obj = Posix::GetSem(sem);
 	if (obj == nullptr || value == nullptr) {
 		return KERNEL_ERROR_EINVAL;

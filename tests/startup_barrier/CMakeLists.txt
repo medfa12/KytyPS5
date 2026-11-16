@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.21)
+project(KytyStartupBarrierTests LANGUAGES CXX)
+enable_testing()
+get_filename_component(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+add_executable(startup_barrier_tests
+    "${ROOT}/tests/RuntimeStartupBarrierTests.cpp"
+    "${ROOT}/src/loader/runtimeStartupBarrier.cpp")
+target_include_directories(startup_barrier_tests PRIVATE "${ROOT}/src")
+target_compile_features(startup_barrier_tests PRIVATE cxx_std_20)
+if(MSVC)
+    target_compile_options(startup_barrier_tests PRIVATE /W4 /UNDEBUG)
+else()
+    target_compile_options(startup_barrier_tests PRIVATE -Wall -Wextra -UNDEBUG)
+endif()
+add_test(NAME startup_barrier COMMAND startup_barrier_tests)

@@ -3,10 +3,22 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+
+#include <cstddef>
+
+namespace Libs::LibKernel::FileSystem {
+struct FileStat;
+}
+
 namespace Libs::Network {
 
 void Initialize();
 void Shutdown();
+// Immutable for the current Network instance, shared with loader opt-in policy.
+bool NativeSslEnabled();
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool HttpSslIdForTest(int http, int* ssl);
+#endif
 
 struct Lifecycle {
 	static constexpr const char* name       = "Network";
@@ -19,15 +31,6 @@ namespace Net {
 struct NetEtherAddr {
 	uint8_t data[6] = {0};
 };
-
-struct NetMemoryPoolStats {
-	uint64_t pool_size;
-	uint64_t max_inuse_size;
-	uint64_t current_inuse_size;
-	int32_t  reserved;
-};
-
-static_assert(sizeof(NetMemoryPoolStats) == 32);
 
 union NetEpollData {
 	void*    ptr;
@@ -63,19 +66,60 @@ struct NetResolverInfo {
 static_assert(sizeof(NetResolverAddr) == 32);
 static_assert(sizeof(NetResolverInfo) == 384);
 
+// libnet6/resolver6.h: rid6 is INPUT for INET46, not part of the cleared tail.
+struct NetResolverAddrEx {
+	uint8_t addr[16];
+	int     af;
+	int     reserved[3];
+};
+
+struct NetResolverInfoEx {
+	NetResolverAddrEx addrs[10];
+	int               records;
+	int               dns4records;
+	int               dns6records;
+	int               rid6;
+	int               reserved[12];
+};
+
+static_assert(sizeof(NetResolverAddrEx) == 32);
+static_assert(offsetof(NetResolverAddrEx, af) == 0x10);
+static_assert(sizeof(NetResolverInfoEx) == 384);
+static_assert(offsetof(NetResolverInfoEx, records) == 0x140);
+static_assert(offsetof(NetResolverInfoEx, dns4records) == 0x144);
+static_assert(offsetof(NetResolverInfoEx, dns6records) == 0x148);
+static_assert(offsetof(NetResolverInfoEx, rid6) == 0x14c);
+static_assert(offsetof(NetResolverInfoEx, reserved) == 0x150);
+
 int KYTY_SYSV_ABI NetInit();
 int KYTY_SYSV_ABI NetTerm();
+// 6MojQ8uFHEI: one-time 32-byte input setter on the existing Network instance.
+// Bit0 of the first u32 selects 128 pools instead of 32; other bytes are retained.
+int KYTY_SYSV_ABI NetSetInitParam(const void* param);
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags);
 int KYTY_SYSV_ABI NetPoolDestroy(int memid);
-int KYTY_SYSV_ABI NetGetMemoryPoolStats(int memid, NetMemoryPoolStats* stats);
 int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags);
 int KYTY_SYSV_ABI NetResolverDestroy(int rid);
 int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags);
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
-                                       int retry, int flags);
+                                        int retry, int flags);
+// Single actual IPv6 address: exact 16-byte success copyout; all failures preserve
+// the destination. Synchronous/default host lookup policy, as with records Ex.
+int KYTY_SYSV_ABI NetResolverStartNtoa6(int rid, const char* hostname, void* addr, int timeout,
+                                        int retry, int flags);
 int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname,
                                                       NetResolverInfo* info, int timeout, int retry,
                                                       int flags);
+int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecordsEx(int rid, const char* hostname,
+                                                      NetResolverInfoEx* info, int timeout, int retry,
+                                                      int flags);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+// One-shot calling-thread hook after ID retention, with no Net locks held.
+void NetResolverRetainedHookForTest(void (*hook)(void*), void* context);
+// Exercise the production bounded append/count operation without depending on
+// a host DNS installation having more than ten answers.
+void NetResolverAppendForTest(NetResolverInfoEx* info, const NetResolverAddrEx* records, size_t count);
+#endif
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst);
 const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32_t size);
 int KYTY_SYSV_ABI         NetEtherNtostr(const NetEtherAddr* n, char* str, size_t len);
@@ -86,14 +130,37 @@ int KYTY_SYSV_ABI         EpollControl(int eid, int op, int id, const NetEpollEv
 int KYTY_SYSV_ABI         EpollWait(int eid, NetEpollEvent* events, int maxevents, int timeout);
 int KYTY_SYSV_ABI         EpollDestroy(int eid);
 bool KYTY_SYSV_ABI        IsSocket(int s);
+bool                      IsSocketReadReady(int s);
+// Consumes Net's reserved fd range, including closed slots. Kernel-coded result;
+// retained real transport and generation validation precede the exact stat copy.
+// Only socket type is modeled; unsupported native stat fields remain zero.
+bool TrySocketFstat(int fd, LibKernel::FileSystem::FileStat* output, int* result);
+// LOCAL_PEERPID-style query on a connected AF_LOCAL socket. All guest processes share one
+// host process here, so a verified same-process peer reports the emulated guest PID.
+int GetUnixPeerProcessId(int s, int* guest_pid);
+constexpr int GUEST_PROCESS_ID = 100; // value returned by the guest getpid()
 int KYTY_SYSV_ABI         SocketClose(int s);
 int KYTY_SYSV_ABI         Socket(int family, int type, int protocol);
+int KYTY_SYSV_ABI         Socketpair(int family, int type, int protocol, int* pair);
+// Atomic socket identity lookup/operation; false means outside Net's fd range.
+bool SocketpairFcntl(int fd, int command, int64_t argument, int* result);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+enum class SocketpairFailure { None, AfterBind, AfterConnect, AfterAccept, SecondSlot };
+void SocketpairFailForTest(SocketpairFailure failure); // calling thread only; consumed once
+struct SocketpairResources { int sockets; int paths; int slots; };
+SocketpairResources SocketpairResourcesForTest();
+// One-shot hook on the calling thread, after retaining Send's transport and
+// releasing all Net locks. For deterministic close/reuse lifetime tests only.
+void SocketRetainedSendHookForTest(void (*hook)(void*), void* context);
+void SocketRetainedStatHookForTest(void (*hook)(void*), void* context);
+#endif
 int KYTY_SYSV_ABI         Bind(int s, const void* addr, uint32_t addrlen);
 int KYTY_SYSV_ABI         Connect(int s, const void* addr, uint32_t addrlen);
 int KYTY_SYSV_ABI         Listen(int s, int backlog);
 int KYTY_SYSV_ABI         Accept(int s, void* addr, uint32_t* addrlen);
 int KYTY_SYSV_ABI         Shutdown(int s, int how);
 int KYTY_SYSV_ABI         Getsockname(int s, void* addr, uint32_t* addrlen);
+int KYTY_SYSV_ABI         Getpeername(int s, void* addr, uint32_t* addrlen);
 int KYTY_SYSV_ABI         Getsockopt(int s, int level, int optname, void* optval, uint32_t* optlen);
 int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, uint32_t optlen);
 int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfds,
@@ -113,6 +180,7 @@ int KYTY_SYSV_ABI SslInit(uint64_t pool_size);
 int KYTY_SYSV_ABI SslTerm(int ssl_ctx_id);
 int KYTY_SYSV_ABI SslGetCaCerts(int ssl_ctx_id, void* ca_certs);
 int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs);
+int KYTY_SYSV_ABI SslLoadRootCACert(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
 
 } // namespace Ssl
 
@@ -149,6 +217,7 @@ int KYTY_SYSV_ABI HttpAddRequestHeader(int id, const char* name, const char* val
 int KYTY_SYSV_ABI HttpSetEpoll(int id, HttpEpollHandle eh, void* user_arg);
 int KYTY_SYSV_ABI HttpUnsetEpoll(int id);
 int KYTY_SYSV_ABI HttpSendRequest(int request_id, const void* post_data, size_t size);
+int KYTY_SYSV_ABI HttpReadData(int request_id, void* data, size_t size);
 int KYTY_SYSV_ABI HttpAbortRequest(int request_id);
 int KYTY_SYSV_ABI HttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int maxevents,
                                   int timeout);
@@ -166,6 +235,9 @@ int KYTY_SYSV_ABI HttpSetSendTimeOut(int id, uint32_t usec);
 int KYTY_SYSV_ABI HttpSetRecvTimeOut(int id, uint32_t usec);
 int KYTY_SYSV_ABI HttpSetAutoRedirect(int id, int enable);
 int KYTY_SYSV_ABI HttpSetAuthEnabled(int id, int enable);
+// The host HTTP backend disables automatic cookies. Disabling on a live HTTP
+// object is supported; enabling is rejected until a context-owned jar exists.
+int KYTY_SYSV_ABI HttpSetCookieEnabled(int id, int enable);
 int KYTY_SYSV_ABI HttpSetRedirectCallback(int id, void* cbfunc, void* user_arg);
 int KYTY_SYSV_ABI HttpSetCookieRecvCallback(int id, void* cbfunc, void* user_arg);
 int KYTY_SYSV_ABI HttpSetRequestStatusCallback(int id, void* cbfunc, void* user_arg);

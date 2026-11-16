@@ -1,11 +1,10 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include "common/common.h"
-#include "common/logging/log.h"
 
 #include <Zydis/Zydis.h>
-#include <atomic>
 #include <bit>
+#include <atomic>
 #include <cstring>
 #include <emmintrin.h>
 #include <xmmintrin.h>
@@ -382,21 +381,21 @@ static bool ResolveShaNiMemoryAddress(const uint8_t* rip, const ShaNiInsn&    in
 	return true;
 }
 
-static ZydisMnemonic ExecuteShaNiInsn(const ShaNiInsn& insn, const XmmWords& src2,
-                                      const XmmWords& xmm0, XmmWords& dest) {
+static bool ExecuteShaNiInsn(const ShaNiInsn& insn, const XmmWords& src2, const XmmWords& xmm0,
+                             XmmWords& dest) {
 	if (insn.escape == 0x3a && insn.opcode == 0xcc) {
 		Sha1Rnds4(dest, src2, insn.imm8);
-		return ZYDIS_MNEMONIC_SHA1RNDS4;
+		return true;
 	}
 
-	// DecodeShaNiInsn accepts only opcodes 0xc8-0xcd.
 	switch (insn.opcode) {
-		case 0xc8: Sha1Nexte(dest, src2); return ZYDIS_MNEMONIC_SHA1NEXTE;
-		case 0xc9: Sha1Msg1(dest, src2); return ZYDIS_MNEMONIC_SHA1MSG1;
-		case 0xca: Sha1Msg2(dest, src2); return ZYDIS_MNEMONIC_SHA1MSG2;
-		case 0xcb: Sha256Rnds2(dest, src2, xmm0); return ZYDIS_MNEMONIC_SHA256RNDS2;
-		case 0xcc: Sha256Msg1(dest, src2); return ZYDIS_MNEMONIC_SHA256MSG1;
-		default: Sha256Msg2(dest, src2); return ZYDIS_MNEMONIC_SHA256MSG2;
+		case 0xc8: Sha1Nexte(dest, src2); return true;
+		case 0xc9: Sha1Msg1(dest, src2); return true;
+		case 0xca: Sha1Msg2(dest, src2); return true;
+		case 0xcb: Sha256Rnds2(dest, src2, xmm0); return true;
+		case 0xcc: Sha256Msg1(dest, src2); return true;
+		case 0xcd: Sha256Msg2(dest, src2); return true;
+		default: return false;
 	}
 }
 
@@ -533,19 +532,6 @@ struct Context {
 	}
 };
 
-// Names each trap-emulated instruction once, at its first guest address. Reading the flag before
-// the exchange keeps repeated traps from writing its cache line.
-static void LogFirstTrap(const Context& context, ZydisMnemonic mnemonic) {
-	static std::atomic_bool logged_traps[ZYDIS_MNEMONIC_MAX_VALUE + 1];
-	auto&                   logged = logged_traps[mnemonic];
-	if (!logged.load(std::memory_order_relaxed) &&
-	    !logged.exchange(true, std::memory_order_relaxed)) {
-		Log::WriteToConsoleAndLog(
-		    fmt::format("AMD CPU compatibility: trapping {} (first at 0x{:x})\n",
-			            ZydisMnemonicGetString(mnemonic), context.Rip()));
-	}
-}
-
 #if !defined(__APPLE__)
 
 static bool TryEmulateShaNi(Context& context) {
@@ -586,9 +572,11 @@ static bool TryEmulateShaNi(Context& context) {
 		std::memcpy(&src2, source, sizeof(src2));
 	}
 
-	const auto mnemonic = ExecuteShaNiInsn(insn, src2, xmm0_words, dest);
+	if (!ExecuteShaNiInsn(insn, src2, xmm0_words, dest)) {
+		return false;
+	}
+
 	std::memcpy(dest_xmm, &dest, sizeof(dest));
-	LogFirstTrap(context, mnemonic);
 	context.Advance(insn.length);
 	return true;
 }
@@ -657,7 +645,6 @@ static bool TryEmulateSse4a(Context& context) {
 		dest[0] = InsertBitField(dest[0], source[0], length, index);
 	}
 	std::memcpy(dest_xmm, dest, sizeof(dest));
-	LogFirstTrap(context, prefix == 0x66 ? ZYDIS_MNEMONIC_EXTRQ : ZYDIS_MNEMONIC_INSERTQ);
 	context.Advance(instruction_length);
 	return true;
 }
@@ -724,7 +711,6 @@ static bool TryEmulateCpuExtensions(Context& context) {
 	} else {
 		return false;
 	}
-	LogFirstTrap(context, instruction.mnemonic);
 	context.Advance(instruction.length);
 	return true;
 }
@@ -743,7 +729,6 @@ static bool TryEmulateMonitorxMwaitx(Context& context) {
 		::sched_yield();
 #endif
 	}
-	LogFirstTrap(context, rip[2] == 0xfb ? ZYDIS_MNEMONIC_MWAITX : ZYDIS_MNEMONIC_MONITORX);
 	context.Advance(3);
 	return true;
 }
@@ -811,9 +796,42 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 	_mm_setcsr(mxcsr);
 	std::memcpy(dest_xmm, &result, sizeof(result));
 	context.ClearUpperYmm(dest);
-	LogFirstTrap(context, ZYDIS_MNEMONIC_VRSQRTPS);
 	context.Advance(prefix_size + 2);
 	return true;
+}
+
+bool IsFsTcbRead(std::span<const uint8_t> instruction) {
+	return instruction.size() >= 9 && instruction[0] == 0x64 &&
+	       (instruction[1] == 0x48 || instruction[1] == 0x4c) &&
+	       (instruction[2] == 0x8b || instruction[2] == 0x33) &&
+	       (instruction[3] & 0xc7) == 0x04 && instruction[4] == 0x25 &&
+	       instruction[5] == 0x28 && instruction[6] == 0 && instruction[7] == 0 && instruction[8] == 0;
+}
+
+bool TryEmulateFsTcbRead(void* native_context, std::span<const uint8_t> instruction,
+                       std::span<const uint8_t> tcb) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (!native_context || !IsFsTcbRead(instruction) || tcb.size() < 0x30) return false;
+	Context context {static_cast<PCONTEXT>(native_context)};
+	const auto reg = uint8_t(((instruction[3] >> 3) & 7) | ((instruction[1] & 4) << 1));
+	uint64_t value = 0;
+	std::memcpy(&value, tcb.data() + 0x28, sizeof(value));
+	if (instruction[2] == 0x33) {
+		value ^= context.Gpr(reg);
+		// XOR clears CF/OF, sets SF/ZF/PF, leaves AF undefined (clear it).
+		// All control flags survive. A changed saved guard MUST leave ZF clear.
+		constexpr uint32_t arithmetic = 0x8d5;
+		uint32_t flags = value == 0 ? 0x40 : 0;
+		if (value >> 63) flags |= 0x80;
+		if ((std::popcount(static_cast<uint8_t>(value)) & 1) == 0) flags |= 4;
+		context.native->EFlags = (context.native->EFlags & ~arithmetic) | flags;
+	}
+	context.Gpr(reg) = value;
+	context.Advance(9);
+	return true;
+#else
+	return false;
+#endif
 }
 
 bool TryEmulate(void* native_context) {
@@ -843,6 +861,29 @@ void SkipLoad(void* native_context, size_t length) {
 	Context context {static_cast<decltype(Context::native)>(native_context)};
 	context.Gpr(0) = 0;
 	context.Advance(length);
+}
+
+bool TrySkipInt3(void* native_context) {
+	if (native_context == nullptr) {
+		return false;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Context context {static_cast<PCONTEXT>(native_context)};
+	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
+	if (rip[0] != 0xcc) {
+		return false;
+	}
+	static std::atomic<uint64_t> s_int3_skips {0};
+	const uint64_t n = s_int3_skips.fetch_add(1, std::memory_order_relaxed);
+	if (n >= 100000ull) {
+		return false;
+	}
+	context.Advance(1);
+	return true;
+#else
+	(void)native_context;
+	return false;
+#endif
 }
 
 } // namespace Loader::X64InstructionEmulator

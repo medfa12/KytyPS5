@@ -125,7 +125,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op);
 uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t state);
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
                                                         uint32_t       video_out_handle,
-                                                        int32_t        display_buffer_index);
+                                                        uint32_t       display_buffer_index);
 uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
                                                  const uint32_t* workload_ids,
                                                  uint32_t        workload_count);
@@ -156,10 +156,10 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
                                         const volatile void* index_addr, uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexGetSize();
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t instance_count,
-                                                      const volatile void* object_ids,
+uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t index_count,
                                                       const volatile void* index_addr,
-                                                      uint32_t index_count, uint64_t modifier);
+                                                      const volatile void* object_ids,
+                                                      uint32_t instance_count, uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexMultiInstancedGetSize();
 int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
                                        const volatile uint32_t* target, uint32_t size_in_dwords,

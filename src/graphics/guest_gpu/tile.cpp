@@ -8,6 +8,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 
 namespace Libs::Graphics {
@@ -20,13 +21,51 @@ static uint32_t CalcLinearBlockWidth(uint32_t bytes_per_element) {
 	return 256u / bytes_per_element;
 }
 
+static uint32_t CalcLinearAlignedLevelPitch(uint32_t base_width, uint32_t base_height,
+                                            uint32_t level, uint32_t bytes_per_element,
+                                            uint32_t* padded_height, uint32_t* level_size) {
+	const uint32_t level_width  = ShiftCeil(base_width, level);
+	const uint32_t level_height = ShiftCeil(base_height, level);
+	const uint32_t padded_width =
+	    Common::AlignUp(std::max(level_width, 1u), CalcLinearBlockWidth(bytes_per_element));
+	const uint64_t size =
+	    static_cast<uint64_t>(padded_width) * std::max(level_height, 1u) * bytes_per_element;
+	EXIT_NOT_IMPLEMENTED(size > 0xffffffffull);
+	*padded_height = std::max(level_height, 1u);
+	*level_size    = static_cast<uint32_t>(size);
+	return padded_width;
+}
+
+static uint32_t SetLinearMipChainLayout(uint32_t levels, const uint32_t* mip_pitch,
+                                        const uint32_t* mip_height, const uint32_t* mip_size,
+                                        TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
+	uint32_t offset = 0;
+	// Smaller mip records come first; mip 0 is last in the block slice.
+	for (int32_t l = static_cast<int32_t>(levels) - 1; l >= 0; l--) {
+		const auto level = static_cast<uint32_t>(l);
+		if (level_sizes != nullptr) {
+			level_sizes[level].size   = mip_size[level];
+			level_sizes[level].offset = offset;
+		}
+		if (padded_size != nullptr) {
+			padded_size[level].width  = mip_pitch[level];
+			padded_size[level].height = mip_height[level];
+		}
+
+		offset += mip_size[level];
+	}
+
+	return Common::AlignUp(offset, 256u);
+}
+
 struct Log2BlockDimensions {
 	uint8_t width;
 	uint8_t height;
 	uint8_t depth;
 };
 
-// Indexed by log2(bytes per element).
+// Indexed by log2(bytes per element). These are the block dimensions from
+// Resolve texture layout facts once and share the result with every consumer.
 static constexpr Log2BlockDimensions LOG2_BLOCK_THIN_256B[] = {
     {4, 4, 0}, {4, 3, 0}, {3, 3, 0}, {3, 2, 0}, {2, 2, 0}};
 static constexpr Log2BlockDimensions LOG2_BLOCK_THIN_4KB[] = {
@@ -284,8 +323,7 @@ bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode
 	return true;
 }
 
-bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSurfaceLayout& out,
-                               TileMipLayout* mips) {
+bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSurfaceLayout& out) {
 	bool volume = false;
 	switch (description.dimension) {
 		case TileSurfaceDimension::Dim2D: break;
@@ -305,85 +343,103 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 	const auto& block   = texture.block;
 	const auto  width0  = (description.width + texture.texel_width - 1u) / texture.texel_width;
 	const auto  height0 = (description.height + texture.texel_height - 1u) / texture.texel_height;
+
+	TileSurfaceLayout result {};
+	result.description      = description;
+	result.texture          = texture;
 	const uint32_t block_slices =
 	    volume ? ShiftCeil(description.depth, std::countr_zero(block.block_depth))
 	           : description.layers;
 
-	MipTailLayout  tail {};
-	const uint32_t first_tail_level =
-	    GetMipTailLayout(block, tail) ? FirstTailLevel(tail, width0, height0, description.levels)
-	                                  : description.levels;
+	MipTailLayout tail {};
+	result.first_tail_level = GetMipTailLayout(block, tail)
+	                              ? FirstTailLevel(tail, width0, height0, description.levels)
+	                              : description.levels;
 
-	// The tail block starts a slice; the larger mips follow it from the smallest up.
-	uint64_t offset = first_tail_level < description.levels ? block.block_size : 0;
-	for (uint32_t level = description.levels; level-- > 0;) {
-		if (level >= first_tail_level) {
-			const auto [x, y] = tail.locations[level - first_tail_level];
-			mips[level]       = {0, block.block_size, block.block_width, block.block_height, x, y};
-			continue;
-		}
-		const auto pitch =
-		    Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
-		const auto height =
-		    Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
-		const auto size = uint64_t {block.block_depth} * pitch * height * block.bytes_per_element;
-		mips[level]     = {offset, size, pitch, height};
-		offset += size;
+	for (uint32_t level = 0; level < result.first_tail_level; ++level) {
+		auto& mip = result.mips[level];
+		mip.width = std::max(
+		    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width, 1u);
+		mip.height = std::max(
+		    ((description.height >> level) + texture.texel_height - 1u) / texture.texel_height, 1u);
+		mip.padded_width  = Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
+		mip.padded_height = Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
+		mip.size = static_cast<uint64_t>(block.block_depth) * mip.padded_width * mip.padded_height *
+		           block.bytes_per_element;
+		result.block_slice_size += mip.size;
 	}
-	if (offset > UINT64_MAX / block_slices) {
+
+	if (result.first_tail_level < description.levels) {
+		result.block_slice_size += block.block_size;
+	}
+	for (uint32_t level = result.first_tail_level; level < description.levels; ++level) {
+		auto& mip = result.mips[level];
+		mip.width = std::max(
+		    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width, 1u);
+		mip.height = std::max(
+		    ((description.height >> level) + texture.texel_height - 1u) / texture.texel_height, 1u);
+		mip.padded_width  = block.block_width;
+		mip.padded_height = block.block_height;
+		mip.size          = block.block_size;
+		mip.tail_x        = tail.locations[level - result.first_tail_level].x;
+		mip.tail_y        = tail.locations[level - result.first_tail_level].y;
+	}
+
+	uint64_t offset = result.first_tail_level < description.levels ? block.block_size : 0;
+	for (int32_t level = static_cast<int32_t>(result.first_tail_level) - 1; level >= 0; --level) {
+		result.mips[level].offset = offset;
+		offset += result.mips[level].size;
+	}
+	if (offset != result.block_slice_size || result.block_slice_size > UINT64_MAX / block_slices) {
 		return false;
 	}
-	out.texture          = texture;
-	out.first_tail_level = first_tail_level;
-	out.block_slice_size = offset;
-	out.total_size       = offset * block_slices;
+	result.total_size = result.block_slice_size * block_slices;
+	out               = result;
 	return true;
 }
 
-static void SetLegacyTiledMipLayout(const TileSurfaceDescription& description,
-                                    const TileSurfaceLayout& layout, const TileMipLayout* mips,
-                                    TileSizeAlign* total_size, TileSizeOffset* level_sizes,
-                                    TilePaddedSize* padded_size) {
+static void SetLegacyTiledMipLayout(const TileSurfaceLayout& layout, TileSizeAlign* total_size,
+                                    TileSizeOffset* level_sizes, TilePaddedSize* padded_size) {
 	EXIT_NOT_IMPLEMENTED(layout.block_slice_size > UINT32_MAX);
-	const auto& texture = layout.texture;
-	const auto& block   = texture.block;
+	const auto& block = layout.texture.block;
 	if (total_size != nullptr) {
 		*total_size = {static_cast<uint32_t>(layout.block_slice_size), block.block_size};
 	}
 
 	uint64_t linear_tail_offset = 0;
-	for (uint32_t level = 0; level < description.levels; ++level) {
-		const auto& mip  = mips[level];
+	for (uint32_t level = 0; level < layout.description.levels; ++level) {
+		const auto& mip  = layout.mips[level];
 		const bool  tail = level >= layout.first_tail_level;
 		EXIT_NOT_IMPLEMENTED(mip.offset > UINT32_MAX || mip.size > UINT32_MAX);
 		if (level_sizes != nullptr) {
 			if (tail) {
-				const uint64_t width =
-				    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width;
-				const uint64_t height =
-				    ((description.height >> level) + texture.texel_height - 1u) /
-				    texture.texel_height;
-				const uint64_t linear_size = std::max<uint64_t>(width, 1) *
-				                             std::max<uint64_t>(height, 1) *
-				                             block.bytes_per_element;
+				const uint64_t linear_size =
+				    static_cast<uint64_t>(mip.width) * mip.height * block.bytes_per_element;
 				EXIT_NOT_IMPLEMENTED(linear_size > UINT32_MAX || linear_tail_offset > UINT32_MAX);
 				level_sizes[level] = {static_cast<uint32_t>(linear_size),
-				                      static_cast<uint32_t>(linear_tail_offset)};
+				                      static_cast<uint32_t>(linear_tail_offset),
+				                      static_cast<uint32_t>(mip.size),
+				                      static_cast<uint32_t>(mip.offset),
+				                      mip.tail_x,
+				                      mip.tail_y};
 				linear_tail_offset += linear_size;
-			} else {
+			} else if (block.family == TileBlockFamily::Standard256B) {
 				level_sizes[level] = {static_cast<uint32_t>(mip.size),
 				                      static_cast<uint32_t>(mip.offset)};
+			} else {
+				level_sizes[level] = {
+				    static_cast<uint32_t>(mip.size), static_cast<uint32_t>(mip.offset),
+				    static_cast<uint32_t>(mip.size), static_cast<uint32_t>(mip.offset)};
 			}
 		}
 		if (padded_size != nullptr) {
-			padded_size[level] = {mip.pitch * texture.texel_width,
-			                      mip.height * texture.texel_height};
+			padded_size[level] = {mip.padded_width * layout.texture.texel_width,
+			                      mip.padded_height * layout.texture.texel_height};
 		}
 	}
 }
 
-static constexpr uint32_t Gen5Standard4KBOffsetInBlock(uint32_t x, uint32_t y,
-                                                       uint32_t bytes_per_element) {
+static uint32_t Gen5Standard4KBOffsetInBlock(uint32_t x, uint32_t y, uint32_t bytes_per_element) {
 	uint32_t offset = 0;
 
 	switch (bytes_per_element) {
@@ -503,7 +559,7 @@ static uint32_t Gen5Standard4KBVolumeOffsetInBlock(uint32_t x, uint32_t y, uint3
 	return 0;
 }
 
-static constexpr uint32_t Bit(uint32_t value, uint32_t source, uint32_t destination) {
+static uint32_t Bit(uint32_t value, uint32_t source, uint32_t destination) {
 	return ((value >> source) & 1u) << destination;
 }
 
@@ -516,104 +572,274 @@ static uint32_t Gen5Standard64KBVolumeOffsetInBlock(uint32_t x, uint32_t y, uint
 	       Bit(z, bits[1], 13) ^ Bit(y, bits[2], 14) ^ Bit(x, bits[3], 15);
 }
 
+struct Uint128 {
+	uint64_t n[2];
+};
+
 static uint32_t Gen5Standard256BOffsetInBlock(uint32_t x, uint32_t y, uint32_t bytes_per_element) {
 	return Gen5Standard4KBOffsetInBlock(x, y, bytes_per_element) & 0xffu;
 }
 
-// Standard64KB keeps the Standard4KB swizzle and takes block-address bits 12-15 from
-// Y, X, Y and X. X and Y contribute separate XOR terms, so each axis is one lookup.
-struct Standard64KBTables {
-	uint32_t x[5][256] {};
-	uint32_t y[5][256] {};
+static constexpr uint32_t GetStandard64KB32XPart(uint32_t x) {
+	// Standard64KB is block-linear: 32bpp surfaces use 128x128-element
+	// 64KB blocks, with fixed x/y bit interleaving inside each block.
+	uint32_t element_offset = 0;
+	element_offset ^= (x << 2u) & 0x0cu;
+	element_offset ^= (x << 5u) & 0x80u;
+	element_offset ^= (x << 6u) & 0x200u;
+	element_offset ^= (x << 7u) & 0x800u;
+	element_offset ^= (x << 8u) & 0x2000u;
+	// X6 selects the upper 32KB of each 128x128x32bpp block.
+	element_offset ^= (x << 9u) & 0x8000u;
 
-	constexpr Standard64KBTables() {
-		constexpr uint8_t SOURCES[5][4] = {
-		    {6, 6, 7, 7}, {5, 6, 6, 7}, {5, 5, 6, 6}, {4, 5, 5, 6}, {4, 4, 5, 5}};
-		for (uint32_t log2 = 0; log2 < 5; log2++) {
-			const auto* bits = SOURCES[log2];
-			for (uint32_t i = 0; i < 256; i++) {
-				x[log2][i] = Gen5Standard4KBOffsetInBlock(i, 0, 1u << log2) ^ Bit(i, bits[1], 13) ^
-				             Bit(i, bits[3], 15);
-				y[log2][i] = Gen5Standard4KBOffsetInBlock(0, i, 1u << log2) ^ Bit(i, bits[0], 12) ^
-				             Bit(i, bits[2], 14);
-			}
+	return element_offset;
+}
+
+static constexpr uint32_t GetStandard64KB32YPart(uint32_t y) {
+	uint32_t element_offset = 0;
+	element_offset ^= (y << 4u) & 0x70u;
+	element_offset ^= (y << 5u) & 0x100u;
+	element_offset ^= (y << 6u) & 0x400u;
+	element_offset ^= (y << 7u) & 0x1000u;
+	element_offset ^= (y << 8u) & 0x4000u;
+
+	return element_offset;
+}
+
+struct Standard64KB32Tables {
+	std::array<uint32_t, 128> x_words {};
+	std::array<uint32_t, 128> y_words {};
+
+	constexpr Standard64KB32Tables() {
+		for (uint32_t i = 0; i < 128; i++) {
+			uint32_t x_part = 0;
+			x_part ^= (i << 2u) & 0x0cu;
+			x_part ^= (i << 5u) & 0x80u;
+			x_part ^= (i << 6u) & 0x200u;
+			x_part ^= (i << 7u) & 0x800u;
+			x_part ^= (i << 8u) & 0x2000u;
+			x_part ^= (i << 9u) & 0x8000u;
+
+			uint32_t y_part = 0;
+			y_part ^= (i << 4u) & 0x70u;
+			y_part ^= (i << 5u) & 0x100u;
+			y_part ^= (i << 6u) & 0x400u;
+			y_part ^= (i << 7u) & 0x1000u;
+			y_part ^= (i << 8u) & 0x4000u;
+
+			x_words[i] = x_part >> 2u;
+			y_words[i] = y_part >> 2u;
 		}
 	}
 };
 
-static constexpr Standard64KBTables STANDARD_64KB_TABLES;
+static_assert(GetStandard64KB32XPart(127) < (64u * 1024u));
+static_assert(GetStandard64KB32YPart(127) < (64u * 1024u));
 
-static uint32_t Gen5RenderTargetOffsetInBlock(uint32_t x, uint32_t y, uint32_t bytes_per_element) {
+static const Standard64KB32Tables& GetStandard64KB32Tables() {
+	static constexpr Standard64KB32Tables tables;
+	return tables;
+}
+
+struct Standard64KB16Tables {
+	std::array<uint32_t, 256> x_words {};
+	std::array<uint32_t, 128> y_words {};
+
+	constexpr Standard64KB16Tables() {
+		for (uint32_t i = 0; i < 256; i++) {
+			uint32_t x_part = 0;
+			x_part ^= (i << 1u) & 0x000eu;
+			x_part ^= (i << 4u) & 0x0080u;
+			x_part ^= (i << 5u) & 0x0200u;
+			x_part ^= (i << 6u) & 0x0800u;
+			x_part ^= (i << 7u) & 0x2000u;
+			x_part ^= (i << 8u) & 0x8000u;
+
+			x_words[i] = x_part >> 1u;
+		}
+
+		for (uint32_t i = 0; i < 128; i++) {
+			uint32_t y_part = 0;
+			y_part ^= (i << 4u) & 0x0070u;
+			y_part ^= (i << 5u) & 0x0100u;
+			y_part ^= (i << 6u) & 0x0400u;
+			y_part ^= (i << 7u) & 0x1000u;
+			y_part ^= (i << 8u) & 0x4000u;
+
+			y_words[i] = y_part >> 1u;
+		}
+	}
+};
+
+template <typename T>
+static uint32_t Gen5RenderTargetOffsetInBlock(uint32_t x, uint32_t y) {
 	uint32_t offset = 0;
 
-	switch (bytes_per_element) {
-		case 1:
-			offset ^= (y << 2u) & 0x0008u;
-			offset ^= (y << 4u) & 0x0010u;
-			offset ^= (y << 3u) & 0x00a0u;
-			offset ^= (y << 5u) & 0x0f00u;
-			offset ^= (y << 6u) & 0x1000u;
-			offset ^= (y << 7u) & 0x4000u;
+	if constexpr (sizeof(T) == 1) {
+		offset ^= (y << 2u) & 0x0008u;
+		offset ^= (y << 4u) & 0x0010u;
+		offset ^= (y << 3u) & 0x00a0u;
+		offset ^= (y << 5u) & 0x0f00u;
+		offset ^= (y << 6u) & 0x1000u;
+		offset ^= (y << 7u) & 0x4000u;
 
-			offset ^= x & 0x0007u;
-			offset ^= (x << 3u) & 0x0040u;
-			offset ^= (x << 5u) & 0x0300u;
-			offset ^= (x << 4u) & 0x0400u;
-			offset ^= (x << 6u) & 0x0800u;
-			offset ^= (x << 7u) & 0x2000u;
-			offset ^= (x << 8u) & 0x8000u;
-			return offset;
-		case 2:
-			offset ^= (y << 4u) & 0x0070u;
-			offset ^= (y << 5u) & 0x0f00u;
-			offset ^= (y << 8u) & 0x5000u;
+		offset ^= x & 0x0007u;
+		offset ^= (x << 3u) & 0x0040u;
+		offset ^= (x << 5u) & 0x0300u;
+		offset ^= (x << 4u) & 0x0400u;
+		offset ^= (x << 6u) & 0x0800u;
+		offset ^= (x << 7u) & 0x2000u;
+		offset ^= (x << 8u) & 0x8000u;
+	} else if constexpr (sizeof(T) == 2) {
+		offset ^= (y << 4u) & 0x0070u;
+		offset ^= (y << 5u) & 0x0f00u;
+		offset ^= (y << 8u) & 0x5000u;
 
-			offset ^= (x << 1u) & 0x000eu;
-			offset ^= (x << 4u) & 0x0480u;
-			offset ^= (x << 5u) & 0x0300u;
-			offset ^= (x << 6u) & 0x0800u;
-			offset ^= (x << 7u) & 0x2000u;
-			offset ^= (x << 8u) & 0x8000u;
-			return offset;
-		case 4:
-			offset ^= (y << 4u) & 0x0070u;
-			offset ^= (y << 5u) & 0x0f00u;
-			offset ^= (y << 9u) & 0x1000u;
-			offset ^= (y << 8u) & 0x4000u;
+		offset ^= (x << 1u) & 0x000eu;
+		offset ^= (x << 4u) & 0x0480u;
+		offset ^= (x << 5u) & 0x0300u;
+		offset ^= (x << 6u) & 0x0800u;
+		offset ^= (x << 7u) & 0x2000u;
+		offset ^= (x << 8u) & 0x8000u;
+	} else if constexpr (sizeof(T) == 4) {
+		offset ^= (y << 4u) & 0x0070u;
+		offset ^= (y << 5u) & 0x0f00u;
+		offset ^= (y << 9u) & 0x1000u;
+		offset ^= (y << 8u) & 0x4000u;
 
-			offset ^= (x << 2u) & 0x000cu;
-			offset ^= (x << 5u) & 0x0380u;
-			offset ^= (x << 4u) & 0x0400u;
-			offset ^= (x << 6u) & 0x0800u;
-			offset ^= (x << 9u) & 0xa000u;
-			return offset;
-		case 8:
-			offset ^= (y << 4u) & 0x0010u;
-			offset ^= (y << 6u) & 0x0080u;
-			offset ^= (y << 5u) & 0x0f00u;
-			offset ^= (y << 10u) & 0x5000u;
+		offset ^= (x << 2u) & 0x000cu;
+		offset ^= (x << 5u) & 0x0380u;
+		offset ^= (x << 4u) & 0x0400u;
+		offset ^= (x << 6u) & 0x0800u;
+		offset ^= (x << 9u) & 0xa000u;
+	} else if constexpr (sizeof(T) == 8) {
+		offset ^= (y << 4u) & 0x0010u;
+		offset ^= (y << 6u) & 0x0080u;
+		offset ^= (y << 5u) & 0x0f00u;
+		offset ^= (y << 10u) & 0x5000u;
 
-			offset ^= (x << 3u) & 0x0008u;
-			offset ^= (x << 4u) & 0x0460u;
-			offset ^= (x << 5u) & 0x0300u;
-			offset ^= (x << 6u) & 0x0800u;
-			offset ^= (x << 10u) & 0x2000u;
-			offset ^= (x << 9u) & 0x8000u;
-			return offset;
-		case 16:
-			offset ^= (x << 4u) & 0x0410u;
-			offset ^= (x << 5u) & 0x0340u;
-			offset ^= (x << 6u) & 0x0800u;
-			offset ^= (x << 11u) & 0xa000u;
+		offset ^= (x << 3u) & 0x0008u;
+		offset ^= (x << 4u) & 0x0460u;
+		offset ^= (x << 5u) & 0x0300u;
+		offset ^= (x << 6u) & 0x0800u;
+		offset ^= (x << 10u) & 0x2000u;
+		offset ^= (x << 9u) & 0x8000u;
+	} else if constexpr (sizeof(T) == 16) {
+		offset ^= (x << 4u) & 0x0410u;
+		offset ^= (x << 5u) & 0x0340u;
+		offset ^= (x << 6u) & 0x0800u;
+		offset ^= (x << 11u) & 0xa000u;
 
-			offset ^= (y << 5u) & 0x0f20u;
-			offset ^= (y << 6u) & 0x0080u;
-			offset ^= (y << 10u) & 0x1000u;
-			offset ^= (y << 11u) & 0x4000u;
-			return offset;
-		default: EXIT("unsupported render-target element size: %u\n", bytes_per_element);
+		offset ^= (y << 5u) & 0x0f20u;
+		offset ^= (y << 6u) & 0x0080u;
+		offset ^= (y << 10u) & 0x1000u;
+		offset ^= (y << 11u) & 0x4000u;
+	} else {
+		EXIT("unsupported render-target element size: %u\n", static_cast<uint32_t>(sizeof(T)));
 	}
-	return 0;
+
+	return offset;
+}
+
+static const Standard64KB16Tables& GetStandard64KB16Tables() {
+	static constexpr Standard64KB16Tables tables;
+	return tables;
+}
+
+struct Standard64KB8Tables {
+	std::array<uint32_t, 256> x_words {};
+	std::array<uint32_t, 256> y_words {};
+
+	constexpr Standard64KB8Tables() {
+		for (uint32_t i = 0; i < 256; i++) {
+			uint32_t x_part = 0;
+			x_part ^= i & 0x000fu;
+			x_part ^= (i << 5u) & 0x0200u;
+			x_part ^= (i << 6u) & 0x0800u;
+			x_part ^= (i << 7u) & 0x2000u;
+			x_part ^= (i << 8u) & 0x8000u;
+
+			uint32_t y_part = 0;
+			y_part ^= (i << 4u) & 0x01f0u;
+			y_part ^= (i << 5u) & 0x0400u;
+			y_part ^= (i << 6u) & 0x1000u;
+			y_part ^= (i << 7u) & 0x4000u;
+
+			x_words[i] = x_part;
+			y_words[i] = y_part;
+		}
+	}
+};
+
+static const Standard64KB8Tables& GetStandard64KB8Tables() {
+	static constexpr Standard64KB8Tables tables;
+	return tables;
+}
+
+struct Standard64KB64Tables {
+	std::array<uint32_t, 128> x_words {};
+	std::array<uint32_t, 64>  y_words {};
+
+	constexpr Standard64KB64Tables() {
+		for (uint32_t i = 0; i < 128; i++) {
+			uint32_t x_part = 0;
+			x_part ^= (i << 3u) & 0x0008u;
+			x_part ^= (i << 5u) & 0x00c0u;
+			x_part ^= (i << 6u) & 0x0200u;
+			x_part ^= (i << 7u) & 0x0800u;
+			x_part ^= (i << 8u) & 0x2000u;
+			x_part ^= (i << 9u) & 0x8000u;
+
+			x_words[i] = x_part >> 3u;
+		}
+
+		for (uint32_t i = 0; i < 64; i++) {
+			uint32_t y_part = 0;
+			y_part ^= (i << 4u) & 0x0030u;
+			y_part ^= (i << 6u) & 0x0100u;
+			y_part ^= (i << 7u) & 0x0400u;
+			y_part ^= (i << 8u) & 0x1000u;
+			y_part ^= (i << 9u) & 0x4000u;
+
+			y_words[i] = y_part >> 3u;
+		}
+	}
+};
+
+static const Standard64KB64Tables& GetStandard64KB64Tables() {
+	static constexpr Standard64KB64Tables tables;
+	return tables;
+}
+
+struct Standard64KB128Tables {
+	std::array<uint32_t, 64> x_words {};
+	std::array<uint32_t, 64> y_words {};
+
+	constexpr Standard64KB128Tables() {
+		for (uint32_t i = 0; i < 64; i++) {
+			uint32_t x_part = 0;
+			x_part ^= (i << 6u) & 0x00c0u;
+			x_part ^= (i << 7u) & 0x0200u;
+			x_part ^= (i << 8u) & 0x0800u;
+			x_part ^= (i << 9u) & 0x2000u;
+			x_part ^= (i << 10u) & 0x8000u;
+
+			uint32_t y_part = 0;
+			y_part ^= (i << 4u) & 0x0030u;
+			y_part ^= (i << 6u) & 0x0100u;
+			y_part ^= (i << 7u) & 0x0400u;
+			y_part ^= (i << 8u) & 0x1000u;
+			y_part ^= (i << 9u) & 0x4000u;
+
+			x_words[i] = x_part >> 4u;
+			y_words[i] = y_part >> 4u;
+		}
+	}
+};
+
+static const Standard64KB128Tables& GetStandard64KB128Tables() {
+	static constexpr Standard64KB128Tables tables;
+	return tables;
 }
 
 static constexpr uint32_t Depth64KB8XOffsetBytes(uint32_t x);
@@ -636,9 +862,16 @@ bool TileGetBlockLayout(TileBlockFamily family, uint32_t bytes_per_element,
 		return false;
 	}
 
-	layout = {family, bytes_per_element, info.block_size, 0, 0, 1};
-	SetBlockDimensions(info.dimensions[std::countr_zero(bytes_per_element)], &layout.block_width,
-	                   &layout.block_height, &layout.block_depth);
+	TileBlockLayout result {family, bytes_per_element, info.block_size, 0, 0, 1};
+	SetBlockDimensions(info.dimensions[std::countr_zero(bytes_per_element)], &result.block_width,
+	                   &result.block_height, &result.block_depth);
+
+	if (static_cast<uint64_t>(result.block_width) * result.block_height * result.block_depth *
+	        bytes_per_element !=
+	    result.block_size) {
+		return false;
+	}
+	layout = result;
 	return true;
 }
 
@@ -677,20 +910,51 @@ bool TileGetBlockOffset(const TileBlockLayout& layout, uint32_t x, uint32_t y, u
 			break;
 		}
 		case TileBlockFamily::Standard64KB:
-		case TileBlockFamily::Prt64KB: {
-			const auto log2 = std::countr_zero(layout.bytes_per_element);
-			offset          = STANDARD_64KB_TABLES.x[log2][x] ^ STANDARD_64KB_TABLES.y[log2][y];
+		case TileBlockFamily::Prt64KB:
+			switch (layout.bytes_per_element) {
+				case 1:
+					offset =
+					    GetStandard64KB8Tables().x_words[x] ^ GetStandard64KB8Tables().y_words[y];
+					break;
+				case 2:
+					offset = (GetStandard64KB16Tables().x_words[x] ^
+					          GetStandard64KB16Tables().y_words[y]) *
+					         2u;
+					break;
+				case 4:
+					offset = (GetStandard64KB32Tables().x_words[x] ^
+					          GetStandard64KB32Tables().y_words[y]) *
+					         4u;
+					break;
+				case 8:
+					offset = (GetStandard64KB64Tables().x_words[x] ^
+					          GetStandard64KB64Tables().y_words[y]) *
+					         8u;
+					break;
+				case 16:
+					offset = (GetStandard64KB128Tables().x_words[x] ^
+					          GetStandard64KB128Tables().y_words[y]) *
+					         16u;
+					break;
+				default: return false;
+			}
 			if (layout.family == TileBlockFamily::Prt64KB) {
 				static constexpr uint8_t SOURCES[5][4] = {
 				    {7, 7, 6, 6}, {7, 6, 6, 5}, {6, 6, 5, 5}, {6, 5, 5, 4}, {5, 5, 4, 4}};
-				const auto* bits = SOURCES[log2];
+				const auto* bits = SOURCES[std::countr_zero(layout.bytes_per_element)];
 				offset ^= Bit(x, bits[0], 8) ^ Bit(y, bits[1], 9) ^ Bit(x, bits[2], 10) ^
 				          Bit(y, bits[3], 11);
 			}
 			break;
-		}
 		case TileBlockFamily::RenderTarget64KB:
-			offset = Gen5RenderTargetOffsetInBlock(x, y, layout.bytes_per_element);
+			switch (layout.bytes_per_element) {
+				case 1: offset = Gen5RenderTargetOffsetInBlock<uint8_t>(x, y); break;
+				case 2: offset = Gen5RenderTargetOffsetInBlock<uint16_t>(x, y); break;
+				case 4: offset = Gen5RenderTargetOffsetInBlock<uint32_t>(x, y); break;
+				case 8: offset = Gen5RenderTargetOffsetInBlock<uint64_t>(x, y); break;
+				case 16: offset = Gen5RenderTargetOffsetInBlock<Uint128>(x, y); break;
+				default: return false;
+			}
 			break;
 		case TileBlockFamily::Depth64KB:
 			switch (layout.bytes_per_element) {
@@ -709,6 +973,11 @@ bool TileGetBlockOffset(const TileBlockLayout& layout, uint32_t x, uint32_t y, u
 	}
 	byte_offset = offset;
 	return true;
+}
+
+bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t block_y,
+                     uint32_t& byte_offset) {
+	return TileGetBlockXor(layout, block_x, block_y, 0, byte_offset);
 }
 
 bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t block_y,
@@ -732,8 +1001,16 @@ bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t b
 		    block_y > UINT32_MAX / layout.block_height) {
 			return false;
 		}
-		byte_offset = Gen5RenderTargetOffsetInBlock(
-		    block_x * layout.block_width, block_y * layout.block_height, layout.bytes_per_element);
+		const auto x = block_x * layout.block_width;
+		const auto y = block_y * layout.block_height;
+		switch (layout.bytes_per_element) {
+			case 1: byte_offset = Gen5RenderTargetOffsetInBlock<uint8_t>(x, y); break;
+			case 2: byte_offset = Gen5RenderTargetOffsetInBlock<uint16_t>(x, y); break;
+			case 4: byte_offset = Gen5RenderTargetOffsetInBlock<uint32_t>(x, y); break;
+			case 8: byte_offset = Gen5RenderTargetOffsetInBlock<uint64_t>(x, y); break;
+			case 16: byte_offset = Gen5RenderTargetOffsetInBlock<Uint128>(x, y); break;
+			default: return false;
+		}
 	} else {
 		byte_offset = 0;
 	}
@@ -849,10 +1126,11 @@ static bool TileGetHtileSize(uint32_t width, uint32_t height, TileSizeAlign& hti
 	return true;
 }
 
-bool TileGetDepthSize(uint32_t width, uint32_t height, Prospero::DepthFormat z_format,
-                      Prospero::StencilFormat stencil_format, bool htile,
-                      TileSizeAlign& stencil_size, TileSizeAlign& htile_size,
+bool TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch,
+                      Prospero::DepthFormat z_format, Prospero::StencilFormat stencil_format,
+                      bool htile, TileSizeAlign& stencil_size, TileSizeAlign& htile_size,
                       TileSizeAlign& depth_size, uint32_t num_fragments_log2) {
+	EXIT_IF(pitch != 0);
 	// Prospero derives uncompressed depth/stencil as independent 64 KiB block surfaces.
 	if (width > 0 && width <= 16384 && height > 0 && height <= 16384 &&
 	    (z_format == Prospero::DepthFormat::kZ16 || z_format == Prospero::DepthFormat::kZ32F) &&
@@ -907,6 +1185,11 @@ uint32_t TileGetRenderTargetPitch(uint32_t width, uint32_t bytes_per_element,
 	}
 	const uint64_t pitch = Common::AlignUp(static_cast<uint64_t>(width), block_width);
 	return pitch <= UINT32_MAX ? static_cast<uint32_t>(pitch) : 0;
+}
+
+uint32_t TileGetDepthPitch(uint32_t width, uint32_t bytes_per_element,
+                           uint32_t num_fragments_log2) {
+	return TileGetRenderTargetPitch(width, bytes_per_element, num_fragments_log2);
 }
 
 bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
@@ -989,33 +1272,32 @@ void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t 
 
 	TileTextureElementLayout element {};
 	if (tile == Prospero::TileMode::kLinear && TileGetTextureElementLayout(format, element)) {
+		uint32_t mip_pitch[16] {};
+		uint32_t mip_height[16] {};
+		uint32_t mip_size[16] {};
+
 		const uint32_t elements_w0 =
 		    std::max((width + element.texel_width - 1u) / element.texel_width, 1u);
 		const uint32_t elements_h0 =
 		    std::max((height + element.texel_height - 1u) / element.texel_height, 1u);
-		const uint32_t min_padded =
-		    element.texel_width != 1 || element.texel_height != 1 ? 32u : 0u;
-		uint32_t offset = 0;
-		// Smaller mip records come first; mip 0 is last in the block slice.
-		for (uint32_t l = levels; l-- > 0;) {
-			const uint32_t pitch =
-			    Common::AlignUp(ShiftCeil(elements_w0, l), CalcLinearBlockWidth(element.bytes));
-			const uint32_t rows = ShiftCeil(elements_h0, l);
-			const uint64_t size = static_cast<uint64_t>(pitch) * rows * element.bytes;
-			EXIT_NOT_IMPLEMENTED(size > 0xffffffffull);
-			if (level_sizes != nullptr) {
-				level_sizes[l].size   = static_cast<uint32_t>(size);
-				level_sizes[l].offset = offset;
+		const bool compressed = element.texel_width != 1 || element.texel_height != 1;
+		for (uint32_t l = 0; l < levels; l++) {
+			uint32_t       padded_elements_h  = 0;
+			const uint32_t aligned_elements_w = CalcLinearAlignedLevelPitch(
+			    elements_w0, elements_h0, l, element.bytes, &padded_elements_h, &mip_size[l]);
+			mip_pitch[l]  = aligned_elements_w * element.texel_width;
+			mip_height[l] = padded_elements_h * element.texel_height;
+			if (compressed) {
+				mip_pitch[l]  = std::max(mip_pitch[l], 32u);
+				mip_height[l] = std::max(mip_height[l], 32u);
 			}
-			if (padded_size != nullptr) {
-				padded_size[l] = {std::max(pitch * element.texel_width, min_padded),
-				                  std::max(rows * element.texel_height, min_padded)};
-			}
-			offset += static_cast<uint32_t>(size);
 		}
 
+		const uint32_t total = SetLinearMipChainLayout(levels, mip_pitch, mip_height, mip_size,
+		                                               level_sizes, padded_size);
+
 		if (total_size != nullptr) {
-			total_size->size  = Common::AlignUp(offset, 256u);
+			total_size->size  = total;
 			total_size->align = 256;
 		}
 
@@ -1023,11 +1305,10 @@ void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t 
 	}
 
 	TileSurfaceLayout            layout {};
-	TileMipLayout                mips[16];
 	const TileSurfaceDescription description {
 	    format, tile, TileSurfaceDimension::Dim2D, width, height, 1, levels, 1};
-	if (TileGetTiledTextureLayout(description, layout, mips)) {
-		SetLegacyTiledMipLayout(description, layout, mips, total_size, level_sizes, padded_size);
+	if (TileGetTiledTextureLayout(description, layout)) {
+		SetLegacyTiledMipLayout(layout, total_size, level_sizes, padded_size);
 		return;
 	}
 	if (total_size != nullptr && total_size->size == 0) {
@@ -1042,10 +1323,9 @@ void TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, uint
 	EXIT_NOT_IMPLEMENTED(depth == 0);
 	if (volume_texture && tile != Prospero::TileMode::kLinear) {
 		TileSurfaceLayout            layout {};
-		TileMipLayout                mips[16];
 		const TileSurfaceDescription description {
 		    format, tile, TileSurfaceDimension::Dim3D, width, height, depth, levels, 1};
-		if (!TileGetTiledTextureLayout(description, layout, mips)) {
+		if (!TileGetTiledTextureLayout(description, layout)) {
 			EXIT("unsupported 3D texture layout: format=%u tile=%u extent=%ux%ux%u levels=%u\n",
 			     static_cast<uint32_t>(format), static_cast<uint32_t>(tile), width, height, depth,
 			     levels);

@@ -340,11 +340,11 @@ void ApplyExternalInputs() {
 
 } // namespace
 
-int KYTY_SYSV_ABI ImeDialogGetPanelSize(const Param* param, uint32_t* width, uint32_t* height) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeDialogGetPanelSize(const Param* param, uint32_t* width, uint32_t* height) {
 	return ImeDialogGetPanelSizeExtended(param, nullptr, width, height);
 }
 
-int KYTY_SYSV_ABI ImeDialogGetPanelSizeExtended(const Param* param, const ExtendedParam* extended,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeDialogGetPanelSizeExtended(const Param* param, const ExtendedParam* extended,
                                                 uint32_t* width, uint32_t* height) {
 	if (param == nullptr || width == nullptr || height == nullptr) {
 		return ERROR_INVALID_ADDRESS;
@@ -366,7 +366,7 @@ int KYTY_SYSV_ABI ImeDialogGetPanelSizeExtended(const Param* param, const Extend
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeDialogInit(const Param* param, const ExtendedParam* extended) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeDialogInit(const Param* param, const ExtendedParam* extended) {
 	if (g_status.load(std::memory_order_acquire) != Status::None) {
 		return ERROR_BUSY;
 	}
@@ -409,13 +409,13 @@ int KYTY_SYSV_ABI ImeDialogInit(const Param* param, const ExtendedParam* extende
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeDialogGetStatus() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeDialogGetStatus() {
 	ApplyExternalInputs();
 	ApplyFilterAndCommit();
 	return static_cast<int>(g_status.load(std::memory_order_acquire));
 }
 
-int KYTY_SYSV_ABI ImeDialogAbort() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeDialogAbort() {
 	uint64_t generation = 0;
 	{
 		std::scoped_lock lock(g_mutex);
@@ -434,7 +434,7 @@ int KYTY_SYSV_ABI ImeDialogAbort() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeDialogGetResult(Result* result) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeDialogGetResult(Result* result) {
 	{
 		std::scoped_lock lock(g_mutex);
 		if (g_state.status == Status::None) {
@@ -465,7 +465,7 @@ int KYTY_SYSV_ABI ImeDialogGetResult(Result* result) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeDialogTerm() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeDialogTerm() {
 	{
 		std::scoped_lock lock(g_mutex);
 		if (g_state.status == Status::None) {
@@ -492,7 +492,7 @@ int KYTY_SYSV_ABI ImeDialogTerm() {
 	return OK;
 }
 
-int KYTY_SYSV_ABI ImeDialogGetPanelPositionAndForm(PositionAndForm* form) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ImeDialogGetPanelPositionAndForm(PositionAndForm* form) {
 	std::scoped_lock lock(g_mutex);
 	if (g_state.status == Status::None) {
 		return ERROR_NOT_IN_USE;

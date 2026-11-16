@@ -39,6 +39,10 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("Mt4QHHkxkOc", VideoOut::VideoOutGetEventCount);
 	LIB_FUNC("j6RaAUlaLv0", VideoOut::VideoOutWaitVblank);
 	LIB_FUNC("utPrVdxio-8", VideoOut::VideoOutGetOutputStatus);
+	LIB_FUNC("d7eh3psk1J8", VideoOut::VideoOutPortStatusIsUsable);
+	LIB_FUNC("q9HFykGcuWU", VideoOut::VideoOutPortStatusIsDeviceConnected);
+	LIB_FUNC("v9gmbZSAovI", VideoOut::VideoOutOutputStatusIsHdcp14Enabled);
+	LIB_FUNC("ys239q8VgXY", VideoOut::VideoOutOutputStatusIsHdcp23Enabled);
 	LIB_FUNC("5tRaBjtdTzY", VideoOut::VideoOutVrrPegToFixedRate);
 	LIB_FUNC("T4ucGB8CsnM", VideoOut::VideoOutVrrUnpegFromFixedRate);
 	LIB_FUNC("+I4K03i3EL0", VideoOut::VideoOutInitializeOutputOptions);
@@ -48,7 +52,23 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("MCJ8SkzsQxY", VideoOut::VideoOutLatencyMeasureSetStartPoint);
 	LIB_FUNC("DYhhWbJSeRg", VideoOut::VideoOutColorSettingsSetGamma);
 	LIB_FUNC("pv9CI5VC+R0", VideoOut::VideoOutAdjustColor);
+	LIB_FUNC("fYWVVDKZOCk", VideoOut::VideoOutSysAddSetModeEvent2);
+	LIB_FUNC("OOF0YO73GTA", VideoOut::VideoOutSysSetDimmer);
+	LIB_FUNC("dFhciCfO31s", VideoOut::VideoOutSysGetPipelineStatus);
+	LIB_FUNC("4XsQdhiOaAc", VideoOut::VideoOutSysIsUserStatusVr);
+	LIB_FUNC("AAELy8Yc3Mc", VideoOut::VideoOutSysGetVideoOutModeByBusSpecifier);
+	LIB_FUNC("I7-lGGvFgBM", VideoOut::VideoOutSysIsModeSupported);
+	LIB_FUNC("zecl8Gox+P0", VideoOut::VideoOutSysModeIsSupported);
+	LIB_FUNC("SgA2MtojPto", VideoOut::VideoOutSysModeIs2);
 	LIB_FUNC("w7Ipp9Xl7hg", VideoOut::VideoOutAllowOutputResolutionWqhdDetection);
+	LIB_FUNC("Am8Hlr7tlxA", VideoOut::VideoOutSysAddVblankEvent2);
+	LIB_FUNC("Ek+VR4lcJQI", VideoOut::VideoOutSysAddVblankEvent);
+	LIB_FUNC("iwsJdAZCg34", VideoOut::VideoOutSysDeleteVblankEvent);
+	LIB_FUNC("2EBuouuYKgM", VideoOut::VideoOutSysDeleteVblankEvent2);
+	LIB_FUNC("qLDCAl8ygCw", VideoOut::VideoOutSysGetResolutionStatus2);
+	LIB_FUNC("O57F5ikhGxo", VideoOut::VideoOutSysIsUserStatusSystemDefault);
+	LIB_FUNC("pTxsULu4Nh0", VideoOut::VideoOutSysGetPrivacyMaskStatus);
+	LIB_FUNC("iYrCszX93AM", VideoOut::VideoOutGetOutputStatus);
 }
 
 } // namespace LibGen5

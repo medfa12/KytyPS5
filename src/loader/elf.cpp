@@ -4,8 +4,14 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
+
+extern "C" {
+#include <libavutil/mem.h>
+#include <libavutil/sha.h>
+}
 
 namespace Loader {
 
@@ -239,7 +245,13 @@ Elf64::~Elf64() {
 	Clear();
 }
 
-void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
+void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size, uint32_t* bytes_read) {
+	if (!m_frozen_image.empty()) {
+		EXIT_IF(file_offset > m_frozen_image.size() || size > m_frozen_image.size() - file_offset || size > UINT32_MAX);
+		std::memcpy(reinterpret_cast<void*>(vaddr), m_frozen_image.data() + file_offset, static_cast<size_t>(size));
+		if (bytes_read) { *bytes_read = static_cast<uint32_t>(size); }
+		return;
+	}
 	EXIT_IF(m_f == nullptr);
 
 	if (m_self != nullptr) {
@@ -262,7 +274,7 @@ void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 					EXIT_NOT_IMPLEMENTED(offset + size > seg.decompressed_size);
 
 					m_f->Seek(offset + seg.offset);
-					m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+				m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size, bytes_read);
 
 					return;
 				}
@@ -271,7 +283,7 @@ void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 
 		if (m_f->Size() - m_self->file_size == size) {
 			m_f->Seek(m_self->file_size);
-			m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+			m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size, bytes_read);
 
 			return;
 		}
@@ -279,7 +291,7 @@ void Elf64::LoadSegment(uint64_t vaddr, uint64_t file_offset, uint64_t size) {
 		EXIT("missing self segment\n");
 	} else {
 		m_f->Seek(file_offset);
-		m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size);
+		m_f->Read(reinterpret_cast<void*>(static_cast<uintptr_t>(vaddr)), size, bytes_read);
 	}
 }
 
@@ -300,6 +312,72 @@ std::vector<const Elf64_Dyn*> Elf64::GetDynList(Elf64_Sxword tag) const {
 		}
 	}
 	return ret;
+}
+
+bool Elf64::MatchesFileSha256(const uint8_t (&expected)[32], uint64_t max_size) {
+	if (!m_f || m_f->IsInvalid() || m_f->Size() == 0 || m_f->Size() > max_size) { return false; }
+	const auto position = m_f->Tell();
+	const auto size = m_f->Size();
+	auto* sha = av_sha_alloc();
+	if (!sha) { return false; }
+	bool ok = av_sha_init(sha, 256) == 0 && m_f->Seek(0);
+	uint8_t buffer[16384];
+	for (uint64_t offset = 0; ok && offset < size;) {
+		const auto count = static_cast<uint32_t>((std::min)(size - offset, uint64_t {sizeof(buffer)}));
+		uint32_t read = 0;
+		m_f->Read(buffer, count, &read);
+		ok = read == count;
+		if (ok) { av_sha_update(sha, buffer, count); }
+		offset += count;
+	}
+	uint8_t digest[32] {};
+	if (ok) { av_sha_final(sha, digest); }
+	av_free(sha);
+	ok = m_f->Seek(position) && ok && m_f->Size() == size;
+	return ok && std::memcmp(digest, expected, sizeof(digest)) == 0;
+}
+
+bool Elf64::SnapshotPlainFile(uint64_t exact_size, std::vector<uint8_t>* out) {
+	if (!out || IsSelf() || !m_f || m_f->IsInvalid() || exact_size > UINT32_MAX || m_f->Size() != exact_size) { return false; }
+	const auto position = m_f->Tell();
+	std::vector<uint8_t> bytes(static_cast<size_t>(exact_size));
+	uint32_t read = 0;
+	const bool seek = m_f->Seek(0);
+	if (seek) { m_f->Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read); }
+	const bool restored = m_f->Seek(position);
+	if (!restored || !seek || read != exact_size || m_f->Size() != exact_size) { return false; }
+	*out = std::move(bytes);
+	return true;
+}
+
+bool Elf64::FreezePlainFile(const uint8_t (&expected)[32], uint64_t exact_size) {
+	if (!m_frozen_image.empty() || !m_ehdr || !m_phdr) { return false; }
+	std::vector<uint8_t> bytes;
+	if (!SnapshotPlainFile(exact_size, &bytes)) { return false; }
+	auto* sha = av_sha_alloc();
+	if (!sha) { return false; }
+	const bool initialized = av_sha_init(sha, 256) == 0;
+	uint8_t digest[32] {};
+	if (initialized) { av_sha_update(sha, bytes.data(), bytes.size()); av_sha_final(sha, digest); }
+	av_free(sha);
+	if (!initialized || std::memcmp(digest, expected, 32)) { return false; }
+	auto matches = [&](uint64_t offset, uint64_t size, const void* cached) {
+		return offset <= bytes.size() && size <= bytes.size() - offset &&
+		       (size == 0 || (cached && std::memcmp(cached, bytes.data() + offset, static_cast<size_t>(size)) == 0));
+	};
+	if (!matches(0, sizeof(Elf64_Ehdr), m_ehdr.get()) || m_ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
+	    !matches(m_ehdr->e_phoff, uint64_t(m_ehdr->e_phnum) * sizeof(Elf64_Phdr), m_phdr.get()) ||
+	    (m_ehdr->e_shnum && (m_ehdr->e_shentsize != sizeof(Elf64_Shdr) ||
+	     !matches(m_ehdr->e_shoff, uint64_t(m_ehdr->e_shnum) * sizeof(Elf64_Shdr), m_shdr.get())))) { return false; }
+	for (size_t i = 0; i < m_ehdr->e_phnum; ++i) {
+		const auto& p = m_phdr[i];
+		if (p.p_type == PT_DYNAMIC && !matches(p.p_offset, p.p_filesz, m_dynamic.get())) { return false; }
+		if (p.p_type == PT_OS_DYNLIBDATA && !matches(p.p_offset, p.p_filesz, m_dynamic_data.get())) { return false; }
+	}
+	if (m_str_table && (m_ehdr->e_shstrndx >= m_ehdr->e_shnum ||
+	    !matches(m_shdr[m_ehdr->e_shstrndx].sh_offset, m_str_table_size, m_str_table.get()))) { return false; }
+	m_frozen_image = std::move(bytes);
+	return true;
 }
 
 bool Elf64::IsShared() const {
@@ -330,6 +408,7 @@ const char* Elf64::GetSectionName(int index) const {
 }
 
 void Elf64::Clear() {
+	m_frozen_image.clear();
 	if (m_f != nullptr) {
 		m_f->Close();
 	}
@@ -344,6 +423,7 @@ void Elf64::Clear() {
 	m_str_table_size = 0;
 	m_dynamic.reset();
 	m_dynamic_data.reset();
+	m_authority_metadata.reset();
 }
 
 void Elf64::DbgDump(const std::string& folder) {
@@ -496,8 +576,12 @@ bool Elf64::IsValid() const {
 		return false;
 	}
 
-	if (m_ehdr->e_ident[EI_ABIVERSION] != 0 && m_ehdr->e_ident[EI_ABIVERSION] != 2) {
-		LOGF("ehdr->e_ident[EI_ABIVERSION] (0x%x) != (0 or 2)\n", m_ehdr->e_ident[EI_ABIVERSION]);
+	// ps5-vsh: 13.60 system modules carry newer SDK markers (1 and 3 are
+	// common across system_b/system_ex_b); they parse identically.
+	if (m_ehdr->e_ident[EI_ABIVERSION] != 0 && m_ehdr->e_ident[EI_ABIVERSION] != 1 &&
+	    m_ehdr->e_ident[EI_ABIVERSION] != 2 && m_ehdr->e_ident[EI_ABIVERSION] != 3) {
+		LOGF("ehdr->e_ident[EI_ABIVERSION] (0x%x) != (0, 1, 2 or 3)\n",
+		     m_ehdr->e_ident[EI_ABIVERSION]);
 		return false;
 	}
 
@@ -538,6 +622,14 @@ void Elf64::Open(const std::filesystem::path& file_name) {
 	if (m_f->IsInvalid()) {
 		EXIT("Can't open %s\n", Common::PathToString(file_name).c_str());
 	}
+
+	// Inspect only a bounded header prefix; short reads never become padding.
+	std::vector<uint8_t> header(static_cast<size_t>(std::min<uint64_t>(m_f->Size(), AuthorityMetadataHeaderLimit)));
+	uint32_t header_read = 0;
+	if (!header.empty()) { m_f->Read(header.data(), static_cast<uint32_t>(header.size()), &header_read); }
+	header.resize(header_read);
+	m_authority_metadata = ReadAuthorityMetadata(header, m_f->Size());
+	m_f->Seek(0);
 
 	m_self = LoadSelf(*m_f);
 
@@ -602,6 +694,16 @@ void Elf64::Save(const std::filesystem::path& file_name) {
 
 		SavePhdr64(f, m_ehdr->e_phoff, m_ehdr->e_phnum, m_phdr.get());
 		SaveShdr64(f, m_ehdr->e_shoff, m_ehdr->e_shnum, m_shdr.get());
+
+		// Save always emits plain ELF, so both input provenances use the logical
+		// ELF header gap, whose bounds/nonoverlap were checked during recognition.
+		if (m_authority_metadata) {
+			const uint64_t offset = m_ehdr->e_phoff + uint64_t(m_ehdr->e_phnum) * m_ehdr->e_phentsize;
+			uint32_t written = 0;
+			f.Seek(offset);
+			f.Write(m_authority_metadata->raw_record.data(), 64, &written);
+			EXIT_IF(written != 64);
+		}
 
 		for (uint16_t i = 0; i < m_ehdr->e_phnum; i++) {
 			if (m_phdr[i].p_filesz == 0u) {

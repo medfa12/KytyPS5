@@ -10,6 +10,7 @@ namespace Libs::Graphics {
 
 struct HostInputTouchPadVisualState {
 	bool     enabled        = false;
+	bool     cursor_visible = true;
 	bool     drawing        = false;
 	bool     position_valid = false;
 	float    x              = 0.5f;

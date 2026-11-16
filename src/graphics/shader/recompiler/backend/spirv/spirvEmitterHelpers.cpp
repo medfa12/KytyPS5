@@ -1,7 +1,34 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
-namespace {
+
+uint32_t EmitFragmentQuadPermute(EmitterState& state, uint32_t type, uint32_t value,
+                                 uint32_t control) {
+	// Unlike subgroup shuffle/ballot, quad operations include fragment helper
+	// invocations. Guest WQM derivative sequences need those lanes at primitive
+	// boundaries. Use constant broadcast indices (valid on SPIR-V 1.3 too).
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformQuad);
+	std::array<uint32_t, 4> broadcast {};
+	for (uint32_t lane = 0; lane < 4; ++lane) {
+		const auto source = (control >> (lane * 2u)) & 3u;
+		if (broadcast[source] == 0) {
+			broadcast[source] = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpGroupNonUniformQuadBroadcast, type, broadcast[source],
+			                          ConstantU32(state, spv::ScopeSubgroup), value,
+			                          ConstantU32(state, source));
+		}
+	}
+	const auto lane = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	                         EmitSubgroupLocalInvocationId(state), ConstantU32(state, 3));
+	auto result = broadcast[control & 3u];
+	for (uint32_t i = 1; i < 4; ++i) {
+		const auto selected = broadcast[(control >> (i * 2u)) & 3u];
+		if (selected == broadcast[control & 3u]) continue;
+		const auto match = Binary(state, spv::OpIEqual, TypeBool(state), lane, ConstantU32(state, i));
+		result = Select(state, type, match, selected, result);
+	}
+	return result;
+}
 
 DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
                                     uint32_t lane_bits) {
@@ -59,8 +86,6 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 	               ConstantU32(state, half_row ? 7u : 15u)),
 	        ConstantBool(state, true)};
 }
-
-} // namespace
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags) {
 	const auto subid = EmitSubgroupLocalInvocationId(state);

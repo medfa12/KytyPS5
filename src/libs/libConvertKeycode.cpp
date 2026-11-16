@@ -13,7 +13,7 @@ namespace ConvertKeycode {
 constexpr int CONVERT_KEYCODE_ERROR_INVALID_ADDRESS = -2135162831; // 0x80bc0031
 constexpr int CONVERT_KEYCODE_ERROR_INVALID_USER_ID = -2135162864; // 0x80bc0010
 
-static int KYTY_SYSV_ABI ConvertKeycodeGetImeKeyboardType(int32_t user_id, uint32_t* type) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ConvertKeycodeGetImeKeyboardType(int32_t user_id, uint32_t* type) {
 	PRINT_NAME();
 
 	LOGF("\t user_id = %d\n", user_id);

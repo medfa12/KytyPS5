@@ -10,7 +10,7 @@ namespace WebBrowserDialog {
 
 constexpr int WEB_BROWSER_DIALOG_STATUS_NONE = 0;
 
-static int KYTY_SYSV_ABI WebBrowserDialogGetStatus() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI WebBrowserDialogGetStatus() {
 	PRINT_NAME();
 
 	return WEB_BROWSER_DIALOG_STATUS_NONE;

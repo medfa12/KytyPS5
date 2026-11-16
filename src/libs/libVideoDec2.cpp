@@ -2,10 +2,13 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/videoDec2Decoder.h"
+#include "libs/videoDec2Types.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
@@ -40,98 +43,79 @@ constexpr int32_t VIDEODEC2_ERROR_ACCESS_UNIT          = -2128805119; // 0x811d0
 constexpr int32_t VIDEODEC2_ERROR_OVERSIZE_DECODE      = -2128805118; // 0x811d0302
 
 constexpr uint32_t VIDEODEC2_RESOURCE_TYPE_COMPUTE = 1;
-constexpr uint32_t VIDEODEC2_CODEC_TYPE_AVC        = 1;
-constexpr uint32_t VIDEODEC2_CODEC_TYPE_VP9        = 2382845;
+// Regular 13.60 translates this private resource to VdecCore mode 8.
+// Unlike COMPUTE it does not require a caller-owned compute queue.
+constexpr uint32_t VIDEODEC2_RESOURCE_TYPE_VDEC = 0x12384;
 constexpr size_t   VIDEODEC2_MIN_MEMORY_SIZE       = 16ull * 1024ull * 1024ull;
 constexpr uint32_t VIDEODEC2_FRAME_FORMAT_DEFAULT  = 0;
 
-using Videodec2Decoder      = void*;
-using Videodec2ComputeQueue = void*;
-
-struct Videodec2DecoderConfigInfo {
-	size_t                this_size;
-	uint32_t              resource_type;
-	uint32_t              codec_type;
-	uint32_t              profile;
-	uint32_t              max_level;
-	int32_t               max_frame_width;
-	int32_t               max_frame_height;
-	int32_t               max_dpb_frame_count;
-	uint32_t              decode_input_queue_depth;
-	Videodec2ComputeQueue compute_queue;
-	uint64_t              cpu_affinity_mask;
-	int32_t               cpu_thread_priority;
-	bool                  optimize_progressive_video;
-	bool                  check_memory_type;
-	uint8_t               reserved0;
-	uint8_t               reserved1;
-	void*                 extra_config_info;
-};
-
-struct Videodec2DecoderMemoryInfo {
-	size_t   this_size;
-	size_t   cpu_memory_size;
-	void*    cpu_memory;
-	size_t   gpu_memory_size;
-	void*    gpu_memory;
-	size_t   cpu_gpu_memory_size;
-	void*    cpu_gpu_memory;
-	size_t   max_frame_buffer_size;
-	uint32_t frame_buffer_alignment;
-	uint32_t reserved0;
-};
-
-struct Videodec2InputData {
-	size_t   this_size;
-	void*    au_data;
-	size_t   au_size;
-	uint64_t pts_data;
-	uint64_t dts_data;
-	uint64_t attached_data;
-};
-
-struct Videodec2OutputInfo {
-	size_t   this_size;
-	bool     is_valid;
-	bool     is_error_frame;
-	uint8_t  picture_count;
-	bool     is_discarded_frame;
-	uint32_t codec_type;
-	uint32_t frame_width;
-	uint32_t frame_pitch;
-	uint32_t frame_height;
-	void*    frame_buffer;
-	size_t   frame_buffer_size;
-	uint32_t frame_format;
-	uint32_t frame_pitch_in_bytes;
-};
-
-struct Videodec2FrameBuffer {
-	size_t this_size;
-	void*  frame_buffer;
-	size_t frame_buffer_size;
-	bool   is_accepted;
-};
-
 using Videodec2AvcPictureInfo = Decoder::AvcPictureInfo;
-using Videodec2Vp9PictureInfo = Decoder::Vp9PictureInfo;
-
-struct Videodec2ComputeMemoryInfo {
-	size_t this_size;
-	size_t cpu_gpu_memory_size;
-	void*  cpu_gpu_memory;
-};
-
-struct Videodec2ComputeConfigInfo {
-	size_t   this_size;
-	uint16_t compute_pipe_id;
-	uint16_t compute_queue_id;
-	bool     check_memory_type;
-	uint8_t  reserved0;
-	uint16_t reserved1;
-};
 
 using DecoderState = Decoder::Instance;
+
+enum class TraceOperation : size_t { Query, Create, Decode, Flush };
+static constexpr const char* TraceOperationNames[] = {"query", "create", "decode", "flush"};
+
+static bool TakeTraceRecord(TraceOperation operation, int32_t result) {
+	// Independent of PRINT_NAME's thread-local initialization: apps call these
+	// exports from decoder workers, not necessarily the library-registration thread.
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_MEDIA_TRACE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (!enabled) { return false; }
+	static std::atomic_uint counts[4][2] {};
+	const bool error = result != OK;
+	const unsigned limit = error ? 16u : operation >= TraceOperation::Decode ? 64u : 32u;
+	const auto count = counts[static_cast<size_t>(operation)][error].fetch_add(1, std::memory_order_relaxed);
+	if (count == limit) {
+		LOGF("Videodec2 result: operation=%s trace-cap=%u errors=%u\n",
+		     TraceOperationNames[static_cast<size_t>(operation)], limit, unsigned(error));
+	}
+	return count < limit;
+}
+
+static void TraceMemoryResult(TraceOperation operation, int32_t result,
+                             const Videodec2DecoderConfigInfo* config,
+                             const Videodec2DecoderMemoryInfo* memory, void* decoder) {
+	if (!TakeTraceRecord(operation, result)) { return; }
+	// Those errors return before all descriptor sizes have been checked. Do not
+	// dereference a pointer the API itself deliberately never inspected.
+	const bool config_known = result != VIDEODEC2_ERROR_ARGUMENT_POINTER && result != VIDEODEC2_ERROR_STRUCT_SIZE;
+	const bool memory_known = config_known && (operation == TraceOperation::Create || result == OK);
+	LOGF("Videodec2 result: operation=%s result=%08x config=%u resource=%08x codec=%u "
+	     "profile=%u level=%u width=%d height=%d depth=%u memory=%s cpu=%llu gpu=%llu shared=%llu "
+	     "frame=%llu alignment=%u decoder=%p\n",
+	     TraceOperationNames[static_cast<size_t>(operation)], unsigned(result), unsigned(config_known),
+	     config_known ? config->resource_type : 0, config_known ? config->codec_type : 0,
+	     config_known ? config->profile : 0, config_known ? config->max_level : 0,
+	     config_known ? config->max_frame_width : 0, config_known ? config->max_frame_height : 0,
+	     config_known ? config->decode_input_queue_depth : 0,
+	     !memory_known ? "unobserved" : operation == TraceOperation::Query ? "returned" : "supplied",
+	     static_cast<unsigned long long>(memory_known ? memory->cpu_memory_size : 0),
+	     static_cast<unsigned long long>(memory_known ? memory->gpu_memory_size : 0),
+	     static_cast<unsigned long long>(memory_known ? memory->cpu_gpu_memory_size : 0),
+	     static_cast<unsigned long long>(memory_known ? memory->max_frame_buffer_size : 0),
+	     memory_known ? memory->frame_buffer_alignment : 0, decoder);
+}
+
+static void TraceFrameResult(TraceOperation operation, int32_t result, void* decoder,
+                            const Videodec2InputData* input, const Videodec2FrameBuffer* buffer,
+                            const Videodec2OutputInfo* output, bool observed) {
+	if (!TakeTraceRecord(operation, result)) { return; }
+	// observed is set only after the real API initializes both output descriptors.
+	// In particular, a backend buffer-size error is distinct from prevalidation.
+	LOGF("Videodec2 result: operation=%s result=%08x decoder=%p output-observed=%u "
+	     "au-bytes=%llu buffer-accepted=%d picture-valid=%d pictures=%u error-frame=%d "
+	     "codec=%u width=%u height=%u pitch=%u buffer-bytes=%llu\n",
+	     TraceOperationNames[static_cast<size_t>(operation)], unsigned(result), decoder, unsigned(observed),
+	     static_cast<unsigned long long>(observed && input != nullptr ? input->au_size : 0),
+	     observed ? int(buffer->is_accepted) : -1, observed ? int(output->is_valid) : -1,
+	     observed ? unsigned(output->picture_count) : 0, observed ? int(output->is_error_frame) : -1,
+	     observed ? output->codec_type : 0, observed ? output->frame_width : 0,
+	     observed ? output->frame_height : 0, observed ? output->frame_pitch : 0,
+	     static_cast<unsigned long long>(observed ? buffer->frame_buffer_size : 0));
+}
 
 static_assert(sizeof(Videodec2ComputeMemoryInfo) == 24);
 static_assert(sizeof(Videodec2ComputeConfigInfo) == 16);
@@ -209,7 +193,8 @@ static void ApplyDecodedOutput(const Decoder::Output& decoded, Videodec2FrameBuf
 
 static int32_t ValidateDecoderConfig(const Videodec2DecoderConfigInfo* config,
                                      bool                              require_compute_queue) {
-	if (config->resource_type != VIDEODEC2_RESOURCE_TYPE_COMPUTE) {
+	if (config->resource_type != VIDEODEC2_RESOURCE_TYPE_COMPUTE &&
+	    config->resource_type != VIDEODEC2_RESOURCE_TYPE_VDEC) {
 		return VIDEODEC2_ERROR_RESOURCE_TYPE;
 	}
 
@@ -234,7 +219,10 @@ static int32_t ValidateDecoderConfig(const Videodec2DecoderConfigInfo* config,
 		return VIDEODEC2_ERROR_FRAME_WIDTH_HEIGHT;
 	}
 
-	if (require_compute_queue && config->compute_queue == nullptr) {
+	// Query and creation share resource admission; only the COMPUTE resource
+	// owns a compute queue (native creation dispatch at 0xf95 / 0x10f4).
+	if (require_compute_queue && config->resource_type == VIDEODEC2_RESOURCE_TYPE_COMPUTE &&
+	    config->compute_queue == nullptr) {
 		return VIDEODEC2_ERROR_COMPUTE_QUEUE;
 	}
 
@@ -259,7 +247,7 @@ QueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* compute_memory_info) {
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI AllocateComputeQueue(
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AllocateComputeQueue(
     const Videodec2ComputeConfigInfo* compute_config_info,
     const Videodec2ComputeMemoryInfo* compute_memory_info, Videodec2ComputeQueue* compute_queue) {
 	PRINT_NAME();
@@ -298,26 +286,14 @@ static int32_t KYTY_SYSV_ABI AllocateComputeQueue(
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_queue) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_queue) {
 	PRINT_NAME();
 
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
-static size_t FrameBufferSize(const Videodec2DecoderConfigInfo& config) {
-	if (config.codec_type != VIDEODEC2_CODEC_TYPE_AVC || config.max_frame_width <= 0 ||
-	    config.max_frame_height <= 0) {
-		return VIDEODEC2_MIN_MEMORY_SIZE;
-	}
-	// AVC output: 256-byte pitch, 16-line maximum height, and 4096 bytes of metadata.
-	const auto pitch  = (static_cast<size_t>(config.max_frame_width) + 255u) & ~size_t {255};
-	const auto height = (static_cast<size_t>(config.max_frame_height) + 15u) & ~size_t {15};
-	return pitch * height * 3 / 2 + 4096;
-}
-
-static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
+static int32_t QueryDecoderMemoryInfoImpl(const Videodec2DecoderConfigInfo* config,
                                                     Videodec2DecoderMemoryInfo*       memory_info) {
-	PRINT_NAME();
 
 	if (config == nullptr || memory_info == nullptr) {
 		return VIDEODEC2_ERROR_ARGUMENT_POINTER;
@@ -339,17 +315,16 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfig
 	memory_info->gpu_memory             = nullptr;
 	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
-	memory_info->max_frame_buffer_size  = FrameBufferSize(*config);
+	memory_info->max_frame_buffer_size  = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->frame_buffer_alignment = 0x100;
 	memory_info->reserved0              = 0;
 
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* config,
+static int32_t CreateDecoderImpl(const Videodec2DecoderConfigInfo* config,
                                            const Videodec2DecoderMemoryInfo* memory_info,
                                            Videodec2Decoder*                 decoder) {
-	PRINT_NAME();
 
 	if (config == nullptr || memory_info == nullptr || decoder == nullptr) {
 		return VIDEODEC2_ERROR_ARGUMENT_POINTER;
@@ -368,7 +343,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->max_frame_buffer_size < FrameBufferSize(*config)) {
+	    memory_info->max_frame_buffer_size < VIDEODEC2_MIN_MEMORY_SIZE) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 
@@ -377,8 +352,9 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 		return VIDEODEC2_ERROR_MEMORY_POINTER;
 	}
 
-	auto* state =
-	    Decoder::Create({config->codec_type, config->max_frame_width, config->max_frame_height});
+	Decoder::Config backend_config {config->codec_type, config->max_frame_width, config->max_frame_height};
+	backend_config.retain_input_buffer = config->resource_type == VIDEODEC2_RESOURCE_TYPE_VDEC;
+	auto* state = Decoder::Create(backend_config);
 	if (state == nullptr) {
 		return VIDEODEC2_ERROR_API_FAIL;
 	}
@@ -392,7 +368,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI DeleteDecoder(Videodec2Decoder decoder) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI DeleteDecoder(Videodec2Decoder decoder) {
 	PRINT_NAME();
 
 	DecoderState* state = nullptr;
@@ -411,10 +387,9 @@ static int32_t KYTY_SYSV_ABI DeleteDecoder(Videodec2Decoder decoder) {
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2InputData* input_data,
-                                    Videodec2FrameBuffer* frame_buffer,
-                                    Videodec2OutputInfo*  output_info) {
-	PRINT_NAME();
+static int32_t DecodeImpl(Videodec2Decoder decoder, const Videodec2InputData* input_data,
+                                     Videodec2FrameBuffer* frame_buffer,
+	                                    Videodec2OutputInfo*  output_info, bool* output_observed) {
 
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
@@ -449,6 +424,7 @@ static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2Inp
 
 	frame_buffer->is_accepted = false;
 	FillNoPictureOutput(frame_buffer, output_info, Decoder::GetCodecType(state));
+	*output_observed = true;
 
 	Decoder::Output decoded {};
 	const auto      result =
@@ -460,9 +436,8 @@ static int32_t KYTY_SYSV_ABI Decode(Videodec2Decoder decoder, const Videodec2Inp
 	return MapDecoderResult(result);
 }
 
-static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffer* frame_buffer,
-                                   Videodec2OutputInfo* output_info) {
-	PRINT_NAME();
+static int32_t FlushImpl(Videodec2Decoder decoder, Videodec2FrameBuffer* frame_buffer,
+                                    Videodec2OutputInfo* output_info, bool* output_observed) {
 
 	auto* state = GetDecoder(decoder);
 	if (state == nullptr) {
@@ -488,6 +463,7 @@ static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffe
 
 	frame_buffer->is_accepted = false;
 	FillNoPictureOutput(frame_buffer, output_info, Decoder::GetCodecType(state));
+	*output_observed = true;
 
 	Decoder::Output decoded {};
 	const auto      result = Decoder::Flush(
@@ -496,7 +472,43 @@ static int32_t KYTY_SYSV_ABI Flush(Videodec2Decoder decoder, Videodec2FrameBuffe
 	return MapDecoderResult(result);
 }
 
-static int32_t KYTY_SYSV_ABI Reset(Videodec2Decoder decoder) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI QueryDecoderMemoryInfo(
+    const Videodec2DecoderConfigInfo* config, Videodec2DecoderMemoryInfo* memory_info) {
+	PRINT_NAME();
+	const auto result = QueryDecoderMemoryInfoImpl(config, memory_info);
+	TraceMemoryResult(TraceOperation::Query, result, config, memory_info, nullptr);
+	return result;
+}
+
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI CreateDecoder(
+    const Videodec2DecoderConfigInfo* config, const Videodec2DecoderMemoryInfo* memory_info,
+    Videodec2Decoder* decoder) {
+	PRINT_NAME();
+	const auto result = CreateDecoderImpl(config, memory_info, decoder);
+	TraceMemoryResult(TraceOperation::Create, result, config, memory_info, result == OK ? *decoder : nullptr);
+	return result;
+}
+
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Decode(
+    Videodec2Decoder decoder, const Videodec2InputData* input_data,
+    Videodec2FrameBuffer* frame_buffer, Videodec2OutputInfo* output_info) {
+	PRINT_NAME();
+	bool observed = false;
+	const auto result = DecodeImpl(decoder, input_data, frame_buffer, output_info, &observed);
+	TraceFrameResult(TraceOperation::Decode, result, decoder, input_data, frame_buffer, output_info, observed);
+	return result;
+}
+
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Flush(
+    Videodec2Decoder decoder, Videodec2FrameBuffer* frame_buffer, Videodec2OutputInfo* output_info) {
+	PRINT_NAME();
+	bool observed = false;
+	const auto result = FlushImpl(decoder, frame_buffer, output_info, &observed);
+	TraceFrameResult(TraceOperation::Flush, result, decoder, nullptr, frame_buffer, output_info, observed);
+	return result;
+}
+
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Reset(Videodec2Decoder decoder) {
 	PRINT_NAME();
 
 	auto* state = GetDecoder(decoder);
@@ -507,7 +519,7 @@ static int32_t KYTY_SYSV_ABI Reset(Videodec2Decoder decoder) {
 	return OK;
 }
 
-static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_info,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_info,
                                             void* first_picture_info, void* second_picture_info) {
 	PRINT_NAME();
 
@@ -546,7 +558,7 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 		return OK;
 	};
 
-	if (output_info->codec_type == VIDEODEC2_CODEC_TYPE_AVC) {
+	if (output_info->codec_type == 1) {
 		const auto requested_size = *static_cast<const size_t*>(first_picture_info);
 		if (requested_size != sizeof(Videodec2AvcPictureInfo) &&
 		    (requested_size | 16u) != sizeof(Videodec2AvcPictureInfo)) {
@@ -555,12 +567,6 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 
 		const auto picture = Decoder::MakeAvcPictureInfo(decoded, requested_size);
 		std::memcpy(first_picture_info, &picture, requested_size);
-	} else if (output_info->codec_type == VIDEODEC2_CODEC_TYPE_VP9) {
-		auto* picture = static_cast<Videodec2Vp9PictureInfo*>(first_picture_info);
-		if (picture->this_size != sizeof(Videodec2Vp9PictureInfo)) {
-			return VIDEODEC2_ERROR_STRUCT_SIZE;
-		}
-		*picture = Decoder::MakeVp9PictureInfo(decoded);
 	} else {
 		const auto result = fill_common(first_picture_info, true);
 		if (result != OK) {
@@ -577,6 +583,15 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 	return OK;
 }
 
+// ps5-vsh: kjrLbcyhEiw is routed to the AVC picture-info implementation.
+// The export's symbolic naming provenance remains under review. The common
+// implementation already takes the AVC path when codec_type == 1.
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GetAvcPictureInfo(const Videodec2OutputInfo* output_info,
+                                               void* first_picture_info,
+                                               void* second_picture_info) {
+	return GetPictureInfo(output_info, first_picture_info, second_picture_info);
+}
+
 LIB_DEFINE(InitVideoDec2_1) {
 	PRINT_NAME_ENABLE(true);
 
@@ -590,7 +605,7 @@ LIB_DEFINE(InitVideoDec2_1) {
 	LIB_FUNC("l1hXwscLuCY", Flush);
 	LIB_FUNC("wJXikG6QFN8", Reset);
 	LIB_FUNC("NtXRa3dRzU0", GetPictureInfo);
-	LIB_FUNC("kjrLbcyhEiw", GetPictureInfo);
+	LIB_FUNC("kjrLbcyhEiw", GetAvcPictureInfo); // sceVideodec2GetAvcPictureInfo
 }
 
 } // namespace VideoDec2

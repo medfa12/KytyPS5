@@ -147,7 +147,7 @@ static int32_t ValidateCreateParam(const PngEncCreateParam* param) {
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI PngEncQueryMemorySize(const PngEncCreateParam* param) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PngEncQueryMemorySize(const PngEncCreateParam* param) {
 	PRINT_NAME();
 
 	if (int32_t result = ValidateCreateParam(param); result != 0) {
@@ -157,7 +157,7 @@ static int32_t KYTY_SYSV_ABI PngEncQueryMemorySize(const PngEncCreateParam* para
 	return sizeof(PngEncContext);
 }
 
-static int32_t KYTY_SYSV_ABI PngEncCreate(const PngEncCreateParam* param, void* memory_address,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PngEncCreate(const PngEncCreateParam* param, void* memory_address,
                                           uint32_t memory_size, void** handle) {
 	PRINT_NAME();
 
@@ -185,7 +185,7 @@ static int32_t KYTY_SYSV_ABI PngEncCreate(const PngEncCreateParam* param, void* 
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI PngEncEncode(void* handle, const PngEncEncodeParam* param,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PngEncEncode(void* handle, const PngEncEncodeParam* param,
                                           PngEncOutputInfo* output_info) {
 	PRINT_NAME();
 
@@ -319,7 +319,7 @@ static int32_t KYTY_SYSV_ABI PngEncEncode(void* handle, const PngEncEncodeParam*
 	return static_cast<int32_t>(writer.size);
 }
 
-static int32_t KYTY_SYSV_ABI PngEncDelete(void* handle) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI PngEncDelete(void* handle) {
 	PRINT_NAME();
 
 	if (handle == nullptr) {

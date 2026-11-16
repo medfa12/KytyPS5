@@ -4,17 +4,22 @@
 #include "common/logging/log.h"
 #include "kernel/eventQueue.h"
 #include "libs/errno.h"
+#include "libs/ipmiObserve.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "libs/hostHttp.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace Libs {
@@ -45,7 +50,7 @@ static constexpr uint32_t g_in6addr_any[4] {};
 
 namespace Net = Network::Net;
 
-KYTY_SYSV_ABI int* GetNetErrorAddr() {
+__attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI int* GetNetErrorAddr() {
 	return &g_net_errno;
 }
 
@@ -56,7 +61,7 @@ static int FinishNetCall(int result) {
 	return result;
 }
 
-static int KYTY_SYSV_ABI NetInit() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetInit() {
 	return FinishNetCall(Net::NetInit());
 }
 
@@ -82,77 +87,227 @@ static int FinishSocketCall(int result) {
 	return FinishNetCall(result < 0 ? PosixToNetError(*Posix::GetErrorAddr()) : result);
 }
 
-int KYTY_SYSV_ABI NetSocket(const char* name, int family, int type, int protocol) {
-	LOGF("\t name = %s\n", name != nullptr ? name : "<null>");
+// ps5-vsh socket HLE: fake-fd overlay for IPC/server sockets (SceLoginMgrServer).
+// A server thread parked in accept()/recv() on an IPC socket with no client would
+// block its host thread forever inside ::accept()/::recv() with no wake. Instead
+// every sceNetSocket() returns a tracked fake fd (never a real host fd):
+// bind/listen succeed, the FIRST accept per listen-fd after T+10s delivers one fake
+// connected fd, later accepts sleep ~5ms and fail EWOULDBLOCK so the guest loop
+// parks instead of spinning, recv reports orderly EOF (0), send reports all-sent.
+// Unknown fds fall through to the real backend (preserves prior behavior).
+namespace FakeSock {
+struct Entry {
+	int  family   = 0;
+	int  type     = 0;
+	int  protocol = 0;
+	bool listening     = false;
+	bool accepted_once = false;
+	bool connected     = false; // accepted connection, or connect()ed client
+	uint64_t polls     = 0;     // accept/recv/send poll count (log throttle)
+	std::chrono::steady_clock::time_point listen_since {};
+};
 
-	return FinishSocketCall(Net::Socket(family, type, protocol));
+constexpr int kFdBase = 5000; // clear of real Net fds (128..1023), epoll ids (1024+), kernel fds
+constexpr int kFdMax  = 5999;
+
+std::mutex           g_mutex;
+std::map<int, Entry> g_table;
+int                  g_next = kFdBase;
+} // namespace FakeSock
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetSocket(const char* name, int family, int type, int protocol) {
+	PRINT_NAME();
+	LOGF("\t name = %s family = %d type = %d protocol = %d\n",
+	     name != nullptr ? name : "<null>", family, type, protocol);
+	if (Network::NativeSslEnabled() || HostHttp::Enabled()) {
+		return FinishSocketCall(Net::Socket(family, type, protocol));
+	}
+
+	std::lock_guard lock(FakeSock::g_mutex);
+	if (FakeSock::g_next > FakeSock::kFdMax) {
+		return FinishNetCall(Network::NET_ERROR_EAGAIN);
+	}
+	const int        fd = FakeSock::g_next++;
+	FakeSock::Entry  entry;
+	entry.family   = family;
+	entry.type     = type;
+	entry.protocol = protocol;
+	FakeSock::g_table[fd] = entry;
+	LOGF("\t fake fd = %d\n", fd);
+	return fd;
 }
 
-int KYTY_SYSV_ABI NetAccept(int s, void* addr, uint32_t* addrlen) {
-	return FinishSocketCall(Net::Accept(s, addr, addrlen));
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetAccept(int s, void* addr, uint32_t* addrlen) {
+	PRINT_NAME();
+
+	int      connected_fd = -1;
+	uint64_t polls        = 0;
+	bool     known        = false;
+	bool     listening    = false;
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		auto            it = FakeSock::g_table.find(s);
+		if (it != FakeSock::g_table.end()) {
+			known     = true;
+			listening = it->second.listening;
+			it->second.polls++;
+			polls = it->second.polls;
+			const auto now = std::chrono::steady_clock::now();
+			if (it->second.listening && !it->second.accepted_once &&
+			    now - it->second.listen_since >= std::chrono::seconds(10) &&
+			    FakeSock::g_next <= FakeSock::kFdMax) {
+				it->second.accepted_once = true;
+				connected_fd             = FakeSock::g_next++;
+				FakeSock::Entry conn;
+				conn.connected        = true;
+				conn.family           = it->second.family;
+				FakeSock::g_table[connected_fd] = conn;
+			}
+		}
+	}
+	if (!known) {
+		return FinishSocketCall(Net::Accept(s, addr, addrlen));
+	}
+	if (connected_fd >= 0) {
+		if (addr != nullptr && addrlen != nullptr && *addrlen > 0) {
+			std::memset(addr, 0, *addrlen > 128 ? 128 : *addrlen);
+		}
+		LOGF("\t fake accept s = %d -> connected fd %d (first client after T+10s)\n", s,
+		     connected_fd);
+		return connected_fd;
+	}
+	if (polls % 1024 == 1) {
+		LOGF("\t fake accept s = %d parked (listening=%d, polls=%llu) -> EWOULDBLOCK\n", s,
+		     listening ? 1 : 0, static_cast<unsigned long long>(polls));
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	return FinishNetCall(Network::NET_ERROR_EWOULDBLOCK);
 }
 
-int KYTY_SYSV_ABI NetBind(int s, const void* addr, uint32_t addrlen) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetBind(int s, const void* addr, uint32_t addrlen) {
+	PRINT_NAME();
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		if (FakeSock::g_table.find(s) != FakeSock::g_table.end()) {
+			LOGF("\t fake bind s = %d addrlen = %u -> 0\n", s, addrlen);
+			return 0;
+		}
+	}
 	return FinishSocketCall(Net::Bind(s, addr, addrlen));
 }
 
-int KYTY_SYSV_ABI NetConnect(int s, const void* addr, uint32_t addrlen) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetConnect(int s, const void* addr, uint32_t addrlen) {
+	PRINT_NAME();
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		auto            it = FakeSock::g_table.find(s);
+		if (it != FakeSock::g_table.end()) {
+			it->second.connected = true;
+			LOGF("\t fake connect s = %d addrlen = %u -> 0\n", s, addrlen);
+			return 0;
+		}
+	}
 	return FinishSocketCall(Net::Connect(s, addr, addrlen));
 }
 
-int KYTY_SYSV_ABI NetListen(int s, int backlog) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetListen(int s, int backlog) {
+	PRINT_NAME();
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		auto            it = FakeSock::g_table.find(s);
+		if (it != FakeSock::g_table.end()) {
+			it->second.listening      = true;
+			it->second.accepted_once  = false;
+			it->second.listen_since   = std::chrono::steady_clock::now();
+			LOGF("\t fake listen s = %d backlog = %d -> 0\n", s, backlog);
+			return 0;
+		}
+	}
 	return FinishSocketCall(Net::Listen(s, backlog));
 }
 
-int KYTY_SYSV_ABI NetShutdown(int s, int how) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetShutdown(int s, int how) {
+	PRINT_NAME();
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		if (FakeSock::g_table.find(s) != FakeSock::g_table.end()) {
+			LOGF("\t fake shutdown s = %d how = %d -> 0\n", s, how);
+			return 0;
+		}
+	}
 	return FinishSocketCall(Net::Shutdown(s, how));
 }
 
-int KYTY_SYSV_ABI NetGetsockname(int s, void* addr, uint32_t* addrlen) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetGetsockname(int s, void* addr, uint32_t* addrlen) {
+	PRINT_NAME();
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		if (FakeSock::g_table.find(s) != FakeSock::g_table.end()) {
+			if (addr != nullptr && addrlen != nullptr && *addrlen > 0) {
+				std::memset(addr, 0, *addrlen > 128 ? 128 : *addrlen);
+			}
+			LOGF("\t fake getsockname s = %d -> 0\n", s);
+			return 0;
+		}
+	}
 	return FinishSocketCall(Net::Getsockname(s, addr, addrlen));
 }
 
-int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags) {
-	return FinishNetCall(Net::NetPoolCreate(name, size, flags));
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags) {
+	const auto caller = KYTY_IPMI_CALLER;
+	const int result = FinishNetCall(Net::NetPoolCreate(name, size, flags));
+	IpmiObserve::NetPoolCreated(caller, name, size, flags, result);
+	return result;
 }
 
-int KYTY_SYSV_ABI NetPoolDestroy(int memid) {
-	return FinishNetCall(Net::NetPoolDestroy(memid));
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetPoolDestroy(int memid) {
+	const auto caller = KYTY_IPMI_CALLER;
+	const int result = FinishNetCall(Net::NetPoolDestroy(memid));
+	IpmiObserve::NetPoolDestroyed(caller, memid, result);
+	return result;
 }
 
-int KYTY_SYSV_ABI NetGetMemoryPoolStats(int memid, Net::NetMemoryPoolStats* stats) {
-	return FinishNetCall(Net::NetGetMemoryPoolStats(memid, stats));
-}
-
-int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 	return FinishNetCall(Net::NetResolverCreate(name, memid, flags));
 }
 
-int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetResolverDestroy(int rid) {
 	return FinishNetCall(Net::NetResolverDestroy(rid));
 }
 
-int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
 	return FinishNetCall(Net::NetResolverAbort(rid, flags));
 }
 
-int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
 	return FinishNetCall(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
 }
 
-int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetResolverStartNtoa6(int rid, const char* hostname, void* addr, int timeout,
+                                        int retry, int flags) {
+	return FinishNetCall(Net::NetResolverStartNtoa6(rid, hostname, addr, timeout, retry, flags));
+}
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname,
                                                       Net::NetResolverInfo* info, int timeout,
                                                       int retry, int flags) {
 	return FinishNetCall(
 	    Net::NetResolverStartNtoaMultipleRecords(rid, hostname, info, timeout, retry, flags));
 }
 
-int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecordsEx(int rid, const char* hostname,
+                                                         Net::NetResolverInfoEx* info, int timeout,
+                                                         int retry, int flags) {
+	return FinishNetCall(
+	    Net::NetResolverStartNtoaMultipleRecordsEx(rid, hostname, info, timeout, retry, flags));
+}
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst) {
 	return FinishNetCall(Net::NetInetPton(af, src, dst));
 }
 
-const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32_t size) {
+const char* __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32_t size) {
 	const char* result = Net::NetInetNtop(af, src, dst, size);
 	if (result == nullptr) {
 		FinishNetCall(PosixToNetError(*Posix::GetErrorAddr()));
@@ -160,84 +315,210 @@ const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32
 	return result;
 }
 
-int KYTY_SYSV_ABI NetEtherNtostr(const Net::NetEtherAddr* n, char* str, size_t len) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetEtherNtostr(const Net::NetEtherAddr* n, char* str, size_t len) {
 	return FinishNetCall(Net::NetEtherNtostr(n, str, len));
 }
 
-int KYTY_SYSV_ABI NetGetMacAddress(Net::NetEtherAddr* addr, int flags) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetGetMacAddress(Net::NetEtherAddr* addr, int flags) {
 	return FinishNetCall(Net::NetGetMacAddress(addr, flags));
 }
 
-int KYTY_SYSV_ABI NetGetSockInfo(int s, void* info, int n, int flags) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetGetSockInfo(int s, void* info, int n, int flags) {
 	return FinishNetCall(Net::NetGetSockInfo(s, info, n, flags));
 }
 
-int KYTY_SYSV_ABI NetEpollCreate(const char* name, int flags) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetEpollCreate(const char* name, int flags) {
 	return FinishSocketCall(Net::EpollCreate(name, flags));
 }
 
-int KYTY_SYSV_ABI NetEpollControl(int eid, int op, int id, const Net::NetEpollEvent* event) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetEpollControl(int eid, int op, int id, const Net::NetEpollEvent* event) {
 	return FinishSocketCall(Net::EpollControl(eid, op, id, event));
 }
 
-int KYTY_SYSV_ABI NetEpollWait(int eid, Net::NetEpollEvent* events, int maxevents, int timeout) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetEpollWait(int eid, Net::NetEpollEvent* events, int maxevents, int timeout) {
 	return FinishSocketCall(Net::EpollWait(eid, events, maxevents, timeout));
 }
 
-int KYTY_SYSV_ABI NetEpollDestroy(int eid) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetEpollDestroy(int eid) {
 	return FinishSocketCall(Net::EpollDestroy(eid));
 }
 
-int KYTY_SYSV_ABI NetSocketClose(int s) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetSocketClose(int s) {
+	PRINT_NAME();
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		auto            it = FakeSock::g_table.find(s);
+		if (it != FakeSock::g_table.end()) {
+			FakeSock::g_table.erase(it);
+			LOGF("\t fake close s = %d -> 0\n", s);
+			return 0;
+		}
+	}
 	return FinishNetCall(Net::SocketClose(s));
 }
 
-int KYTY_SYSV_ABI NetGetsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
-	return FinishSocketCall(Net::Getsockopt(s, level, optname, optval, optlen));
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetSocketAbort(int s, int flags) {
+	if (Network::NativeSslEnabled() || HostHttp::Enabled()) {
+		// Native N+4210 ->7420 forwards BOTH s and flags to syscall101.
+		// Abort cancels pending operations, separately from shutdown/close.
+		// The synchronous backend cannot yet wake them with the native
+		// preservation contract. Do not report success or destroy the socket.
+		const int result = Net::IsSocket(s) ? Network::NET_ERROR_EOPNOTSUPP : Network::NET_ERROR_EBADF;
+		LOGF("Native SSL socket abort unsupported: s=%d flags=%08x result=%08x\n",
+		     s, static_cast<unsigned>(flags), static_cast<unsigned>(result));
+		return FinishNetCall(result);
+	}
+	// ps5-vsh: zJGf8xjFnQE. Abort in-flight socket ops; nothing pends on fake fds.
+	PRINT_NAME();
+	LOGF("\t s = %d -> 0\n", s);
+	return 0;
 }
 
-int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optval,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetEpollAbort(int eid) {
+	// ps5-vsh: w21YgGGNtBk. Abort a wait in progress; waits always time out anyway.
+	PRINT_NAME();
+	LOGF("\t eid = %d -> 0\n", eid);
+	return 0;
+}
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optval,
                                 uint32_t optlen) {
+	PRINT_NAME();
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		if (FakeSock::g_table.find(s) != FakeSock::g_table.end()) {
+			LOGF("\t fake setsockopt s = %d level = %d optname = %d optlen = %u -> 0\n", s,
+			     level, optname, optlen);
+			return 0;
+		}
+	}
 	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
 }
 
-int KYTY_SYSV_ABI NetSendto(int s, const void* buf, size_t len, int flags, const void* addr,
-                         uint32_t addrlen) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetGetsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
+	return FinishSocketCall(Net::Getsockopt(s, level, optname, optval, optlen));
+}
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetSend(int s, const void* buf, size_t len, int flags) {
+	NoteHleCall(g_library, g_module, __func__);
+	HLE_SLOW_GUARD("send");
 	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		auto            it = FakeSock::g_table.find(s);
+		if (it != FakeSock::g_table.end()) {
+			it->second.polls++;
+			if (it->second.polls % 4096 == 1) {
+				PRINT_NAME();
+				LOGF("\t fake send s = %d len = %u -> all-sent\n", s,
+				     static_cast<unsigned>(size));
+			}
+			return static_cast<int>(size);
+		}
+	}
+	return FinishSocketCall(static_cast<int>(Net::Send(s, buf, size, flags | 0x20000)));
+}
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetSendto(int s, const void* buf, size_t len, int flags, const void* addr,
+                            uint32_t addrlen) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		auto            it = FakeSock::g_table.find(s);
+		if (it != FakeSock::g_table.end()) {
+			it->second.polls++;
+			if (it->second.polls % 4096 == 1) {
+				PRINT_NAME();
+				LOGF("\t fake sendto s = %d len = %u -> all-sent\n", s,
+				     static_cast<unsigned>(size));
+			}
+			return static_cast<int>(size);
+		}
+	}
 	return FinishSocketCall(
 	    static_cast<int>(Net::Sendto(s, buf, size, flags | 0x20000, addr, addrlen)));
 }
 
-int KYTY_SYSV_ABI NetSend(int s, const void* buf, size_t len, int flags) {
-	return NetSendto(s, buf, len, flags, nullptr, 0);
-}
-
-int KYTY_SYSV_ABI NetRecv(int s, void* buf, size_t len, int flags) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetRecv(int s, void* buf, size_t len, int flags) {
+	NoteHleCall(g_library, g_module, __func__);
+	HLE_SLOW_GUARD("recv");
 	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		auto            it = FakeSock::g_table.find(s);
+		if (it != FakeSock::g_table.end()) {
+			it->second.polls++;
+			if (it->second.polls % 4096 == 1) {
+				PRINT_NAME();
+				LOGF("\t fake recv s = %d len = %u -> 0 (orderly EOF, polls=%llu)\n", s,
+				     static_cast<unsigned>(size),
+				     static_cast<unsigned long long>(it->second.polls));
+			}
+			return 0;
+		}
+	}
 	return FinishSocketCall(static_cast<int>(Net::Recv(s, buf, size, flags)));
 }
 
-int KYTY_SYSV_ABI NetRecvfrom(int s, void* buf, size_t len, int flags, void* addr,
-                               uint32_t* addrlen) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetRecvfrom(int s, void* buf, size_t len, int flags, void* addr,
+                              uint32_t* addrlen) {
 	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	{
+		std::lock_guard lock(FakeSock::g_mutex);
+		auto            it = FakeSock::g_table.find(s);
+		if (it != FakeSock::g_table.end()) {
+			it->second.polls++;
+			if (addr != nullptr && addrlen != nullptr && *addrlen > 0) {
+				std::memset(addr, 0, *addrlen > 128 ? 128 : *addrlen);
+			}
+			if (it->second.polls % 4096 == 1) {
+				PRINT_NAME();
+				LOGF("\t fake recvfrom s = %d len = %u -> 0 (orderly EOF, polls=%llu)\n",
+				     s, static_cast<unsigned>(size),
+				     static_cast<unsigned long long>(it->second.polls));
+			}
+			return 0;
+		}
+	}
 	return FinishSocketCall(static_cast<int>(Net::Recvfrom(s, buf, size, flags, addr, addrlen)));
 }
 
-uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
 	return ((host32 & 0x000000ffu) << 24u) | ((host32 & 0x0000ff00u) << 8u) |
 	       ((host32 & 0x00ff0000u) >> 8u) | ((host32 & 0xff000000u) >> 24u);
 }
 
-uint16_t KYTY_SYSV_ABI NetHtons(uint16_t host16) {
+uint16_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetHtons(uint16_t host16) {
 	return static_cast<uint16_t>(((host16 & 0x00ffu) << 8u) | ((host16 & 0xff00u) >> 8u));
 }
 
-uint32_t KYTY_SYSV_ABI NetNtohl(uint32_t net32) {
+uint32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetNtohl(uint32_t net32) {
 	return NetHtonl(net32);
 }
 
-uint16_t KYTY_SYSV_ABI NetNtohs(uint16_t net16) {
+uint16_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NetNtohs(uint16_t net16) {
 	return NetHtons(net16);
+}
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SceNetEventCallbackWaitCB() {
+// ps5-vsh: 5isaotjMWlA. No events ever arrive; report none (0). Sleep
+// briefly so the guest's 100ms poll loop doesn't spin at 100% CPU.
+	NoteHleCall(g_library, g_module, __func__);
+	Common::Thread::SleepMicro(10000);
+	return 0;
+}
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SceNetEventCallbackCreate() {
+	// ps5-vsh: cWGGXoeZUzA. Callback registration only in emulation.
+	return 0;
+}
+
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SceNetInitParam(const void* param) {
+	// Native N+290: one-time32-byte setter, not a pointer-returning getter.
+	const auto caller = KYTY_IPMI_CALLER;
+	const int result = FinishNetCall(Net::NetSetInitParam(param));
+	IpmiObserve::NetPoolConfigured(caller, param, result);
+	return result;
 }
 
 LIB_DEFINE(InitNet_1_Net) {
@@ -250,12 +531,13 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("OXXX4mUk3uk", LibNet::NetConnect);
 	LIB_FUNC("dgJBaeJnGpo", LibNet::NetPoolCreate);
 	LIB_FUNC("K7RlrTkI-mw", LibNet::NetPoolDestroy);
-	LIB_FUNC("rMyh97BU5pY", LibNet::NetGetMemoryPoolStats);
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
 	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
+	LIB_FUNC("zl35YNs9jnI", LibNet::NetResolverStartNtoa6);
 	LIB_FUNC("RCCY01Xd+58", LibNet::NetResolverStartNtoaMultipleRecords);
+	LIB_FUNC("sT4nBQKUPqM", LibNet::NetResolverStartNtoaMultipleRecordsEx);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);
 	LIB_FUNC("v6M4txecCuo", LibNet::NetEtherNtostr);
@@ -276,10 +558,15 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("gvD1greCu0A", LibNet::NetSendto);
 	LIB_FUNC("9wO9XrMsNhc", LibNet::NetRecv);
 	LIB_FUNC("304ooNZxWDY", LibNet::NetRecvfrom);
+	LIB_FUNC("w21YgGGNtBk", LibNet::NetEpollAbort);
+	LIB_FUNC("zJGf8xjFnQE", LibNet::NetSocketAbort);
 	LIB_FUNC("9T2pDF2Ryqg", LibNet::NetHtonl);
 	LIB_FUNC("iWQWrwiSt8A", LibNet::NetHtons);
 	LIB_FUNC("pQGpHYopAIY", LibNet::NetNtohl);
 	LIB_FUNC("Rbvt+5Y2iEw", LibNet::NetNtohs);
+	LIB_FUNC("5isaotjMWlA", LibNet::SceNetEventCallbackWaitCB);
+	LIB_FUNC("cWGGXoeZUzA", LibNet::SceNetEventCallbackCreate);
+	LIB_FUNC("6MojQ8uFHEI", LibNet::SceNetInitParam);
 }
 
 } // namespace LibNet
@@ -295,6 +582,7 @@ LIB_DEFINE(InitNet_1_Ssl) {
 	LIB_FUNC("0K1yQ6Lv-Yc", Ssl::SslTerm);
 	LIB_FUNC("TDfQqO-gMbY", Ssl::SslGetCaCerts);
 	LIB_FUNC("qIvLs0gYxi0", Ssl::SslFreeCaCerts);
+	LIB_FUNC("3-643mGVFJo", Ssl::SslLoadRootCACert);
 }
 
 } // namespace LibSsl
@@ -376,12 +664,12 @@ static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, si
 	return 0;
 }
 
-static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_url, void* pool,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_url, void* pool,
                                       size_t* require, size_t prepare) {
 	PRINT_NAME();
 
 	LOGF("\t out     = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(out));
-	LOGF("\t src_url = %s\n", src_url != nullptr ? src_url : "(null)");
+	LOGF("\t src_url = %s\n", src_url != nullptr ? "<omitted>" : "(null)");
 	LOGF("\t pool    = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(pool));
 	LOGF("\t require = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(require));
 	LOGF("\t prepare = %" PRIu64 "\n", static_cast<uint64_t>(prepare));
@@ -568,13 +856,13 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 	return 0;
 }
 
-static int KYTY_SYSV_ABI HttpUriEscape(char* out, size_t* require, size_t prepare, const char* in) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI HttpUriEscape(char* out, size_t* require, size_t prepare, const char* in) {
 	PRINT_NAME();
 
 	LOGF("\t out     = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(out));
 	LOGF("\t require = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(require));
 	LOGF("\t prepare = %" PRIu64 "\n", static_cast<uint64_t>(prepare));
-	LOGF("\t in      = %s\n", in != nullptr ? in : "(null)");
+	LOGF("\t in      = %s\n", in != nullptr ? "<omitted>" : "(null)");
 
 	if (in == nullptr) {
 		return HTTP_ERROR_INVALID_VALUE;
@@ -625,7 +913,7 @@ static void AppendUriPart(std::string* dst, const char* part) {
 	}
 }
 
-static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare,
                                       const SceHttpUriElement* src_element, uint32_t option) {
 	PRINT_NAME();
 
@@ -744,6 +1032,7 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("PTiFIUxCpJc", Http::HttpSetRequestContentLength);
 	LIB_FUNC("EY28T2bkN7k", Http::HttpAddRequestHeader);
 	LIB_FUNC("1e2BNwI-XzE", Http::HttpSendRequest);
+	LIB_FUNC("P5pdoykPYTk", Http::HttpReadData); // 13.60 libSceHttp +0x11c00
 	LIB_FUNC("hvG6GfBMXg8", Http::HttpAbortRequest);
 	LIB_FUNC("qISjDHrxONc", Http::HttpWaitRequest);
 	LIB_FUNC("0a2TBNfE3BU", Http::HttpGetStatusCode);
@@ -756,6 +1045,7 @@ LIB_DEFINE(InitNet_1_Http) {
 	LIB_FUNC("yigr4V0-HTM", Http::HttpSetRecvTimeOut);
 	LIB_FUNC("T-mGo9f3Pu4", Http::HttpSetAutoRedirect);
 	LIB_FUNC("qFg2SuyTJJY", Http::HttpSetAuthEnabled);
+	LIB_FUNC("XNUoD2B9a6A", Http::HttpSetCookieEnabled);
 	LIB_FUNC("h9wmFZX4i-4", Http::HttpSetRedirectCallback);
 	LIB_FUNC("Kh6bS2HQKbo", Http::HttpSetCookieRecvCallback);
 	LIB_FUNC("vO4B-42ef-k", Http::HttpSetRequestStatusCallback);
@@ -778,11 +1068,11 @@ LIB_VERSION("Http2", 1, "Http2", 1, 1);
 
 namespace EventQueue = LibKernel::EventQueue;
 
-constexpr int HTTP2_ERROR_INVALID_ID    = -2122641152; /* 0x817B1100 */
-constexpr int HTTP2_ERROR_BEFORE_SEND   = -2122641307; /* 0x817B1065 */
-constexpr int HTTP2_ERROR_TIMEOUT       = -2122641304; /* 0x817B1068 */
-constexpr int HTTP2_ERROR_NULL_POINTER  = -2122640859; /* 0x817B1225 */
-constexpr int HTTP2_ERROR_INVALID_VALUE = -2122640898; /* 0x817B11FE */
+constexpr int HTTP2_ERROR_INVALID_ID   = -2122641152; /* 0x817B1100 */
+constexpr int HTTP2_ERROR_BEFORE_SEND  = -2122641307; /* 0x817B1065 */
+constexpr int HTTP2_ERROR_TIMEOUT      = -2122641304; /* 0x817B1068 */
+constexpr int HTTP2_ERROR_NULL_POINTER = -2122640859; /* 0x817B1225 */
+constexpr int HTTP2_ERROR_EAGAIN = static_cast<int>(0x817b1079u);
 
 struct Http2Options {
 	bool     auth_enabled               = false;
@@ -808,13 +1098,6 @@ struct Http2Context {
 	int    max_concurrent_requests = 0;
 };
 
-struct Http2MemoryPoolStats {
-	size_t  pool_size;
-	size_t  max_inuse_size;
-	size_t  current_inuse_size;
-	int32_t reserved;
-};
-
 struct Http2Template {
 	int          context_id = 0;
 	std::string  user_agent;
@@ -837,6 +1120,7 @@ struct Http2Request {
 	int                                              async_result = HTTP2_ERROR_BEFORE_SEND;
 	int                                              async_event  = 0;
 	Http2Options                                     options;
+	std::shared_future<HostHttp::Response>             transfer;
 };
 
 struct Http2AsyncResult {
@@ -847,6 +1131,8 @@ struct Http2AsyncResult {
 	void*   reserved;
 };
 
+static int g_http2_next_id = 1;
+static std::recursive_mutex g_http2_mutex;
 struct Http2TriggerUserEventArgs {
 	EventQueue::KernelEqueue eq;
 	int                      uniq_id;
@@ -857,13 +1143,46 @@ struct Http2TriggerUserEventArgs {
 
 static_assert(sizeof(Http2TriggerUserEventArgs) == 32);
 
-static int g_http2_next_context_id  = 1;
-static int g_http2_next_template_id = 1;
-static int g_http2_next_request_id  = 1;
+static void Http2TriggerUserEvent(const Http2TriggerUserEventArgs* option) {
+	if (option != nullptr) {
+		EventQueue::KernelTriggerUserEvent(option->eq, option->uniq_id, option->udata);
+	}
+}
 
 static std::map<int, Http2Context>  g_http2_contexts;
 static std::map<int, Http2Template> g_http2_templates;
 static std::map<int, Http2Request>  g_http2_requests;
+
+static void RefreshHttp2(Http2Request& request) {
+	if (!request.transfer.valid() || request.send_result != HTTP2_ERROR_EAGAIN ||
+	    request.transfer.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+	const auto& response = request.transfer.get();
+	request.send_result = HostHttp::GuestError(response.error, true);
+	request.status_code = response.status;
+	request.response_headers = response.headers;
+	request.response_body = response.body;
+	request.async_result = request.send_result;
+}
+
+static int StartHttp2(Http2Request& request, const void* data, size_t size) {
+	if (request.send_result != HTTP2_ERROR_BEFORE_SEND) return static_cast<int>(0x817b1066u);
+	if (!HostHttp::Enabled()) return request.send_result = HTTP2_ERROR_TIMEOUT;
+	HostHttp::Request host;
+	host.url = request.url;
+	host.method = request.method;
+	host.headers = request.headers;
+	host.user_agent = g_http2_templates.at(request.tmpl_id).user_agent;
+	host.redirect = request.options.auto_redirect;
+	const auto ms = [](uint32_t us) { return us ? std::max(1u, us / 1000u) : 30000u; };
+	host.resolve_timeout_ms = ms(request.options.resolve_timeout_us);
+	host.connect_timeout_ms = ms(request.options.connect_timeout_us);
+	host.send_timeout_ms = ms(request.options.send_timeout_us);
+	host.recv_timeout_ms = ms(request.options.recv_timeout_us);
+	if (size) host.body.assign(static_cast<const char*>(data), size);
+	request.transfer = HostHttp::Start(std::move(host));
+	request.send_result = HTTP2_ERROR_EAGAIN;
+	return 0;
+}
 
 static Http2Options* GetHttp2Options(int id) {
 	auto request = g_http2_requests.find(id);
@@ -879,8 +1198,9 @@ static Http2Options* GetHttp2Options(int id) {
 	return nullptr;
 }
 
-static int KYTY_SYSV_ABI Http2Init(int libnet_mem_id, int libssl_ctx_id, size_t pool_size,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2Init(int libnet_mem_id, int libssl_ctx_id, size_t pool_size,
                                    int max_concurrent_request) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t libnet_mem_id          = %d\n"
@@ -889,14 +1209,15 @@ static int KYTY_SYSV_ABI Http2Init(int libnet_mem_id, int libssl_ctx_id, size_t 
 	     "\t max_concurrent_request = %d\n",
 	     libnet_mem_id, libssl_ctx_id, pool_size, max_concurrent_request);
 
-	const auto id        = g_http2_next_context_id++;
+	const auto id        = g_http2_next_id++;
 	g_http2_contexts[id] = {libnet_mem_id, libssl_ctx_id, pool_size, max_concurrent_request};
 
 	return id;
 }
 
-static int KYTY_SYSV_ABI Http2CreateTemplate(int lib_http2_ctx_id, const char* user_agent,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2CreateTemplate(int lib_http2_ctx_id, const char* user_agent,
                                              int http_ver, int is_auto_proxy_conf) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t lib_http2_ctx_id   = %d\n", lib_http2_ctx_id);
@@ -908,14 +1229,15 @@ static int KYTY_SYSV_ABI Http2CreateTemplate(int lib_http2_ctx_id, const char* u
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	const auto tmpl_id         = g_http2_next_template_id++;
+	const auto tmpl_id         = g_http2_next_id++;
 	g_http2_templates[tmpl_id] = {lib_http2_ctx_id, user_agent != nullptr ? user_agent : "",
 	                              http_ver, is_auto_proxy_conf};
 
 	return tmpl_id;
 }
 
-static int KYTY_SYSV_ABI Http2DeleteTemplate(int tmpl_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2DeleteTemplate(int tmpl_id) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t tmpl_id = %d\n", tmpl_id);
@@ -938,7 +1260,8 @@ static int KYTY_SYSV_ABI Http2DeleteTemplate(int tmpl_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2Term(int lib_http2_ctx_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2Term(int lib_http2_ctx_id) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t lib_http2_ctx_id = %d\n", lib_http2_ctx_id);
@@ -969,30 +1292,14 @@ static int KYTY_SYSV_ABI Http2Term(int lib_http2_ctx_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2GetMemoryPoolStats(int lib_http2_ctx_id, Http2MemoryPoolStats* stats) {
-	PRINT_NAME();
-
-	if (stats == nullptr) {
-		return HTTP2_ERROR_INVALID_VALUE;
-	}
-
-	const auto context = g_http2_contexts.find(lib_http2_ctx_id);
-	if (context == g_http2_contexts.end()) {
-		return HTTP2_ERROR_INVALID_ID;
-	}
-
-	// Requests use host storage, not allocations from the library pool
-	*stats = {context->second.pool_size, 0, 0, 0};
-	return 0;
-}
-
-static int KYTY_SYSV_ABI Http2CreateRequestWithURL(int tmpl_id, const char* method, const char* url,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2CreateRequestWithURL(int tmpl_id, const char* method, const char* url,
                                                    uint64_t content_length) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t tmpl_id        = %d\n", tmpl_id);
 	LOGF("\t method         = %s\n", method != nullptr ? method : "(null)");
-	LOGF("\t url            = %s\n", url != nullptr ? url : "(null)");
+	LOGF("\t url            = %s\n", url != nullptr ? "<omitted>" : "(null)");
 	LOGF("\t content_length = %" PRIu64 "\n", content_length);
 
 	if (method == nullptr || url == nullptr) {
@@ -1003,19 +1310,21 @@ static int KYTY_SYSV_ABI Http2CreateRequestWithURL(int tmpl_id, const char* meth
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	const auto req_id        = g_http2_next_request_id++;
+	const auto req_id        = g_http2_next_id++;
 	g_http2_requests[req_id] = {tmpl_id, method, url, content_length};
+	g_http2_requests[req_id].options = g_http2_templates.at(tmpl_id).options;
 
 	return req_id;
 }
 
-static int KYTY_SYSV_ABI Http2AddRequestHeader(int id, const char* name, const char* value,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2AddRequestHeader(int id, const char* name, const char* value,
                                                uint32_t mode) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id    = %d\n", id);
 	LOGF("\t name  = %s\n", name != nullptr ? name : "(null)");
-	LOGF("\t value = %s\n", value != nullptr ? value : "(null)");
+	LOGF("\t value = %s\n", value != nullptr ? "<omitted>" : "(null)");
 	LOGF("\t mode  = %" PRIu32 "\n", mode);
 
 	if (name == nullptr || value == nullptr) {
@@ -1032,7 +1341,8 @@ static int KYTY_SYSV_ABI Http2AddRequestHeader(int id, const char* name, const c
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetRequestContentLength(int id, uint64_t content_length) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetRequestContentLength(int id, uint64_t content_length) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id             = %d\n", id);
@@ -1048,7 +1358,8 @@ static int KYTY_SYSV_ABI Http2SetRequestContentLength(int id, uint64_t content_l
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetAuthEnabled(int id, int is_enable) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetAuthEnabled(int id, int is_enable) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id        = %d\n", id);
@@ -1064,7 +1375,8 @@ static int KYTY_SYSV_ABI Http2SetAuthEnabled(int id, int is_enable) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetAutoRedirect(int id, int enable) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetAutoRedirect(int id, int enable) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id     = %d\n", id);
@@ -1080,7 +1392,8 @@ static int KYTY_SYSV_ABI Http2SetAutoRedirect(int id, int enable) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetInflateGZIPEnabled(int id, int enable) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetInflateGZIPEnabled(int id, int enable) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id     = %d\n", id);
@@ -1096,7 +1409,8 @@ static int KYTY_SYSV_ABI Http2SetInflateGZIPEnabled(int id, int enable) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SslEnableOption(int id, uint32_t ssl_flags) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SslEnableOption(int id, uint32_t ssl_flags) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id        = %d\n", id);
@@ -1112,7 +1426,8 @@ static int KYTY_SYSV_ABI Http2SslEnableOption(int id, uint32_t ssl_flags) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SslDisableOption(int id, uint32_t ssl_flags) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SslDisableOption(int id, uint32_t ssl_flags) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id        = %d\n", id);
@@ -1128,7 +1443,8 @@ static int KYTY_SYSV_ABI Http2SslDisableOption(int id, uint32_t ssl_flags) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetSslCallback(int id, void* cb_func, void* user_arg) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetSslCallback(int id, void* cb_func, void* user_arg) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id       = %d\n", id);
@@ -1146,7 +1462,8 @@ static int KYTY_SYSV_ABI Http2SetSslCallback(int id, void* cb_func, void* user_a
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetRedirectCallback(int id, void* cb_func, void* user_arg) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetRedirectCallback(int id, void* cb_func, void* user_arg) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id       = %d\n", id);
@@ -1164,7 +1481,8 @@ static int KYTY_SYSV_ABI Http2SetRedirectCallback(int id, void* cb_func, void* u
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetConnectTimeOut(int id, uint32_t usec) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetConnectTimeOut(int id, uint32_t usec) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id   = %d\n", id);
@@ -1180,7 +1498,8 @@ static int KYTY_SYSV_ABI Http2SetConnectTimeOut(int id, uint32_t usec) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetConnectionWaitTimeOut(int id, uint32_t usec) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetConnectionWaitTimeOut(int id, uint32_t usec) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id   = %d\n", id);
@@ -1196,7 +1515,8 @@ static int KYTY_SYSV_ABI Http2SetConnectionWaitTimeOut(int id, uint32_t usec) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetResolveTimeOut(int id, uint32_t usec) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetResolveTimeOut(int id, uint32_t usec) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id   = %d\n", id);
@@ -1212,11 +1532,8 @@ static int KYTY_SYSV_ABI Http2SetResolveTimeOut(int id, uint32_t usec) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetResolveRetry(int, int) {
-	return 0;
-}
-
-static int KYTY_SYSV_ABI Http2SetTimeOut(int id, uint32_t usec) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetTimeOut(int id, uint32_t usec) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id   = %d\n", id);
@@ -1232,7 +1549,12 @@ static int KYTY_SYSV_ABI Http2SetTimeOut(int id, uint32_t usec) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetSendTimeOut(int id, uint32_t usec) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetResolveRetry(int, int) {
+	return 0;
+}
+
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetSendTimeOut(int id, uint32_t usec) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id   = %d\n", id);
@@ -1248,7 +1570,8 @@ static int KYTY_SYSV_ABI Http2SetSendTimeOut(int id, uint32_t usec) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SetRecvTimeOut(int id, uint32_t usec) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SetRecvTimeOut(int id, uint32_t usec) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t id   = %d\n", id);
@@ -1264,7 +1587,8 @@ static int KYTY_SYSV_ABI Http2SetRecvTimeOut(int id, uint32_t usec) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, size_t size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, size_t size) {
+	std::unique_lock lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1280,22 +1604,23 @@ static int KYTY_SYSV_ABI Http2SendRequest(int req_id, const void* post_data, siz
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	request->second.send_result = HTTP2_ERROR_TIMEOUT;
-
+	const int result = StartHttp2(request->second, post_data, size);
+	if (result != 0) return result;
+	auto transfer = request->second.transfer;
+	lock.unlock();
+	transfer.wait();
+	lock.lock();
+	request = g_http2_requests.find(req_id);
+	if (request == g_http2_requests.end()) return HTTP2_ERROR_INVALID_ID;
+	RefreshHttp2(request->second);
+	LOGF("Host HTTP2: request=%d status=%d bytes=%zu result=0x%08x\n", req_id,
+	     request->second.status_code, request->second.response_body.size(), request->second.send_result);
 	return request->second.send_result;
 }
 
-// Async operations complete at once; the caller's event queue gets the completion event.
-static void Http2TriggerUserEvent(const Http2TriggerUserEventArgs* kqueue_option) {
-	if (kqueue_option != nullptr) {
-		EventQueue::KernelTriggerUserEvent(kqueue_option->eq, kqueue_option->uniq_id,
-		                                   kqueue_option->udata);
-	}
-}
-
-static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data, size_t size,
-                                               const Http2TriggerUserEventArgs* kqueue_option,
-                                               void* /*option*/) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data, size_t size,
+                                               const Http2TriggerUserEventArgs* kqueue_option, void* /*option*/) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t req_id    = %d\n", req_id);
@@ -1311,16 +1636,33 @@ static int KYTY_SYSV_ABI Http2SendRequestAsync(int req_id, const void* post_data
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
-	request->second.send_result  = HTTP2_ERROR_TIMEOUT;
+	const int result = StartHttp2(request->second, post_data, size);
+	if (result != 0 && HostHttp::Enabled()) return result;
 	request->second.async_result = request->second.send_result;
 	request->second.async_event  = 0;
-	Http2TriggerUserEvent(kqueue_option);
+	if (kqueue_option != nullptr && request->second.transfer.valid()) {
+		const auto notification = *kqueue_option;
+		auto queue = EventQueue::KernelPinEqueue(notification.eq);
+		if (queue) {
+			std::thread([req_id, notification, queue = std::move(queue), transfer = request->second.transfer] {
+				transfer.wait();
+				std::lock_guard lock(g_http2_mutex);
+				const auto completed = g_http2_requests.find(req_id);
+				if (completed == g_http2_requests.end()) { return; }
+				RefreshHttp2(completed->second);
+				Http2TriggerUserEvent(&notification);
+			}).detach();
+		}
+	} else {
+		Http2TriggerUserEvent(kqueue_option);
+	}
 
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2WaitAsync(int req_id, Http2AsyncResult* result, uint32_t* /*timeout*/,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2WaitAsync(int req_id, Http2AsyncResult* result, uint32_t* timeout,
                                         void* /*option*/) {
+	std::unique_lock lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1336,6 +1678,18 @@ static int KYTY_SYSV_ABI Http2WaitAsync(int req_id, Http2AsyncResult* result, ui
 	}
 
 	*result            = {};
+	if (request->second.transfer.valid() && request->second.send_result == HTTP2_ERROR_EAGAIN) {
+		auto transfer = request->second.transfer;
+		lock.unlock();
+		if (timeout) {
+			if (transfer.wait_for(std::chrono::microseconds(*timeout)) != std::future_status::ready)
+				return HTTP2_ERROR_TIMEOUT;
+		} else transfer.wait();
+		lock.lock();
+		request = g_http2_requests.find(req_id);
+		if (request == g_http2_requests.end()) return HTTP2_ERROR_INVALID_ID;
+		RefreshHttp2(request->second);
+	}
 	result->event_type = request->second.async_event;
 	result->req_id     = req_id;
 	result->result     = request->second.async_result;
@@ -1343,7 +1697,8 @@ static int KYTY_SYSV_ABI Http2WaitAsync(int req_id, Http2AsyncResult* result, ui
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2GetStatusCode(int req_id, int* status_code) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2GetStatusCode(int req_id, int* status_code) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t req_id      = %d\n", req_id);
@@ -1360,6 +1715,7 @@ static int KYTY_SYSV_ABI Http2GetStatusCode(int req_id, int* status_code) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	RefreshHttp2(request->second);
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		return send_result;
@@ -1369,8 +1725,9 @@ static int KYTY_SYSV_ABI Http2GetStatusCode(int req_id, int* status_code) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2GetResponseContentLength(int req_id, int* result,
-                                                       uint64_t* content_length) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2GetResponseContentLength(int req_id, int* result,
+                                                     uint64_t* content_length) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t req_id         = %d\n", req_id);
@@ -1389,6 +1746,7 @@ static int KYTY_SYSV_ABI Http2GetResponseContentLength(int req_id, int* result,
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	RefreshHttp2(request->second);
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		*result = -1;
@@ -1399,8 +1757,9 @@ static int KYTY_SYSV_ABI Http2GetResponseContentLength(int req_id, int* result,
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
                                                     size_t* header_size) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t req_id      = %d\n", req_id);
@@ -1419,6 +1778,7 @@ static int KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	RefreshHttp2(request->second);
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		return send_result;
@@ -1429,7 +1789,8 @@ static int KYTY_SYSV_ABI Http2GetAllResponseHeaders(int req_id, char** header,
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1445,6 +1806,7 @@ static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	RefreshHttp2(request->second);
 	const int send_result = request->second.send_result;
 	if (send_result != 0) {
 		return send_result;
@@ -1463,9 +1825,9 @@ static int KYTY_SYSV_ABI Http2ReadData(int req_id, void* data, size_t size) {
 	return static_cast<int>(to_copy);
 }
 
-static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
-                                            const Http2TriggerUserEventArgs* kqueue_option,
-                                            void* /*option*/) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
+                                            const Http2TriggerUserEventArgs* kqueue_option, void* /*option*/) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1481,7 +1843,9 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 		return HTTP2_ERROR_INVALID_ID;
 	}
 
+	RefreshHttp2(request->second);
 	const int send_result = request->second.send_result;
+	if (send_result == HTTP2_ERROR_EAGAIN) return send_result;
 	if (send_result != 0) {
 		request->second.async_result = send_result;
 	} else {
@@ -1504,7 +1868,8 @@ static int KYTY_SYSV_ABI Http2ReadDataAsync(int req_id, void* data, size_t size,
 	return 0;
 }
 
-static int KYTY_SYSV_ABI Http2DeleteRequest(int req_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI Http2DeleteRequest(int req_id) {
+	std::lock_guard lock(g_http2_mutex);
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1522,7 +1887,6 @@ static int KYTY_SYSV_ABI Http2DeleteRequest(int req_id) {
 LIB_DEFINE(InitNet_1_Http2) {
 	LIB_FUNC("3JCe3lCbQ8A", LibHttp2::Http2Init);
 	LIB_FUNC("YiBUtz-pGkc", LibHttp2::Http2Term);
-	LIB_FUNC("otUQuZa-mv0", LibHttp2::Http2GetMemoryPoolStats);
 	LIB_FUNC("+wCt7fCijgk", LibHttp2::Http2CreateTemplate);
 	LIB_FUNC("pDom5-078DA", LibHttp2::Http2DeleteTemplate);
 	LIB_FUNC("mmyOCxQMVYQ", LibHttp2::Http2CreateRequestWithURL);
@@ -1618,7 +1982,7 @@ static_assert(sizeof(CommerceDialogResult) == 48 && offsetof(CommerceDialogResul
 static int                  g_commerce_status = COMMERCE_STATUS_NONE;
 static CommerceDialogResult g_commerce_result {};
 
-static int KYTY_SYSV_ABI NpCommerceDialogInitialize() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpCommerceDialogInitialize() {
 	PRINT_NAME();
 	if (g_commerce_status != COMMERCE_STATUS_NONE) {
 		return COMMERCE_ERROR_ALREADY_INITIALIZED;
@@ -1627,7 +1991,7 @@ static int KYTY_SYSV_ABI NpCommerceDialogInitialize() {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI NpCommerceDialogTerminate() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpCommerceDialogTerminate() {
 	PRINT_NAME();
 	if (g_commerce_status == COMMERCE_STATUS_NONE) {
 		return COMMERCE_ERROR_NOT_INITIALIZED;
@@ -1637,7 +2001,7 @@ static int KYTY_SYSV_ABI NpCommerceDialogTerminate() {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI NpCommerceDialogOpen(const CommerceDialogParam* param) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpCommerceDialogOpen(const CommerceDialogParam* param) {
 	PRINT_NAME();
 	if (g_commerce_status == COMMERCE_STATUS_NONE) {
 		return COMMERCE_ERROR_NOT_INITIALIZED;
@@ -1659,7 +2023,7 @@ static int KYTY_SYSV_ABI NpCommerceDialogOpen(const CommerceDialogParam* param) 
 	return OK;
 }
 
-static int KYTY_SYSV_ABI NpCommerceDialogGetResult(CommerceDialogResult* result) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpCommerceDialogGetResult(CommerceDialogResult* result) {
 	PRINT_NAME();
 	if (g_commerce_status == COMMERCE_STATUS_NONE) {
 		return COMMERCE_ERROR_NOT_INITIALIZED;
@@ -1674,7 +2038,7 @@ static int KYTY_SYSV_ABI NpCommerceDialogGetResult(CommerceDialogResult* result)
 	return result->result;
 }
 
-static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
 	PRINT_NAME();
 
 	return g_commerce_status;
@@ -1733,7 +2097,7 @@ namespace LibNpSessionSignaling {
 
 LIB_VERSION("NpSessionSignaling", 1, "NpSessionSignaling", 1, 1);
 
-static int KYTY_SYSV_ABI NpSessionSignalingInitialize(void* param) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpSessionSignalingInitialize(void* param) {
 	PRINT_NAME();
 
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
@@ -1842,11 +2206,11 @@ static int np_auth_create_request(bool async) {
 	return static_cast<int>(index) + NP_AUTH_REQUEST_ID_OFFSET + 1;
 }
 
-static int KYTY_SYSV_ABI NpAuthCreateRequest() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpAuthCreateRequest() {
 	return np_auth_create_request(false);
 }
 
-static int KYTY_SYSV_ABI NpAuthCreateAsyncRequest(const void* param) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpAuthCreateAsyncRequest(const void* param) {
 	PRINT_NAME();
 
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
@@ -1854,7 +2218,7 @@ static int KYTY_SYSV_ABI NpAuthCreateAsyncRequest(const void* param) {
 	return np_auth_create_request(true);
 }
 
-static int KYTY_SYSV_ABI NpAuthDeleteRequest(int req_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpAuthDeleteRequest(int req_id) {
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1874,7 +2238,7 @@ static int KYTY_SYSV_ABI NpAuthDeleteRequest(int req_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpAuthAbortRequest(int req_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpAuthAbortRequest(int req_id) {
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1931,7 +2295,7 @@ static int np_auth_complete_unavailable(NpAuthRequest* request, int user_id) {
 	return request->async ? 0 : request->result;
 }
 
-static int KYTY_SYSV_ABI NpAuthWaitAsync(int req_id, int* result) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpAuthWaitAsync(int req_id, int* result) {
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1940,7 +2304,7 @@ static int KYTY_SYSV_ABI NpAuthWaitAsync(int req_id, int* result) {
 	return np_auth_wait_or_poll_async(req_id, result);
 }
 
-static int KYTY_SYSV_ABI NpAuthPollAsync(int req_id, int* result) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpAuthPollAsync(int req_id, int* result) {
 	PRINT_NAME();
 
 	LOGF("\t req_id = %d\n", req_id);
@@ -1949,7 +2313,7 @@ static int KYTY_SYSV_ABI NpAuthPollAsync(int req_id, int* result) {
 	return np_auth_wait_or_poll_async(req_id, result);
 }
 
-static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
     int req_id, const NpAuthGetAuthorizationCodeParameterV3* param, void* auth_code,
     int* issuer_id) {
 	PRINT_NAME();
@@ -1982,7 +2346,7 @@ static int KYTY_SYSV_ABI NpAuthGetAuthorizationCodeV3(
 	return np_auth_complete_unavailable(request, param->user_id);
 }
 
-static int KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const NpAuthGetIdTokenParameterV3* param,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpAuthGetIdTokenV3(int req_id, const NpAuthGetIdTokenParameterV3* param,
                                         void* id_token) {
 	PRINT_NAME();
 
@@ -2051,7 +2415,7 @@ struct NpGameIntentInfo {
 static_assert(sizeof(NpGameIntentData) == 16392);
 static_assert(sizeof(NpGameIntentInfo) == 16704);
 
-static int KYTY_SYSV_ABI NpGameIntentInitialize(const void* init_param) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpGameIntentInitialize(const void* init_param) {
 	PRINT_NAME();
 
 	LOGF("\t init_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(init_param));
@@ -2059,13 +2423,13 @@ static int KYTY_SYSV_ABI NpGameIntentInitialize(const void* init_param) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpGameIntentTerminate() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpGameIntentTerminate() {
 	PRINT_NAME();
 
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpGameIntentReceiveIntent(NpGameIntentInfo* intent_info) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpGameIntentReceiveIntent(NpGameIntentInfo* intent_info) {
 	PRINT_NAME();
 
 	LOGF("\t intent_info = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(intent_info));
@@ -2081,7 +2445,7 @@ static int KYTY_SYSV_ABI NpGameIntentReceiveIntent(NpGameIntentInfo* intent_info
 	return NP_GAME_INTENT_ERROR_INTENT_NOT_FOUND;
 }
 
-static int KYTY_SYSV_ABI NpGameIntentGetPropertyValueString(const NpGameIntentData* intent_data,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpGameIntentGetPropertyValueString(const NpGameIntentData* intent_data,
                                                             const char* key, char* value_buf,
                                                             size_t buf_size) {
 	PRINT_NAME();
@@ -2150,7 +2514,7 @@ static std::map<int64_t, NpWebApi2Request>& NpWebApi2Requests() {
 	return requests;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_size) {
 	PRINT_NAME();
 
 	LOGF("\t lib_http_ctx_id = %d\n"
@@ -2167,7 +2531,7 @@ static int KYTY_SYSV_ABI NpWebApi2Initialize(int lib_http_ctx_id, size_t pool_si
 	return id;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int lib_ctx_id,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int lib_ctx_id,
                                                    NpWebApi2MemoryPoolStats* stats) {
 	if (stats == nullptr) {
 		return NP_WEBAPI2_ERROR_INVALID_ARGUMENT;
@@ -2185,7 +2549,7 @@ static int KYTY_SYSV_ABI NpWebApi2GetMemoryPoolStats(int lib_ctx_id,
 	return OK;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2PushEventCreateHandle(int lib_ctx_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2PushEventCreateHandle(int lib_ctx_id) {
 	PRINT_NAME();
 
 	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
@@ -2195,7 +2559,7 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventCreateHandle(int lib_ctx_id) {
 	return ++handle;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2CreateUserContext(int lib_ctx_id, int user_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2CreateUserContext(int lib_ctx_id, int user_id) {
 	PRINT_NAME();
 
 	LOGF("\t lib_ctx_id = %d\n"
@@ -2207,7 +2571,7 @@ static int KYTY_SYSV_ABI NpWebApi2CreateUserContext(int lib_ctx_id, int user_id)
 	return ++user_context;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2DeleteUserContext(int user_context_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2DeleteUserContext(int user_context_id) {
 	PRINT_NAME();
 
 	LOGF("\t user_context_id = %d\n", user_context_id);
@@ -2215,7 +2579,7 @@ static int KYTY_SYSV_ABI NpWebApi2DeleteUserContext(int user_context_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2CreateRequest(int user_context_id, const char* api_group,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2CreateRequest(int user_context_id, const char* api_group,
                                                 const char* path, const char* method,
                                                 const void* content_parameter,
                                                 int64_t*    request_id) {
@@ -2243,7 +2607,7 @@ static int KYTY_SYSV_ABI NpWebApi2CreateRequest(int user_context_id, const char*
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2AbortRequest(int64_t request_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2AbortRequest(int64_t request_id) {
 	PRINT_NAME();
 
 	LOGF("\t request_id = %" PRIi64 "\n", request_id);
@@ -2284,7 +2648,7 @@ NpWebApi2SendRequest(int64_t request_id, const void* data, size_t data_size,
 	return NP_WEBAPI2_ERROR_NOT_SIGNED_IN;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2ReadData(int64_t request_id, void* data, size_t size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2ReadData(int64_t request_id, void* data, size_t size) {
 	PRINT_NAME();
 
 	LOGF("\t request_id = %" PRIi64 "\n", request_id);
@@ -2310,7 +2674,7 @@ static int KYTY_SYSV_ABI NpWebApi2ReadData(int64_t request_id, void* data, size_
 	return static_cast<int>(to_copy);
 }
 
-static int KYTY_SYSV_ABI NpWebApi2DeleteRequest(int64_t request_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2DeleteRequest(int64_t request_id) {
 	PRINT_NAME();
 
 	LOGF("\t request_id = %" PRIi64 "\n", request_id);
@@ -2320,7 +2684,7 @@ static int KYTY_SYSV_ABI NpWebApi2DeleteRequest(int64_t request_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2AddHttpRequestHeader(int64_t request_id, const char* field_name,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2AddHttpRequestHeader(int64_t request_id, const char* field_name,
                                                        const char* value) {
 	PRINT_NAME();
 
@@ -2331,7 +2695,7 @@ static int KYTY_SYSV_ABI NpWebApi2AddHttpRequestHeader(int64_t request_id, const
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2GetHttpResponseHeaderValueLength(int64_t     request_id,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2GetHttpResponseHeaderValueLength(int64_t     request_id,
                                                                    const char* field_name,
                                                                    size_t*     value_length) {
 	PRINT_NAME();
@@ -2355,7 +2719,7 @@ static int KYTY_SYSV_ABI NpWebApi2GetHttpResponseHeaderValueLength(int64_t     r
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2GetHttpResponseHeaderValue(int64_t     request_id,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2GetHttpResponseHeaderValue(int64_t     request_id,
                                                              const char* field_name, char* value,
                                                              size_t value_size) {
 	PRINT_NAME();
@@ -2386,7 +2750,7 @@ static int KYTY_SYSV_ABI NpWebApi2GetHttpResponseHeaderValue(int64_t     request
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2PushEventDeleteHandle(int lib_ctx_id, int handle_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2PushEventDeleteHandle(int lib_ctx_id, int handle_id) {
 	PRINT_NAME();
 
 	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
@@ -2395,7 +2759,7 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventDeleteHandle(int lib_ctx_id, int hand
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2PushEventDeletePushContext(int         user_context_id,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2PushEventDeletePushContext(int         user_context_id,
                                                              const void* push_context_id) {
 	PRINT_NAME();
 
@@ -2405,7 +2769,7 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventDeletePushContext(int         user_co
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2PushEventCreateFilter(int lib_ctx_id, int handle_id,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2PushEventCreateFilter(int lib_ctx_id, int handle_id,
                                                         const char* np_service_name,
                                                         uint32_t    np_service_label,
                                                         const void* filter_param,
@@ -2424,7 +2788,7 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventCreateFilter(int lib_ctx_id, int hand
 	return filter_id++;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id, int filter_id,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id, int filter_id,
                                                             void* callback, void* user_arg) {
 	PRINT_NAME();
 
@@ -2438,7 +2802,7 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventRegisterCallback(int user_context_id,
 	return callback_id++;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2PushEventDeleteFilter(int lib_ctx_id, int filter_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2PushEventDeleteFilter(int lib_ctx_id, int filter_id) {
 	PRINT_NAME();
 
 	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
@@ -2447,7 +2811,7 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventDeleteFilter(int lib_ctx_id, int filt
 	return 0;
 }
 
-static int KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int user_context_id,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int user_context_id,
                                                               int callback_id) {
 	PRINT_NAME();
 
@@ -2457,13 +2821,13 @@ static int KYTY_SYSV_ABI NpWebApi2PushEventUnregisterCallback(int user_context_i
 	return 0;
 }
 
-static void KYTY_SYSV_ABI NpWebApi2CheckTimeout() {
+static void __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2CheckTimeout() {
 	// Timeout processing is an internal maintenance tick in Prospero. Requests
 	// complete synchronously in this implementation, so there is no pending
 	// timeout state to advance.
 }
 
-static int KYTY_SYSV_ABI NpWebApi2Terminate(int lib_ctx_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI NpWebApi2Terminate(int lib_ctx_id) {
 	PRINT_NAME();
 
 	LOGF("\t lib_ctx_id = %d\n", lib_ctx_id);
@@ -2537,7 +2901,7 @@ static bool                g_game_update_initialized  = false;
 static int                 g_game_update_next_request = 1;
 static std::map<int, bool> g_game_update_requests;
 
-static int KYTY_SYSV_ABI GameUpdateInitialize() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameUpdateInitialize() {
 	PRINT_NAME();
 
 	g_game_update_initialized = true;
@@ -2545,7 +2909,7 @@ static int KYTY_SYSV_ABI GameUpdateInitialize() {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI GameUpdateTerminate() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameUpdateTerminate() {
 	PRINT_NAME();
 
 	g_game_update_initialized = false;
@@ -2554,7 +2918,7 @@ static int KYTY_SYSV_ABI GameUpdateTerminate() {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI GameUpdateCreateRequest() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameUpdateCreateRequest() {
 	PRINT_NAME();
 
 	if (!g_game_update_initialized) {
@@ -2567,7 +2931,7 @@ static int KYTY_SYSV_ABI GameUpdateCreateRequest() {
 	return request_id;
 }
 
-static int KYTY_SYSV_ABI GameUpdateCheck(int request_id, const GameUpdateCheckParam* param,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameUpdateCheck(int request_id, const GameUpdateCheckParam* param,
                                          GameUpdateCheckResult* result) {
 	PRINT_NAME();
 
@@ -2599,7 +2963,7 @@ static int KYTY_SYSV_ABI GameUpdateCheck(int request_id, const GameUpdateCheckPa
 	return 0;
 }
 
-static int KYTY_SYSV_ABI GameUpdateAbortRequest(int request_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameUpdateAbortRequest(int request_id) {
 	PRINT_NAME();
 
 	LOGF("\t request_id = %d\n", request_id);
@@ -2614,7 +2978,7 @@ static int KYTY_SYSV_ABI GameUpdateAbortRequest(int request_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI GameUpdateDeleteRequest(int request_id) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameUpdateDeleteRequest(int request_id) {
 	PRINT_NAME();
 
 	LOGF("\t request_id = %d\n", request_id);
@@ -2629,7 +2993,7 @@ static int KYTY_SYSV_ABI GameUpdateDeleteRequest(int request_id) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI GameUpdateGetAddcontLatestVersion(uint32_t    service_label,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameUpdateGetAddcontLatestVersion(uint32_t    service_label,
                                                            const void* entitlement_label,
                                                            GameUpdateAddcontVersionInfo* info) {
 	PRINT_NAME();
@@ -2674,7 +3038,7 @@ namespace LibShare {
 
 LIB_VERSION("Share", 1, "Share", 1, 1);
 
-static int KYTY_SYSV_ABI ShareInitialize(size_t heap_size, int thread_priority,
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ShareInitialize(size_t heap_size, int thread_priority,
                                          uint64_t affinity_mask) {
 	PRINT_NAME();
 
@@ -2686,7 +3050,7 @@ static int KYTY_SYSV_ABI ShareInitialize(size_t heap_size, int thread_priority,
 	return 0;
 }
 
-static int KYTY_SYSV_ABI ShareFeaturePermit(uint32_t feature_flags) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ShareFeaturePermit(uint32_t feature_flags) {
 	PRINT_NAME();
 
 	LOGF("\t feature_flags = 0x%08" PRIx32 "\n", feature_flags);
@@ -2694,7 +3058,7 @@ static int KYTY_SYSV_ABI ShareFeaturePermit(uint32_t feature_flags) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI ShareTerminate() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI ShareTerminate() {
 	PRINT_NAME();
 
 	return 0;
@@ -2719,7 +3083,7 @@ LIB_VERSION("Random", 1, "Random", 1, 1);
 constexpr int  RANDOM_ERROR_INVALID = 0x817c0016;
 constexpr auto RANDOM_MAX_SIZE      = 64u;
 
-static int KYTY_SYSV_ABI RandomGetRandomNumber(void* buf, size_t size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI RandomGetRandomNumber(void* buf, size_t size) {
 	PRINT_NAME();
 
 	if ((buf == nullptr && size != 0) || size > RANDOM_MAX_SIZE) {
@@ -2746,7 +3110,7 @@ namespace LibRemoteplay {
 
 LIB_VERSION("Remoteplay", 1, "Remoteplay", 1, 1);
 
-static int KYTY_SYSV_ABI RemoteplayInitialize(void* heap, size_t heap_size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI RemoteplayInitialize(void* heap, size_t heap_size) {
 	PRINT_NAME();
 
 	LOGF("\t heap      = 0x%016" PRIx64 "\n"
@@ -2756,13 +3120,13 @@ static int KYTY_SYSV_ABI RemoteplayInitialize(void* heap, size_t heap_size) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI RemoteplayTerminate() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI RemoteplayTerminate() {
 	PRINT_NAME();
 
 	return 0;
 }
 
-static int KYTY_SYSV_ABI RemoteplayGetConnectionStatus(int user_id, int* status) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI RemoteplayGetConnectionStatus(int user_id, int* status) {
 	PRINT_NAME();
 
 	LOGF("\t user_id = %d\n", user_id);
@@ -2788,13 +3152,13 @@ namespace LibWebBrowserDialog {
 
 LIB_VERSION("WebBrowserDialog", 1, "WebBrowserDialog", 1, 1);
 
-static int KYTY_SYSV_ABI WebBrowserDialogInitialize() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI WebBrowserDialogInitialize() {
 	PRINT_NAME();
 
 	return 0;
 }
 
-static int KYTY_SYSV_ABI WebBrowserDialogTerminate() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI WebBrowserDialogTerminate() {
 	PRINT_NAME();
 
 	return 0;
@@ -2826,7 +3190,7 @@ static_assert(sizeof(GameLiveStreamingStatus2) == 72);
 static_assert(offsetof(GameLiveStreamingStatus2, is_on_air) == 4);
 static_assert(offsetof(GameLiveStreamingStatus2, spectator_count) == 8);
 
-static int KYTY_SYSV_ABI GameLiveStreamingInitialize(size_t heap_size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameLiveStreamingInitialize(size_t heap_size) {
 	PRINT_NAME();
 
 	LOGF("\t heap_size = %" PRIu64 "\n", static_cast<uint64_t>(heap_size));
@@ -2834,13 +3198,13 @@ static int KYTY_SYSV_ABI GameLiveStreamingInitialize(size_t heap_size) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI GameLiveStreamingTerminate() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameLiveStreamingTerminate() {
 	PRINT_NAME();
 
 	return 0;
 }
 
-static int KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingStatus2* status) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingStatus2* status) {
 	PRINT_NAME();
 
 	if (status == nullptr) {
@@ -2852,7 +3216,7 @@ static int KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingSta
 	return OK;
 }
 
-static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int type, uint32_t* count) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int type, uint32_t* count) {
 	PRINT_NAME();
 
 	if (type < 1 || type > 3 || count == nullptr) {
@@ -2897,7 +3261,7 @@ static_assert(offsetof(SharePlayConnectionInfoA, host_user_id) == 64);
 
 static bool g_share_play_initialized = false;
 
-static int KYTY_SYSV_ABI SharePlayInitialize(void* heap, size_t heap_size) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SharePlayInitialize(void* heap, size_t heap_size) {
 	PRINT_NAME();
 
 	LOGF("\t heap      = 0x%016" PRIx64 "\n"
@@ -2914,7 +3278,7 @@ static int KYTY_SYSV_ABI SharePlayInitialize(void* heap, size_t heap_size) {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI SharePlayTerminate() {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SharePlayTerminate() {
 	PRINT_NAME();
 
 	if (!g_share_play_initialized) {
@@ -2924,7 +3288,7 @@ static int KYTY_SYSV_ABI SharePlayTerminate() {
 	return 0;
 }
 
-static int KYTY_SYSV_ABI SharePlayGetCurrentConnectionInfoA(SharePlayConnectionInfoA* info) {
+static int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI SharePlayGetCurrentConnectionInfoA(SharePlayConnectionInfoA* info) {
 	if (!g_share_play_initialized) {
 		return SHARE_PLAY_ERROR_NOT_INITIALIZED;
 	}

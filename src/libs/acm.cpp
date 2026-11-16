@@ -35,7 +35,7 @@ static void acm_advance_batch(AcmBatchInfo* info, size_t bytes) {
 	info->offset = std::min(info->buffer_size, info->offset + bytes);
 }
 
-int KYTY_SYSV_ABI AcmContextCreate(AcmContextId* context) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmContextCreate(AcmContextId* context) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(context == nullptr);
@@ -47,13 +47,13 @@ int KYTY_SYSV_ABI AcmContextCreate(AcmContextId* context) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmContextDestroy(AcmContextId context) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmContextDestroy(AcmContextId context) {
 	PRINT_NAME();
 	LOGF("\t context = %" PRIu32 "\n", context);
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmBatchStartBuffer(AcmContextId context, const void* batch_commands,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmBatchStartBuffer(AcmContextId context, const void* batch_commands,
                                       size_t batch_size, AcmBatchError* batch_error,
                                       AcmBatchId* batch) {
 	PRINT_NAME();
@@ -69,7 +69,7 @@ int KYTY_SYSV_ABI AcmBatchStartBuffer(AcmContextId context, const void* batch_co
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmBatchStartBuffers(AcmContextId context, uint32_t batch_info_count,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmBatchStartBuffers(AcmContextId context, uint32_t batch_info_count,
                                        const AcmBatchInfo* const batch_info[],
                                        AcmBatchError* batch_error, AcmBatchId* batch) {
 	PRINT_NAME();
@@ -86,24 +86,24 @@ int KYTY_SYSV_ABI AcmBatchStartBuffers(AcmContextId context, uint32_t batch_info
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmBatchWait(AcmContextId context, AcmBatchId batch, uint32_t timeout) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmBatchWait(AcmContextId context, AcmBatchId batch, uint32_t timeout) {
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmBatchJobNotification(AcmBatchInfo* batch_info) {
 	PRINT_NAME();
 	acm_advance_batch(batch_info, 2 * 16);
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmBatchJobPriority(AcmBatchInfo* batch_info, uint32_t priority) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmBatchJobPriority(AcmBatchInfo* batch_info, uint32_t priority) {
 	PRINT_NAME();
 	(void)batch_info;
 	(void)priority;
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmConvReverbSharedInput(AcmBatchInfo* batch_info, uint32_t block_count, void* in,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmConvReverbSharedInput(AcmBatchInfo* batch_info, uint32_t block_count, void* in,
                                            uint32_t count, const void* const ir[],
                                            const float* gain, void* const out[]) {
 	PRINT_NAME();
@@ -117,7 +117,7 @@ int KYTY_SYSV_ABI AcmConvReverbSharedInput(AcmBatchInfo* batch_info, uint32_t bl
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmConvReverbSharedIr(AcmBatchInfo* batch_info, uint32_t block_count,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmConvReverbSharedIr(AcmBatchInfo* batch_info, uint32_t block_count,
                                         const void* ir, uint32_t count, void* const in[],
                                         const float* gain, void* const out[]) {
 	PRINT_NAME();
@@ -131,7 +131,7 @@ int KYTY_SYSV_ABI AcmConvReverbSharedIr(AcmBatchInfo* batch_info, uint32_t block
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmFft(AcmBatchInfo* batch_info, int size, int count, int input_format,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmFft(AcmBatchInfo* batch_info, int size, int count, int input_format,
                          const void* const input[], int output_format, void* const output[],
                          uint32_t flags) {
 	PRINT_NAME();
@@ -146,7 +146,7 @@ int KYTY_SYSV_ABI AcmFft(AcmBatchInfo* batch_info, int size, int count, int inpu
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmIfft(AcmBatchInfo* batch_info, int size, int count, int input_format,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmIfft(AcmBatchInfo* batch_info, int size, int count, int input_format,
                           const void* const input[], int output_format, void* const output[],
                           uint32_t flags) {
 	PRINT_NAME();
@@ -161,7 +161,7 @@ int KYTY_SYSV_ABI AcmIfft(AcmBatchInfo* batch_info, int size, int count, int inp
 	return OK;
 }
 
-int KYTY_SYSV_ABI AcmPanner(AcmBatchInfo* batch_info, uint32_t in_count, const float* const in[],
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AcmPanner(AcmBatchInfo* batch_info, uint32_t in_count, const float* const in[],
                             uint32_t biquad_count, uint32_t biquad_update_count, uint32_t out_count,
                             const void* const parameter[], void* const state[],
                             const float* const out_init[], float* const out[]) {

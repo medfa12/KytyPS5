@@ -1,5 +1,6 @@
 #include "common/abi.h"
 #include "libs/ajm/aac_decoder.h"
+#include "libs/ajm/atrac9_decoder.h"
 #include "libs/acm.h"
 #include "libs/audio3d.h"
 #include "libs/audio.h"
@@ -38,7 +39,7 @@ static AudioPropagationHandle AudioPropagationNextHandle() {
 	return next_handle.fetch_add(1, std::memory_order_relaxed);
 }
 
-static int32_t KYTY_SYSV_ABI AudioPropagationSystemQueryMemory(
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioPropagationSystemQueryMemory(
     const void* /*options*/, AudioPropagationSystemMemory* out_memory) {
 	PRINT_NAME();
 
@@ -64,7 +65,7 @@ AudioPropagationSystemCreate(const void* /*options*/, AudioPropagationSystemMemo
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI AudioPropagationRoomCreate(AudioPropagationHandle /*system_handle*/,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioPropagationRoomCreate(AudioPropagationHandle /*system_handle*/,
                                                         AudioPropagationHandle* out_room_handle) {
 	PRINT_NAME();
 
@@ -75,7 +76,7 @@ static int32_t KYTY_SYSV_ABI AudioPropagationRoomCreate(AudioPropagationHandle /
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI AudioPropagationSystemRegisterMaterial(
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioPropagationSystemRegisterMaterial(
     AudioPropagationHandle /*system_handle*/, const void* /*material*/,
     AudioPropagationHandle* out_material_handle) {
 	PRINT_NAME();
@@ -95,7 +96,7 @@ AudioPropagationSystemSetAttributes(AudioPropagationHandle /*system_handle*/,
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI AudioPropagationSystemGetRays(AudioPropagationHandle /*system_handle*/,
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudioPropagationSystemGetRays(AudioPropagationHandle /*system_handle*/,
                                                            void* /*rays*/, uint32_t* num_rays) {
 	PRINT_NAME();
 
@@ -119,6 +120,12 @@ LIB_DEFINE(InitAudio_1_AudioPropagation) {
 
 namespace LibAudioOut {
 
+static __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI int64_t AudioOutDiag(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                           uint64_t a4, uint64_t a5) {
+	LOGF("\t AudioOutDiag: %llx %llx %llx %llx %llx %llx\n", a0, a1, a2, a3, a4, a5);
+	return 1;
+}
+
 LIB_VERSION("AudioOut", 1, "AudioOut", 1, 1);
 
 namespace AudioOut = Audio::AudioOut;
@@ -131,6 +138,14 @@ LIB_DEFINE(InitAudio_1_AudioOut) {
 	LIB_FUNC("QOQtbeDqsT4", AudioOut::AudioOutOutput);
 	LIB_FUNC("s1--uE9mBFw", AudioOut::AudioOutClose);
 	LIB_FUNC("GrQ9s4IrNaQ", AudioOut::AudioOutGetPortState);
+	LIB_FUNC("qLpSK75lXI4", AudioOut::AudioOutOpenEx);
+	LIB_FUNC("O3FM2WXIJaI", LibAudioOut::AudioOutDiag);
+	LIB_FUNC("Y3lXfCFEWFY", LibAudioOut::AudioOutDiag);
+	LIB_FUNC("X7Cfsiujm8Y", LibAudioOut::AudioOutDiag);
+	LIB_FUNC("8By20nPynEo", LibAudioOut::AudioOutDiag);
+	LIB_FUNC("GTP5C2Wvrhs", LibAudioOut::AudioOutDiag);
+	LIB_FUNC("W+ZjdeG-NYg", LibAudioOut::AudioOutDiag);
+	LIB_FUNC("cg84SbpLeac", LibAudioOut::AudioOutDiag);
 	LIB_FUNC("R5hemoKKID8", AudioOut::AudioOutGetSystemState);
 }
 
@@ -305,7 +320,7 @@ static VoicePort* get_voice_port(uint32_t port_id) {
 	return &g_voice_ports[port_id];
 }
 
-int KYTY_SYSV_ABI VoiceInit(VoiceInitParam* /*param*/, int32_t /*version*/) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceInit(VoiceInitParam* /*param*/, int32_t /*version*/) {
 	PRINT_NAME();
 	g_voice_started = false;
 	for (auto& port: g_voice_ports) {
@@ -315,12 +330,12 @@ int KYTY_SYSV_ABI VoiceInit(VoiceInitParam* /*param*/, int32_t /*version*/) {
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceSetThreadsParams(void* /*params*/) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceSetThreadsParams(void* /*params*/) {
 	PRINT_NAME();
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceCreatePort(uint32_t* port_id, const VoicePortParam* param) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceCreatePort(uint32_t* port_id, const VoicePortParam* param) {
 	PRINT_NAME();
 
 	if (port_id == nullptr) {
@@ -336,7 +351,7 @@ int KYTY_SYSV_ABI VoiceCreatePort(uint32_t* port_id, const VoicePortParam* param
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceConnectIPortToOPort(uint32_t input_port_id, uint32_t output_port_id) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceConnectIPortToOPort(uint32_t input_port_id, uint32_t output_port_id) {
 	PRINT_NAME();
 
 	auto* input_port  = get_voice_port(input_port_id);
@@ -352,7 +367,7 @@ int KYTY_SYSV_ABI VoiceConnectIPortToOPort(uint32_t input_port_id, uint32_t outp
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceDisconnectIPortFromOPort(uint32_t input_port_id, uint32_t output_port_id) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceDisconnectIPortFromOPort(uint32_t input_port_id, uint32_t output_port_id) {
 	PRINT_NAME();
 
 	auto* input_port  = get_voice_port(input_port_id);
@@ -368,7 +383,7 @@ int KYTY_SYSV_ABI VoiceDisconnectIPortFromOPort(uint32_t input_port_id, uint32_t
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceDeletePort(uint32_t port_id) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceDeletePort(uint32_t port_id) {
 	PRINT_NAME();
 
 	if (auto* port = get_voice_port(port_id); port != nullptr) {
@@ -378,7 +393,7 @@ int KYTY_SYSV_ABI VoiceDeletePort(uint32_t port_id) {
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceEnd() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceEnd() {
 	PRINT_NAME();
 
 	g_voice_started = false;
@@ -390,19 +405,19 @@ int KYTY_SYSV_ABI VoiceEnd() {
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceStart(const VoiceStartParam* /*param*/) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceStart(const VoiceStartParam* /*param*/) {
 	PRINT_NAME();
 	g_voice_started = true;
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceStop() {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceStop() {
 	PRINT_NAME();
 	g_voice_started = false;
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceReadFromOPort(uint32_t /*output_port_id*/, void* data, uint32_t* size) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceReadFromOPort(uint32_t /*output_port_id*/, void* data, uint32_t* size) {
 	PRINT_NAME();
 
 	if (size == nullptr) {
@@ -417,7 +432,7 @@ int KYTY_SYSV_ABI VoiceReadFromOPort(uint32_t /*output_port_id*/, void* data, ui
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceWriteToIPort(uint32_t /*input_port_id*/, const void* /*data*/,
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceWriteToIPort(uint32_t /*input_port_id*/, const void* /*data*/,
                                     uint32_t* size, int16_t /*frame_gaps*/) {
 	PRINT_NAME();
 
@@ -428,7 +443,7 @@ int KYTY_SYSV_ABI VoiceWriteToIPort(uint32_t /*input_port_id*/, const void* /*da
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceGetPortInfo(uint32_t port_id, VoicePortInfo* info) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceGetPortInfo(uint32_t port_id, VoicePortInfo* info) {
 	PRINT_NAME();
 
 	if (info == nullptr) {
@@ -449,7 +464,7 @@ int KYTY_SYSV_ABI VoiceGetPortInfo(uint32_t port_id, VoicePortInfo* info) {
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceGetPortAttr(uint32_t /*port_id*/, int32_t attr, void* value, int32_t size) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceGetPortAttr(uint32_t /*port_id*/, int32_t attr, void* value, int32_t size) {
 	PRINT_NAME();
 
 	if (value == nullptr || size <= 0) {
@@ -466,7 +481,7 @@ int KYTY_SYSV_ABI VoiceGetPortAttr(uint32_t /*port_id*/, int32_t attr, void* val
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceGetBitRate(uint32_t port_id, uint32_t* bitrate) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceGetBitRate(uint32_t port_id, uint32_t* bitrate) {
 	PRINT_NAME();
 
 	if (bitrate == nullptr) {
@@ -479,7 +494,7 @@ int KYTY_SYSV_ABI VoiceGetBitRate(uint32_t port_id, uint32_t* bitrate) {
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceSetVolume(uint32_t port_id, float volume) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceSetVolume(uint32_t port_id, float volume) {
 	PRINT_NAME();
 
 	if (auto* port = get_voice_port(port_id); port != nullptr) {
@@ -489,7 +504,7 @@ int KYTY_SYSV_ABI VoiceSetVolume(uint32_t port_id, float volume) {
 	return 0;
 }
 
-int KYTY_SYSV_ABI VoiceGetVolume(uint32_t port_id, float* volume) {
+int __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI VoiceGetVolume(uint32_t port_id, float* volume) {
 	PRINT_NAME();
 
 	if (volume == nullptr) {
@@ -522,22 +537,6 @@ LIB_DEFINE(InitAudio_1_Voice) {
 }
 
 } // namespace LibVoice
-
-namespace LibVoiceChat {
-
-LIB_VERSION("VoiceChat", 1, "VoiceChat", 1, 1);
-
-static int KYTY_SYSV_ABI VoiceChatStub() {
-	return OK;
-}
-
-LIB_DEFINE(InitAudio_1_VoiceChat) {
-	LIB_FUNC("spdS-hedavE", VoiceChatStub);
-	LIB_FUNC("Ptmkf9UnWBg", VoiceChatStub);
-	LIB_FUNC("CscDZAFA5+c", VoiceChatStub);
-}
-
-} // namespace LibVoiceChat
 
 namespace LibAjm {
 
@@ -578,7 +577,6 @@ LIB_DEFINE(InitAudio_1_Ajm) {
 	LIB_FUNC("jVCWcthifr8", Ajm::AjmBatchJobRun);
 	LIB_FUNC("Z9NVCesiP0Q", Ajm::AjmBatchJobRunSplit);
 	LIB_FUNC("1t3ixYNXyuc", Ajm::AjmDecAt9ParseConfigData);
-	LIB_FUNC("eDFeTyi+G3Y", Ajm::AjmDecMp3ParseFrame);
 }
 
 } // namespace LibAjm
@@ -667,6 +665,7 @@ static constexpr int32_t AUDIODEC_ERROR_INVALID_HANDLE           = -2139160561; 
 static constexpr int32_t AUDIODEC_ERROR_INVALID_WORD_LENGTH      = -2139160560; // 0x807F0010
 static constexpr int32_t AUDIODEC_ERROR_INVALID_AU_SIZE          = -2139160559; // 0x807F0011
 static constexpr int32_t AUDIODEC_ERROR_INVALID_PCM_SIZE         = -2139160558; // 0x807F0012
+static constexpr int32_t AUDIODEC_ERROR_AT9_INVALID_CONFIG_DATA = static_cast<int32_t>(0x807f1000u);
 
 static constexpr uint32_t AUDIODEC_TYPE_AT9   = 0x0001;
 static constexpr uint32_t AUDIODEC_TYPE_MP3   = 0x0002;
@@ -676,8 +675,6 @@ static constexpr int32_t AUDIODEC_WORD_SZ_24BIT = 0;
 static constexpr int32_t AUDIODEC_WORD_SZ_16BIT = 1;
 static constexpr int32_t AUDIODEC_WORD_SZ_FLOAT = 2;
 
-static constexpr uint32_t AUDIODEC_AT9_MAX_FRAME_SIZE      = 2048;
-static constexpr uint32_t AUDIODEC_AT9_MAX_FRAME_SAMPLES   = 256;
 static constexpr uint32_t AUDIODEC_MP3_MAX_FRAME_SIZE      = 1441;
 static constexpr uint32_t AUDIODEC_MP3_MAX_FRAME_SAMPLES   = 1152;
 
@@ -772,6 +769,7 @@ struct AudiodecDecoder {
 	uint32_t frame_bytes   = AUDIODEC_MP3_MAX_FRAME_SIZE;
 	uint32_t frame_samples = AUDIODEC_MP3_MAX_FRAME_SAMPLES;
 	std::unique_ptr<Audio::Ajm::AjmAacDecoder> aac;
+	std::unique_ptr<Audio::Ajm::AjmAt9Decoder> at9;
 };
 
 static Common::Mutex                   g_audiodec_mutex;
@@ -837,7 +835,8 @@ static int32_t audiodec_validate_ctrl(const AudiodecCtrl* ctrl, uint32_t codec_t
 			if (info->uiSize != sizeof(AudiodecAt9Info)) {
 				return AUDIODEC_ERROR_INVALID_BSI_INFO_SIZE;
 			}
-			if (audiodec_word_size_bytes(param->iBwPcm) == 0) {
+			// 13.60 libSceAudiodec +0x6db accepts S16 or float for ATRAC9.
+			if (param->iBwPcm != AUDIODEC_WORD_SZ_16BIT && param->iBwPcm != AUDIODEC_WORD_SZ_FLOAT) {
 				return AUDIODEC_ERROR_INVALID_WORD_LENGTH;
 			}
 			break;
@@ -886,14 +885,17 @@ static int32_t audiodec_validate_ctrl(const AudiodecCtrl* ctrl, uint32_t codec_t
 static void audiodec_fill_info(AudiodecCtrl* ctrl, const AudiodecDecoder& decoder) {
 	switch (decoder.codec_type) {
 		case AUDIODEC_TYPE_AT9: {
+			Audio::Ajm::AjmSidebandDecAt9CodecInfo codec {};
+			decoder.at9->WriteCodecInfo(&codec, sizeof(codec), {});
+			const auto format         = decoder.at9->GetFormat();
 			auto* info                 = static_cast<AudiodecAt9Info*>(ctrl->pBsiInfo);
-			info->uiChannel            = decoder.channels;
-			info->uiBitrate            = 0;
-			info->uiSamplingRate       = decoder.sample_rate;
-			info->uiSuperFrameSize     = decoder.frame_bytes;
-			info->uiFramesInSuperFrame = 1;
-			info->uiNextFrameSize      = decoder.frame_bytes;
-			info->uiFrameSamples       = decoder.frame_samples;
+			info->uiChannel            = format.channel_num;
+			info->uiBitrate            = format.bitrate;
+			info->uiSamplingRate       = format.sampling_frequency;
+			info->uiSuperFrameSize     = codec.super_frame_size;
+			info->uiFramesInSuperFrame = codec.frames_in_super_frame;
+			info->uiNextFrameSize      = codec.next_frame_size;
+			info->uiFrameSamples       = codec.frame_samples;
 			info->iResult              = 0;
 			break;
 		}
@@ -924,7 +926,7 @@ static void audiodec_fill_info(AudiodecCtrl* ctrl, const AudiodecDecoder& decode
 	}
 }
 
-static int32_t KYTY_SYSV_ABI AudiodecInitLibrary(uint32_t codec_type) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudiodecInitLibrary(uint32_t codec_type) {
 	PRINT_NAME();
 
 	if (!audiodec_is_valid_type(codec_type)) {
@@ -937,7 +939,7 @@ static int32_t KYTY_SYSV_ABI AudiodecInitLibrary(uint32_t codec_type) {
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI AudiodecTermLibrary(uint32_t codec_type) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudiodecTermLibrary(uint32_t codec_type) {
 	PRINT_NAME();
 
 	if (!audiodec_is_valid_type(codec_type)) {
@@ -952,7 +954,7 @@ static int32_t KYTY_SYSV_ABI AudiodecTermLibrary(uint32_t codec_type) {
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI AudiodecCreateDecoder(AudiodecCtrl* ctrl, uint32_t codec_type) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudiodecCreateDecoder(AudiodecCtrl* ctrl, uint32_t codec_type) {
 	PRINT_NAME();
 
 	if (!audiodec_is_valid_type(codec_type)) {
@@ -979,11 +981,17 @@ static int32_t KYTY_SYSV_ABI AudiodecCreateDecoder(AudiodecCtrl* ctrl, uint32_t 
 
 			switch (codec_type) {
 				case AUDIODEC_TYPE_AT9: {
-					auto* param           = static_cast<const AudiodecParamAt9*>(ctrl->pParam);
-					decoder.word_size     = param->iBwPcm;
-					decoder.channels      = 2;
-					decoder.frame_bytes   = AUDIODEC_AT9_MAX_FRAME_SIZE;
-					decoder.frame_samples = AUDIODEC_AT9_MAX_FRAME_SAMPLES;
+					using namespace Audio::Ajm;
+					const auto* param = static_cast<const AudiodecParamAt9*>(ctrl->pParam);
+					decoder.word_size = param->iBwPcm;
+					decoder.at9 = std::make_unique<AjmAt9Decoder>(
+					    2, 48000, param->iBwPcm == AUDIODEC_WORD_SZ_16BIT
+					                  ? AjmSampleEncoding::S16 : AjmSampleEncoding::Float, 0);
+					if (((param->uiConfigData[1] >> 1) & 7) > 5 ||
+					    decoder.at9->Initialize(param->uiConfigData, sizeof(param->uiConfigData)).result != 0) {
+						decoder = {};
+						return AUDIODEC_ERROR_AT9_INVALID_CONFIG_DATA;
+					}
 					break;
 				}
 				case AUDIODEC_TYPE_MP3: {
@@ -1030,7 +1038,7 @@ static int32_t KYTY_SYSV_ABI AudiodecCreateDecoder(AudiodecCtrl* ctrl, uint32_t 
 	return AUDIODEC_ERROR_ARG;
 }
 
-static int32_t KYTY_SYSV_ABI AudiodecDeleteDecoder(int32_t handle) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudiodecDeleteDecoder(int32_t handle) {
 	PRINT_NAME();
 
 	if (handle <= 0 || static_cast<uint32_t>(handle) > g_audiodec_decoders.size()) {
@@ -1048,7 +1056,7 @@ static int32_t KYTY_SYSV_ABI AudiodecDeleteDecoder(int32_t handle) {
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI AudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) {
 	PRINT_NAME();
 
 	if (handle <= 0 || static_cast<uint32_t>(handle) > g_audiodec_decoders.size()) {
@@ -1066,6 +1074,25 @@ static int32_t KYTY_SYSV_ABI AudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) 
 		return ret;
 	}
 
+	if (decoder.at9) {
+		using namespace Audio::Ajm;
+		// Native +0x870 submits a single-frame AJM job, copies consumed/written
+		// sizes and format/codec sidebands, then maps partial input/output errors.
+		const auto result = decoder.at9->Decode(
+		    ctrl->pAuInfo->pAuAddr, ctrl->pAuInfo->uiAuSize, ctrl->pPcmItem->pPcmAddr,
+		    ctrl->pPcmItem->uiPcmSize, false, nullptr);
+		ctrl->pAuInfo->uiAuSize = static_cast<uint32_t>(result.input_consumed);
+		ctrl->pPcmItem->uiPcmSize = static_cast<uint32_t>(result.output_written);
+		audiodec_fill_info(ctrl, decoder);
+		if ((result.result & (AJM_RESULT_FATAL | AJM_RESULT_CODEC_ERROR)) != 0) {
+			static_cast<AudiodecAt9Info*>(ctrl->pBsiInfo)->iResult = result.internal_result;
+			return AUDIODEC_ERROR_API_FAIL;
+		}
+		if ((result.result & AJM_RESULT_PARTIAL_INPUT) != 0) {
+			return AUDIODEC_ERROR_INVALID_AU_SIZE;
+		}
+		return (result.result & AJM_RESULT_NOT_ENOUGH_ROOM) != 0 ? AUDIODEC_ERROR_INVALID_PCM_SIZE : 0;
+	}
 	if (decoder.aac) {
 		using namespace Audio::Ajm;
 		const auto result = decoder.aac->Decode(
@@ -1105,7 +1132,7 @@ static int32_t KYTY_SYSV_ABI AudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) 
 	return 0;
 }
 
-static int32_t KYTY_SYSV_ABI AudiodecClearContext(int32_t handle) {
+static int32_t __attribute__((force_align_arg_pointer)) KYTY_SYSV_ABI AudiodecClearContext(int32_t handle) {
 	PRINT_NAME();
 
 	if (handle <= 0 || static_cast<uint32_t>(handle) > g_audiodec_decoders.size()) {
@@ -1119,6 +1146,9 @@ static int32_t KYTY_SYSV_ABI AudiodecClearContext(int32_t handle) {
 	}
 	if (decoder.aac) {
 		decoder.aac->Reset();
+	}
+	if (decoder.at9) {
+		decoder.at9->Reset();
 	}
 
 	return 0;
@@ -1201,7 +1231,6 @@ LIB_DEFINE(InitAudio_1) {
 	LibAudioIn::InitAudio_1_AudioIn(s);
 	LibVoiceQoS::InitAudio_1_VoiceQoS(s);
 	LibVoice::InitAudio_1_Voice(s);
-	LibVoiceChat::InitAudio_1_VoiceChat(s);
 	LibAjm::InitAudio_1_Ajm(s);
 	LibAcm::InitAudio_1_Acm(s);
 	LibAvPlayer::InitAudio_1_AvPlayer(s);

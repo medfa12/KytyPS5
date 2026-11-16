@@ -3,11 +3,20 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "loader/runtimeChildInput.h"
 namespace Libs::Controller {
 
 void Initialize();
 void Shutdown();
 void EmergencyShutdown();
+void ConfigureRuntimeControllerRole(bool parent);
+void SetRuntimeControllerFocus(bool enabled, uint64_t epoch);
+void PumpRuntimeChildController();
+Loader::RuntimeChild::PadReport RuntimePadSnapshot();
+void ApplyRuntimePadOutput(const Loader::RuntimeChild::PadOutput& output, uint64_t epoch, bool enabled);
+void StopRuntimePadOutput();
+// Child PS notifications are exposed only to the privileged shell reader.
+void PulseRuntimeSystemPs();
 
 struct Lifecycle {
 	static constexpr const char* name               = "Controller";
@@ -17,13 +26,14 @@ struct Lifecycle {
 };
 
 constexpr int HOST_INPUT_CONTROLLER_ID = -1000;
+struct PadData;
+int KYTY_SYSV_ABI PadReadSystemState(int handle, PadData* data);
 
-constexpr int PAD_ERROR_INVALID_ARG          = -2137915391; /* 0x80920001 */
-constexpr int PAD_ERROR_INVALID_HANDLE       = -2137915389; /* 0x80920003 */
-constexpr int PAD_ERROR_ALREADY_OPENED       = -2137915388; /* 0x80920004 */
-constexpr int PAD_ERROR_NOT_INITIALIZED      = -2137915387; /* 0x80920005 */
-constexpr int PAD_ERROR_DEVICE_NOT_CONNECTED = -2137915385; /* 0x80920007 */
-constexpr int PAD_ERROR_NO_HANDLE            = -2137915384; /* 0x80920008 */
+constexpr int PAD_ERROR_INVALID_ARG     = -2137915391; /* 0x80920001 */
+constexpr int PAD_ERROR_INVALID_HANDLE  = -2137915389; /* 0x80920003 */
+constexpr int PAD_ERROR_ALREADY_OPENED  = -2137915388; /* 0x80920004 */
+constexpr int PAD_ERROR_NOT_INITIALIZED = -2137915387; /* 0x80920005 */
+constexpr int PAD_ERROR_NO_HANDLE       = -2137915384; /* 0x80920008 */
 
 constexpr uint32_t PAD_BUTTON_L3        = 0x00000002;
 constexpr uint32_t PAD_BUTTON_R3        = 0x00000004;
@@ -40,6 +50,7 @@ constexpr uint32_t PAD_BUTTON_TRIANGLE  = 0x00001000;
 constexpr uint32_t PAD_BUTTON_CIRCLE    = 0x00002000;
 constexpr uint32_t PAD_BUTTON_CROSS     = 0x00004000;
 constexpr uint32_t PAD_BUTTON_SQUARE    = 0x00008000;
+constexpr uint32_t PAD_BUTTON_PS        = 0x00010000;
 constexpr uint32_t PAD_BUTTON_TOUCH_PAD = 0x00100000;
 
 enum class Axis {
@@ -80,8 +91,7 @@ void CycleKeyboardPlayer();
 void SetButton(int id, uint32_t button, bool down);
 void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
-// A host input controller touch also presses the touch pad button unless click is false.
-void SetTouchPad(int id, int finger, bool down, float x, float y, bool click = true);
+void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ToggleGyroEmulation(int id);
 void ResetInputState();
@@ -123,7 +133,8 @@ int KYTY_SYSV_ABI PadVrControllerSetTriggerEffects(int left_handle, int right_ha
 
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);
-int KYTY_SYSV_ABI PadOpenExt(int user_id, int type, int index, const void* param);
+// Privileged co-hosted device opens share the primary port, with one close per open.
+int OpenSystemDevicePort();
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index);
 int KYTY_SYSV_ABI PadClose(int handle);
 int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable);

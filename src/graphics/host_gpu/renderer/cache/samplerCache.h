@@ -42,6 +42,7 @@ private:
 	};
 
 	GraphicContext&                                             m_graphics;
+	Common::Mutex                                               m_mutex;
 	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
 };
 

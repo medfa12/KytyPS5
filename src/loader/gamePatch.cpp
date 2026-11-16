@@ -247,6 +247,12 @@ bool ApplyWrites(Plan* plan, const Program& program, std::string* error) {
 
 bool Apply(const std::filesystem::path& plan_path, Program* main_program,
            const std::vector<Program*>& programs) {
+	for (const auto* program: programs) {
+		if (program && program->boot_credential_admission) {
+			::printf("Game cheat refused: source-bound boot admission excludes arbitrary patch plans\n");
+			return false;
+		}
+	}
 	Plan        plan;
 	std::string error;
 	if (!LoadPlan(plan_path, &plan, &error) || !ValidateGame(plan, main_program, &error)) {
@@ -271,6 +277,10 @@ bool Apply(const std::filesystem::path& plan_path, Program* main_program,
 }
 
 bool ApplyPending(Program* program) {
+	if (g_pending_plan && program && program->boot_credential_admission) {
+		::printf("Game cheat refused: pending patch plan with source-bound boot admission\n");
+		return false;
+	}
 	uint64_t source_base = 0;
 	if (g_pending_plan == nullptr || program == nullptr || program->elf == nullptr ||
 	    !Matches(g_pending_plan.get(), *program, &source_base)) {
